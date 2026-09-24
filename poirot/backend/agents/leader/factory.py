@@ -1,3 +1,41 @@
+"""Leader Agent 工厂 — 装配 graph（middleware / tools / prompt / checkpointer）。
+
+【整体职责】
+App 层工厂：按 expert_mode 参数化装配 Leader 的 LangGraph graph。负责
+- middleware：_build_middlewares 全挂 + 参数化行为差异；
+- tools：get_available_tools 按 expert 选 core / core+deferred，并补充 registry 与 specialist 工具；
+- system_prompt：apply_prompt_template 按 expert 与 specialist_registry 条件注入；
+- checkpointer：get_checkpointer() 单例，thread_id 跨轮 + 跨模式保留 state。
+
+【内容摘要】
+- _safe_get_specialist_registry : 安全取 specialist_registry，缺失返 None。
+- _build_middlewares            : 组装全部 middleware，参数化控制行为差异。
+- make_lead_agent               : 主入口，装配并返回 LeaderAgent。
+
+【职责边界】
+- 只负责：装配 graph 的中间件、工具、提示词与 checkpointer。
+- 不负责：middleware 的具体实现（middlewares 模块）、工具定义（agent_tools）、
+  提示词内容（prompts）、模型构造（config / model_router）、runtime 装配（bootstrap）。
+
+【INVARIANT】
+- 全模式全挂 middleware：default 与 expert 用同一批中间件，差异靠参数控制。
+- 参数化差异：
+  - default：Todo 不强制完成、Reflection 不 jump（LightReflectionStrategy）、Report 不自动合成。
+  - expert：Todo 强制完成、Reflection 充分性 jump（SufficiencyStrategy）、Report after_agent 自动合成。
+- 挂载顺序固定：治理层（公共 3 + StrategyMiddleware）→ SystemContext → SkillInjection（条件）
+  → SkillMetrics（条件）→ SkillActivation（条件）→ Title → RunJournal → MCP Audit（条件）
+  → Sandbox（条件）→ Memory（条件）→ MemoryConsolidation（条件）→ HelpRequest →
+  DanglingToolCall → ToolCall → Orchestration（条件）→ Evidence → StallDetection →
+  Todo → Reflection → Report（条件）。
+- LoopDetectionMiddleware 已移除：用户要求取消循环上限约束，保留注释与 import。
+- registry 必须存 BaseChatModel / BaseTool 实例：不存工厂或类。
+- capability_registry 必填：从 runnable_config.configurable 或参数取，缺失抛 ValueError。
+- expert_mode 优先级：runnable_config.configurable 透传值 > 参数。
+- checkpointer 单例：thread_id 跨轮 + 跨模式保留 state。
+- summarize_model 独立取：context_governance.params.summarize_model 配名则取独立模型，
+  否则 None（回退 research model）。
+- specialist_registry 条件注入：非空时注入 <specialist_routing> 段，缺失则不注入（保护 prompt caching）。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -43,6 +81,12 @@ def _safe_get_specialist_registry(registry: Any) -> Any | None:
     Bug B 修复：make_lead_agent 调 apply_prompt_template 时传 specialist_registry。
     缺失（multiagent disabled 或无 specialist 注册）时返 None，
     apply_prompt_template 不注入 <specialist_routing> 段（保护 prompt caching）。
+
+    Args:
+        registry: CapabilityRegistry 实例。
+
+    Returns:
+        Any | None: specialist_registry；缺失则 None。
     """
     try:
         return registry.get_specialist_registry()
@@ -76,6 +120,24 @@ def _build_middlewares(
     挂载顺序：治理层（公共3 + StrategyMiddleware） → SystemContext → SkillInjection（条件挂）
     → SkillMetrics（条件挂）→ Title → RunJournal → MCP Audit（条件挂）→ Sandbox（条件挂）
     → LoopDetection → ToolCall → Evidence → Todo → Reflection → Report。
+
+    Args:
+        expert_mode: 是否专家模式，控制多处行为差异。
+        model: 主模型（researcher），供 Reflection / Report 使用。
+        context_governance: 上下文治理配置（策略层）。
+        summarize_model: 摘要模型，可选。
+        sandbox_provider: 沙箱提供者，非空时挂 SandboxMiddleware。
+        artifact_server: 产物服务，供沙箱使用。
+        mcp_audit_middleware: MCP 审计中间件，可选。
+        skill_injection_middleware: 技能注入中间件，可选。
+        skill_metrics_middleware: 技能指标中间件，可选。
+        orchestration_middleware: 编排中间件，可选。
+        memory_provider: 记忆提供者，非空时挂 MemoryMiddleware。
+        memory_config: 记忆配置。
+        memory_worker: 记忆后台任务，非空时挂 MemoryConsolidationMiddleware。
+
+    Returns:
+        list: 组装好的 middleware 列表（顺序固定）。
     """
     middlewares: list = []
     if context_governance is not None:
@@ -190,6 +252,29 @@ def make_lead_agent(
     - checkpointer: get_checkpointer() 单例，thread_id 跨轮 + 跨模式保留 state
 
     Registry MUST store BaseChatModel / BaseTool instances directly.
+
+    Args:
+        expert_mode: 是否专家模式。
+        capability_registry: 能力注册表。
+        middleware_manager: 预留参数（当前未使用）。
+        runnable_config: Runnable 配置，含 configurable（expert_mode / capability_registry）。
+        context_governance: 上下文治理配置。
+        sandbox_provider: 沙箱提供者。
+        artifact_server: 产物服务。
+        mcp_audit_middleware: MCP 审计中间件。
+        skill_injection_middleware: 技能注入中间件。
+        skill_metrics_middleware: 技能指标中间件。
+        specialist_tools: specialist 工具列表（delegate_to_*）。
+        orchestration_middleware: 编排中间件。
+        memory_provider: 记忆提供者。
+        memory_config: 记忆配置。
+        memory_worker: 记忆后台任务。
+
+    Returns:
+        LeaderAgent: 装配完成的 Leader Agent。
+
+    Raises:
+        ValueError: capability_registry 缺失时。
     """
     from poirot.backend.agents.leader.agent import LeaderAgent
 

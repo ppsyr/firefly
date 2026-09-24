@@ -1,11 +1,35 @@
-"""PiInstaller — 后台安装 pi coding agent（决策 2：不阻塞主流程 + TUI 提示）。
+"""PiInstaller — 后台安装 Pi coding agent（不阻塞主流程）。
 
-设计（spec.md PiInstaller Requirement + design_docs/46 §10.4）:
-- pi 装到与 Poirot 相同环境（沙箱镜像或 WSL2），保证 PATH 可见
-- daemon thread 后台 npm install -g @earendil-works/pi-coding-agent --ignore-scripts
-- 不阻塞主流程（subagent specialist 立即可用，pi 后台装）
-- 装完写 flag file（~/.poirot/pi-installed.flag），下次启动 pi specialist 自动可用
-- 首次启动无 coding specialist 时 TUI 显示提示（status 属性供 TUI 查询）
+【整体职责】
+检测 Pi CLI 是否已安装；未装时在 daemon 线程里后台执行 npm install，
+不阻塞主流程。装完写 flag 文件，下次启动时 Pi specialist 自动可用。
+安装状态通过 status 属性暴露给 TUI 展示。
+
+【内容摘要】
+- PiInstaller              : 安装器主类。
+- ensure_installed()       : 检测 + 触发后台安装，返回"当前是否可用"。
+- status (property)        : 暴露安装状态给 TUI（not_started / installing / done / failed）。
+- _is_installed()          : 检测 Pi 是否已装（PATH 查找 或 flag 文件存在）。
+- _is_npm_available()      : 检测 npm 是否可用。
+- _install_in_background() : daemon 线程里的 npm install 实现。
+
+【职责边界】
+- 只负责：检测是否已装、触发后台安装、维护安装状态、写 flag 文件。
+- 不负责：Pi 凭证（PiCredentialProvider 负责）、Pi 运行时（PiRuntime 负责）、
+  Pi specialist 注册（bootstrap 负责）。
+- 不持有运行时状态：状态在内存里，跨进程靠 flag 文件。
+
+【INVARIANT】
+- 不阻塞主流程：安装走 daemon 线程，ensure_installed 立即返回。
+- ensure_installed 返回 True 仅当 Pi 已装；未装时返回 False（后台安装中）。
+- auto_install=false 时不触发后台安装，只打 warning。
+- npm 不可用时不打后台安装，只打 warning（提示装 Node.js）。
+- 安装命令固定：npm install -g --ignore-scripts @earendil-works/pi-coding-agent。
+- --ignore-scripts 是 Pi 官方推荐：不跑 lifecycle scripts。
+- 安装超时 300 秒（5 分钟）；超时视为 failed。
+- 装完写 flag 文件（~/.poirot/pi-installed.flag）；下次启动 _is_installed 直接命中。
+- 状态机：not_started → installing → done / failed，单向流转。
+- Windows 兼容：npm 是 .cmd，用 shutil.which 拿全路径后 subprocess 直接调。
 """
 from __future__ import annotations
 
@@ -19,25 +43,32 @@ logger = logging.getLogger(__name__)
 
 
 class PiInstaller:
-    """后台安装 Pi coding agent（不阻塞主流程，决策 2）。
+    """后台安装 Pi coding agent（不阻塞主流程）。
 
-    pi 装到与 Poirot 相同环境（沙箱镜像或 WSL2），保证 PATH 可见。
+    Pi 装到与 Poirot 相同环境（沙箱镜像或 WSL2），保证 PATH 可见。
     """
 
+    # npm 包名。
     PACKAGE_NAME = "@earendil-works/pi-coding-agent"
+    # 安装完成标记文件；下次启动时据此判定"已装"。
     FLAG_FILE = Path.home() / ".poirot" / "pi-installed.flag"
 
     def __init__(self, auto_install: bool = True) -> None:
+        """初始化。
+
+        Args:
+            auto_install: 是否允许未装时自动后台安装。
+        """
         self._auto_install = auto_install
         self._install_status = "not_started"  # not_started / installing / done / failed
         self._install_thread: threading.Thread | None = None
 
     def ensure_installed(self) -> bool:
-        """检测 pi 是否已装；未装时启动后台安装（非阻塞）。
+        """检测 Pi 是否已装；未装时启动后台安装（非阻塞）。
 
         返回：
-        - True：pi 已装，立即可用
-        - False：pi 不可用（未装 + auto_install=false，或 npm 不可用，或后台安装中）
+        - True：Pi 已装，立即可用。
+        - False：Pi 不可用（未装 + auto_install=false，或 npm 不可用，或后台安装中）。
         """
         if self._is_installed():
             return True
@@ -74,9 +105,9 @@ class PiInstaller:
 
     @property
     def status(self) -> str:
-        """供 TUI 显示安装状态（决策 2）。
+        """供 TUI 显示安装状态。
 
-        返：
+        返回：
         - "not_started"：未启动安装
         - "installing"：后台安装中
         - "done"：安装完成（重启后可用）
@@ -85,19 +116,24 @@ class PiInstaller:
         return self._install_status
 
     def _is_installed(self) -> bool:
-        """检测 pi 是否已装（PATH 查找 或 flag file 存在）。"""
+        """检测 Pi 是否已装：PATH 里能找到 pi 或 flag 文件存在。"""
         return shutil.which("pi") is not None or self.FLAG_FILE.exists()
 
     def _is_npm_available(self) -> bool:
-        """检测 npm 是否可用（pi 是 npm 包）。"""
+        """检测 npm 是否可用（Pi 是 npm 包，安装需 npm）。"""
         return shutil.which("npm") is not None
 
     def _install_in_background(self) -> None:
-        """后台 npm install（daemon thread，不阻塞）。
+        """后台 npm install（daemon 线程，不阻塞主流程）。
 
-        决策 2：装到与 Poirot 相同环境（沙箱镜像或 WSL2）。
-        装完写 flag file，下次启动 pi specialist 自动可用。
-        Windows 兼容：npm 是 .cmd 文件，subprocess 需 shell=True 或全路径。
+        流程：
+        1. 再次确认 npm 路径；拿不到则 failed。
+        2. subprocess.run 执行 npm install（超时 300 秒）。
+        3. 成功 → 写 flag 文件 + 状态 done。
+        4. 非零退出 / 超时 / 异常 → 状态 failed。
+
+        Windows 兼容：npm 是 .cmd 文件，用 shutil.which 拿全路径后
+        subprocess 直接调，不依赖 shell=True。
         """
         try:
             npm_path = shutil.which("npm")

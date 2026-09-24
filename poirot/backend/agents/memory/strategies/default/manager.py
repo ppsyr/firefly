@@ -1,22 +1,42 @@
-"""DefaultMemoryManager — 四操作编排（00 §5.3 + 48 Step 5.5 + 49 §4 Step 4）。
+"""DefaultMemoryManager — 四操作编排（Encode / Associate / Consolidate / Reconsolidate）。
 
-四操作：Encode / Associate / Consolidate / Reconsolidate（Retrieve 移至 Retriever）。
-核心原则：工具里无 LLM。merged_content / new_content 外部传入。
-依赖：MemoryStore Protocol（mock 注入，Layer 3 实现 MarkdownFileStore）。
+【整体职责】
+实现 MemoryManager Protocol，提供记忆的四操作编排。
+是 memory 模块唯一的 manager 实现，被 worker（写路径）与 Provider（工具调用）调用。
 
-traceability（48 v3 + 49 v2）：
-- A：每操作 append OperationLog（encode/associate/consolidate/reconsolidate/forget）
-- B：每操作 emit journal 事件（memory.*），journal callback 注入
-- C：actor 字段从 ContextVar `_turn_id_var` 取（Layer 4 Middleware 注入 turn_id）
+四操作：Encode / Associate / Consolidate / Reconsolidate。
+（Retrieve 不在本模块 —— 检索统一走 Retriever。）
 
-拍板决策（49 v2-v3）：
-- A1：encode strength = base_strength（初始强度）
-- B3：reconsolidate 保留原 strength + last_accessed=now（视为一次访问）
-- C1：forgotten trace Retriever 过滤（L3 实现，L2 只标记 metadata.forgotten）
-- D3：associate LRU 淘汰最弱关联（超 max 时）
-- E1：consolidate max=10
-- F2：encode id = SHA256(content+type.value)[:16]（同内容同 type 去重）+ batch_update
-- 点4：encode get-then-add 幂等（同 id 返回已存在 trace）
+【核心原则】
+- 工具里无 LLM：merged_content / new_content 由外部传入。
+- frozen 语义：所有操作返回新 MemoryTrace 实例（replace / with_operation）。
+- 依赖注入：store + decay_policy + forget_policy + journal。
+
+【traceability（三路）】
+- A：每操作 append OperationLog
+     （encode / associate / consolidate / reconsolidate / forget）。
+- B：每操作 emit journal 事件（memory.*），journal callback 注入。
+- C：actor 字段从 ContextVar `_turn_id_var` 取（Layer 4 Middleware 注入 turn_id）。
+
+【关键决策（已拍板）】
+- A1：encode 初始 strength = base_strength。
+- B3：reconsolidate 保留原 strength + last_accessed=now（视为一次访问）。
+- C1：forgotten trace 由 Retriever 过滤（本模块只标记 metadata.forgotten）。
+- D3：associate 超 max 时 LRU 淘汰 strength 最低的关联。
+- E1：consolidate 数量上限 10。
+- F2：encode id = SHA256(content + type.value) 前 16 位（同内容同 type 去重）。
+- 点4：encode get-then-add 幂等（同 id 返回已存在 trace）。
+
+【职责边界】
+- 本模块只做四操作编排，不做实际存储（那是 store 的事）。
+- 不生成内容：merged_content / new_content 由外部 LLM 生成后传入。
+- 不判定遗忘：should_forget 由 forget_policy 提供，本模块只在 consolidate 时标 forgotten。
+
+【INVARIANT】
+- 四操作无 LLM（consolidate / reconsolidate 的 merged_content / new_content 外部传入）。
+- frozen 语义：所有操作返回新实例，不原地修改。
+- operation_log 上限 20 条 FIFO（由 schema.MemoryTrace.with_operation 保证）。
+- runtime 可切：decay 参数每次从 get_memory_config() 取最新。
 """
 
 from __future__ import annotations
@@ -44,18 +64,34 @@ from poirot.backend.agents.memory.strategies.default._constants import (
 from poirot.backend.agents.memory.strategies.default.decay import EbbinghausDecayPolicy
 from poirot.backend.agents.memory.strategies.default.forget import CompositeForgetPolicy
 
-# ContextVar：Layer 4 MemoryMiddleware before_model 设 turn_id，manager._get_actor() 取
-# Layer 2 测试时不设，actor=None
+# ContextVar：Layer 4 MemoryMiddleware before_model 设 turn_id，manager._get_actor() 取。
+# Layer 2 测试时不设，actor=None。
 _turn_id_var: ContextVar[str | None] = ContextVar("memory_turn_id", default=None)
 
 
 def set_turn_id(turn_id: str | None) -> None:
-    """Layer 4 MemoryMiddleware 调用，设置当前 turn_id（关联记忆操作到对话轮次）。"""
+    """设置当前 turn_id（关联记忆操作到对话轮次）。
+
+    Layer 4 MemoryMiddleware 在 before_model 注入、after_model 清除。
+    worker 在处理任务时也会注入 `worker:{thread_id}:{turn_count}`。
+
+    Args:
+        turn_id: 当前对话轮次标识；None 表示清除。
+
+    Returns:
+        None。
+
+    Raises:
+        不主动抛异常。
+
+    组装规则：
+        1. 直接调 _turn_id_var.set(turn_id)（ContextVar 就地覆盖）。
+    """
     _turn_id_var.set(turn_id)
 
 
 class DefaultMemoryManager:
-    """默认记忆管理器（四操作，00 §5.3 + 49 §4 Step 4）。
+    """默认记忆管理器（MemoryManager 的默认实现）。
 
     依赖注入：store + decay_policy + forget_policy + journal（策略组合 + traceability）。
     无 LLM：merged_content / new_content 外部传入。
@@ -73,21 +109,52 @@ class DefaultMemoryManager:
         """初始化。
 
         Args:
-            store: 持久化后端（MemoryStore Protocol，Layer 3 实现 / Layer 2 mock）
-            decay_policy: 衰减策略（None 时默认 EbbinghausDecayPolicy）
-            forget_policy: 遗忘策略（None 时默认 CompositeForgetPolicy，内部用 decay_policy）
-            journal: 事件回调（traceability B），None 时不发事件；Layer 4 注入 RunJournal
+            store: 持久化后端（MemoryStore Protocol，Layer 3 实现 / Layer 2 mock）。
+            decay_policy: 衰减策略（None 时默认 EbbinghausDecayPolicy）。
+            forget_policy: 遗忘策略（None 时默认 CompositeForgetPolicy，内部用 decay_policy）。
+            journal: 事件回调（traceability B），None 时不发事件；Layer 4 注入 RunJournal。
+
+        Returns:
+            None。
+
+        Raises:
+            不主动抛异常。
+
+        组装规则：
+            1. store 直接存入。
+            2. decay_policy 未传入 → 构造 EbbinghausDecayPolicy()。
+            3. forget_policy 未传入 → 构造 CompositeForgetPolicy(self._decay_policy)。
+            4. journal 存入（可能为 None）。
         """
         self._store = store
         self._decay_policy = decay_policy or EbbinghausDecayPolicy()
         self._forget_policy = forget_policy or CompositeForgetPolicy(self._decay_policy)
         self._journal = journal
 
+    # -----------------------------------------------------------------------
+    # 内部辅助
+    # -----------------------------------------------------------------------
+
     @staticmethod
     def _compute_trace_id(content: str, type: MemoryType) -> str:
         """F2：id = SHA256(content + type.value) 前 16 位。
 
         同 content + 同 type → 同 id → store.add 冲突 → encode 幂等返回旧 trace。
+
+        Args:
+            content: 记忆内容。
+            type:    记忆类型（MemoryType 或可转字符串）。
+
+        Returns:
+            16 位十六进制 trace id。
+
+        Raises:
+            不主动抛异常。
+
+        组装规则：
+            1. type 转字符串 key（MemoryType → value，其他 → str）。
+            2. 拼 raw = f"{content}\\x00{type_key}"（\\x00 作分隔符防歧义）。
+            3. SHA256(raw.encode("utf-8")).hexdigest()[:16] 返回。
         """
         type_key = type.value if isinstance(type, MemoryType) else str(type)
         raw = f"{content}\x00{type_key}"
@@ -102,12 +169,20 @@ class DefaultMemoryManager:
         """D3：加关联，超 max 时 LRU 淘汰 strength 最低的。
 
         Args:
-            trace: 原 trace（不修改）
-            new_assoc: 待加的关联
-            max_assocs: 单 trace 最大关联数
+            trace:      原 trace（不修改）。
+            new_assoc:  待加的关联。
+            max_assocs: 单 trace 最大关联数。
 
         Returns:
-            新 trace（associations 更新后）
+            新 trace（associations 更新后）。
+
+        Raises:
+            不主动抛异常。
+
+        组装规则：
+            1. 当前关联数 < max_assocs → 直接 append 新关联。
+            2. 已达 max → 按 strength 降序排序，保留前 (max-1) 条 + 新关联。
+            3. 用 replace 构造新 trace 返回（frozen 语义）。
         """
         current = trace.associations
         if len(current) >= max_assocs:
@@ -118,16 +193,62 @@ class DefaultMemoryManager:
         return replace(trace, associations=current + (new_assoc,))
 
     def _get_actor(self) -> str | None:
-        """C：取当前 turn_id（Layer 4 MemoryMiddleware 注入 ContextVar）。"""
+        """C：取当前 turn_id（Layer 4 MemoryMiddleware 注入 ContextVar）。
+
+        Args:
+            无。
+
+        Returns:
+            当前 turn_id；未注入时为 None。
+
+        Raises:
+            不主动抛异常。
+
+        组装规则：
+            1. 返回 _turn_id_var.get()。
+        """
         return _turn_id_var.get()
 
     def _emit_journal(self, event: str, payload: dict) -> None:
-        """B：emit journal 事件（Layer 4 注入 RunJournal，Layer 2 测试用 mock）。"""
+        """B：emit journal 事件（Layer 4 注入 RunJournal，Layer 2 测试用 mock）。
+
+        Args:
+            event:   事件名（memory.*）。
+            payload: 事件负载 dict。
+
+        Returns:
+            None。
+
+        Raises:
+            不主动抛异常；journal 内部异常按原逻辑传播。
+
+        组装规则：
+            1. self._journal 为 None → 静默返回（不发事件）。
+            2. 否则调 self._journal(event, payload)。
+        """
         if self._journal is not None:
             self._journal(event, payload)
 
     def _get_decay_params(self, type: MemoryType) -> dict:
-        """取衰减参数（runtime config 优先，缺省回退 _constants）。"""
+        """取衰减参数（runtime config 优先，缺省回退 _constants）。
+
+        runtime 可切：set_memory_config() 替换 config.decay 后立即生效。
+
+        Args:
+            type: 记忆类型。
+
+        Returns:
+            该类型的衰减参数 dict（base_strength / decay_rate）。
+
+        Raises:
+            不主动抛异常；type_key 不在 DECAY_PARAMS 时 KeyError 按原逻辑传播。
+
+        组装规则：
+            1. 取 config = get_memory_config()。
+            2. type 转字符串 key。
+            3. config.decay 中有该 key → 返回 config 值（runtime 覆盖）。
+            4. 否则回退 DECAY_PARAMS[type_key]。
+        """
         config = get_memory_config()
         type_key = type.value if isinstance(type, MemoryType) else str(type)
         if hasattr(config, "decay") and type_key in config.decay:
@@ -135,10 +256,42 @@ class DefaultMemoryManager:
         return DECAY_PARAMS[type_key]
 
     def _get_associate_defaults(self) -> dict:
+        """取关联默认参数（缺省 ASSOCIATE_DEFAULTS）。
+
+        Args:
+            无。
+
+        Returns:
+            ASSOCIATE_DEFAULTS 常量 dict。
+
+        Raises:
+            不主动抛异常。
+
+        组装规则：
+            1. 直接返回 ASSOCIATE_DEFAULTS。
+        """
         return ASSOCIATE_DEFAULTS
 
     def _get_consolidate_params(self) -> dict:
+        """取巩固参数（缺省 CONSOLIDATE_PARAMS）。
+
+        Args:
+            无。
+
+        Returns:
+            CONSOLIDATE_PARAMS 常量 dict。
+
+        Raises:
+            不主动抛异常。
+
+        组装规则：
+            1. 直接返回 CONSOLIDATE_PARAMS。
+        """
         return CONSOLIDATE_PARAMS
+
+    # -----------------------------------------------------------------------
+    # 四操作
+    # -----------------------------------------------------------------------
 
     def encode(
         self,
@@ -149,21 +302,31 @@ class DefaultMemoryManager:
         source: str | None = None,
         metadata: dict | None = None,
     ) -> MemoryTrace:
-        """Encode（编码）：创建新记忆（00 §5.3）。
-
-        F2：id = SHA256(content + type.value) 前 16 位（同内容同 type 去重）。
-        点4：get-then-add 幂等 — 同 id 已存在则返回旧 trace（不抛错）。
-        A1：strength = base_strength（初始强度）。
+        """Encode（编码）：创建新记忆。
 
         Args:
-            content: 记忆内容（自然语言，外部传入）
-            type: 记忆类型（episodic/semantic/procedural）
-            importance: 语义重要性 0.0~1.0（默认 0.5，Phase 2 LLM 评估后传入）
-            source: 来源（thread_id / run_id / user_input）
-            metadata: 扩展（tags / project / specialist_id）
+            content: 记忆内容（自然语言，外部传入）。
+            type: 记忆类型（episodic / semantic / procedural）。
+            importance: 语义重要性 0.0~1.0（默认 0.5，Phase 2 LLM 评估后传入）。
+            source: 来源（thread_id / run_id / user_input）。
+            metadata: 扩展（tags / project / specialist_id）。
 
         Returns:
-            MemoryTrace（新建 或 已存在，幂等）
+            MemoryTrace（新建 或 已存在，幂等）。
+
+        Raises:
+            不主动抛异常（同 id 已存在时返回旧 trace，不抛）。
+
+        组装规则：
+            1. F2：trace_id = _compute_trace_id(content, type)。
+            2. 点4：get-then-add 幂等 —— store.get(trace_id)：
+               - 已存在 → emit "memory.encode.duplicate" + 返回旧 trace。
+            3. A1：strength = base_strength（从 _get_decay_params 取）。
+            4. actor = _get_actor()（traceability C）。
+            5. 构造 MemoryTrace（operation_log 初始含一条 encode 日志）。
+            6. store.add(trace)。
+            7. emit "memory.encode"（traceability B）。
+            8. 返回 trace。
         """
         # F2：id = content hash（同内容同 type 去重）
         trace_id = self._compute_trace_id(content, type)
@@ -219,18 +382,30 @@ class DefaultMemoryManager:
         strength: float | None = None,
         type: str | None = None,
     ) -> None:
-        """Associate（关联）：建立两条记忆的关联（00 §5.3，双向）。
+        """Associate（关联）：建立两条记忆的关联（双向）。
 
         D3：超 max_associations_per_trace 时 LRU 淘汰 strength 最低的关联（非静默跳过）。
 
         Args:
-            trace_id_a: 记忆 A 的 id
-            trace_id_b: 记忆 B 的 id
-            strength: 关联强度（默认 ASSOCIATE_DEFAULTS["default_strength"]）
-            type: 关联类型（默认 ASSOCIATE_DEFAULTS["default_type"]）
+            trace_id_a: 记忆 A 的 id。
+            trace_id_b: 记忆 B 的 id。
+            strength: 关联强度（默认 ASSOCIATE_DEFAULTS["default_strength"]）。
+            type: 关联类型（默认 ASSOCIATE_DEFAULTS["default_type"]）。
+
+        Returns:
+            None。
 
         Raises:
-            MemoryNotFoundError: trace_id_a 或 trace_id_b 不存在
+            MemoryNotFoundError: trace_id_a 或 trace_id_b 不存在。
+
+        组装规则：
+            1. 取 ASSOCIATE_DEFAULTS，解析 strength / type / max_assocs（默认值兜底）。
+            2. store.get 两条 trace，任一不存在 → 抛 MemoryNotFoundError。
+            3. 构造双向 Association（a→b、b→a）。
+            4. D3：_add_association_with_lru 更新两条 trace（超 max 淘汰最弱）。
+            5. traceability A：两条 trace 各 append 一条 associate 日志。
+            6. store.update 两条。
+            7. emit "memory.associate"（traceability B）。
         """
         defaults = self._get_associate_defaults()
         assoc_strength = strength if strength is not None else defaults["default_strength"]
@@ -276,22 +451,32 @@ class DefaultMemoryManager:
         trace_ids: list[str],
         merged_content: str,
     ) -> MemoryTrace:
-        """Consolidate（巩固）：多条零散记忆合并为一条稳定知识（00 §5.3）。
-
-        E1：max_traces_to_consolidate=10（数量校验）。
-        C1：旧 trace 标记 forgotten（不删除），Retriever 过滤留 L3；consolidate 幂等。
-        merged_content 由外部 LLM 生成后传入（工具里无 LLM）。
+        """Consolidate（巩固）：多条零散记忆合并为一条稳定知识。
 
         Args:
-            trace_ids: 待合并的旧记忆 id 列表（min~max 范围校验）
-            merged_content: 合并后的内容（外部 LLM 生成）
+            trace_ids: 待合并的旧记忆 id 列表（min~max 范围校验）。
+            merged_content: 合并后的内容（外部 LLM 生成）。
 
         Returns:
-            新创建的 semantic MemoryTrace
+            新创建的 semantic MemoryTrace。
 
         Raises:
-            MemoryNotFoundError: trace_ids 中任一不存在
-            ValueError: trace_ids 数量不在 [min, max] 范围
+            MemoryNotFoundError: trace_ids 中任一不存在。
+            ValueError: trace_ids 数量不在 [min, max] 范围。
+
+        组装规则：
+            1. E1：数量校验（min / max），超范围抛 ValueError。
+            2. store.get 全部旧 trace，任一不存在 → 抛 MemoryNotFoundError。
+            3. 算合并后 importance（取 max + boost，上限 1.0）。
+            4. C1 幂等：新 trace id = _compute_trace_id(merged_content, SEMANTIC)；
+               已存在 → emit "memory.consolidate.duplicate" + 返回旧 trace。
+            5. 合并关联（去重 union，排除待合并的内部关联）。
+            6. 构造新 semantic trace（operation_log 初始含一条 consolidate 日志）。
+            7. store.add(new_trace)。
+            8. 标记旧 trace forgotten（C1：不删除；append operation_log "forget"）。
+            9. F2：用 batch_update 一次提交（避免 N 次 O(N²)）。
+            10. emit "memory.consolidate"。
+            11. 返回 new_trace。
         """
         params = self._get_consolidate_params()
 
@@ -397,21 +582,30 @@ class DefaultMemoryManager:
         trace_id: str,
         new_content: str,
     ) -> MemoryTrace:
-        """Reconsolidate（重编码）：更新已有记忆内容（00 §5.3）。
+        """Reconsolidate（重编码）：更新已有记忆内容。
 
         B3：保留原 strength + last_accessed=now（不重置强度，视为一次访问）。
         new_content 由外部 LLM 生成后传入（工具里无 LLM）。
         frozen 语义：id 不变，content 替换，operation_log 记 diff（旧内容前 200 字符不丢）。
 
         Args:
-            trace_id: 待更新的记忆 id
-            new_content: 新内容（外部 LLM 生成）
+            trace_id: 待更新的记忆 id。
+            new_content: 新内容（外部 LLM 生成）。
 
         Returns:
-            更新后的 MemoryTrace（id 不变，content 替换，strength 保留）
+            更新后的 MemoryTrace（id 不变，content 替换，strength 保留）。
 
         Raises:
-            MemoryNotFoundError: trace_id 不存在
+            MemoryNotFoundError: trace_id 不存在。
+
+        组装规则：
+            1. store.get(trace_id)，不存在 → 抛 MemoryNotFoundError。
+            2. B3：replace 替换 content + last_accessed=now（strength 不动）。
+            3. traceability A：with_operation append reconsolidate 日志
+               （diff 记旧内容前 200 字符 + 新内容前 200 字符，strength 前后不变）。
+            4. store.update(updated)。
+            5. emit "memory.reconsolidate"（traceability B）。
+            6. 返回 updated。
         """
         old_trace = self._store.get(trace_id)
         if old_trace is None:

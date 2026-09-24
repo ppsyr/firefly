@@ -1,13 +1,37 @@
-"""VersionDAG — 演化产物 version DAG + is_active 单指针 + 回滚 + hash 防环（R1）。
+"""VersionDAG — 演化产物 version DAG + is_active 单指针 + 回滚 + hash 防环。
 
-设计（42 文档 §7.8 + spec.md VersionDAG Requirement + R1）:
-- commit 写 evolution_artifacts + evolution_experiments 表 + is_active 单指针更新
-- get_active L1 每次调用查 DB（不缓存，保 hot swap，INV-12）
-- rollback is_active 指针回退
-- hash_exists_in_recent 检查近 5 版防环（INV-7/INV-27）
-- reject candidate 也存（防重复尝试）
-- 持久化 SQLite（multiagent.db 加表，Z3 模式，与 L1 metrics 同 db 不同表）
-- 演化失败保持旧 is_active（INV-13）
+【整体职责】
+持久化 L2 演化产物与实验记录：commit 写入 evolution_artifacts +
+evolution_experiments 两张表，accept 时更新 is_active 单指针；
+提供 get_active / get_history / rollback / hash_exists_in_recent 四个查询。
+
+【内容摘要】
+- _VERSION_DAG_SCHEMA_SQL : 两张表建表 SQL（幂等）。
+- ArtifactRow(frozen)     : evolution_artifacts 表行。
+- _artifact_type_name()   : 从 artifact 实例推断 artifact_type 名。
+- _serialize_payload()    : 序列化 artifact 为 JSON。
+- _deserialize_payload()  : 从 ArtifactRow 反序列化 artifact。
+- _DummySelector          : 反序列化 placeholder。
+- VersionDAG              : 主类（commit / get_active / get_history / rollback / hash_exists_in_recent）。
+
+【职责边界】
+- 只负责：持久化 artifact + experiment、is_active 单指针维护、回滚、hash 防环查询。
+- 不负责：变异（mutator 负责）、评估（PromotionGate 负责）、
+  晋升决策（PromotionGate.decide 负责）。
+- 不持有重状态：只持有 db_path + 锁。
+
+【INVARIANT】
+- 持久化 SQLite（multiagent.db 加表，与 L1 metrics 同 db 不同表——Z3 模式）。
+- is_active 单指针：同 artifact_type + template_id 仅 1 行 is_active=1。
+- get_active 每次查 DB（不缓存，保 hot swap）。
+- reject candidate 也存（防重复尝试），但 is_active 不更新。
+- hash_exists_in_recent 检查近 5 版防环。
+- 演化失败保持旧 is_active（不更新指针）。
+- commit 同时写 artifact 和 experiment 记录。
+- artifact_id 格式：art_<12 位 hex>；experiment_id 格式：exp_<12 位 hex>。
+- extractors / filters / skill_selector 仅存类名，反序列化为空 tuple / DummySelector
+  （L1 hot swap 时重新构造）。
+- WAL 模式 + busy_timeout=30000 + threading.Lock。
 """
 from __future__ import annotations
 
@@ -26,7 +50,7 @@ from poirot.backend.agents.multiagent.evolution.types import (
     SkillInjectionTemplate,
 )
 
-# L2 表 schema（加到 multiagent.db，与 L1 specialist_records 同 db 不同表）
+# L2 表 schema（加到 multiagent.db，与 L1 specialist_records 同 db 不同表）。
 _VERSION_DAG_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS evolution_artifacts (
     artifact_id     TEXT PRIMARY KEY,
@@ -58,7 +82,10 @@ CREATE INDEX IF NOT EXISTS idx_evo_exp_artifact ON evolution_experiments(artifac
 
 @dataclass(frozen=True)
 class ArtifactRow:
-    """evolution_artifacts 表行（get_active / get_history 返回）。"""
+    """evolution_artifacts 表行（get_active / get_history 返回）。
+
+    字段与表列一一对应；is_active 从 INTEGER 转 bool。
+    """
 
     artifact_id: str
     artifact_type: str
@@ -72,7 +99,7 @@ class ArtifactRow:
 
 
 def _artifact_type_name(artifact: EvolutionArtifact) -> str:
-    """artifact_type 字段值（'context_summary' | 'skill_injection'）。"""
+    """从 artifact 实例推断 artifact_type 名（'context_summary' | 'skill_injection'）。"""
     if isinstance(artifact, ContextSummaryTemplate):
         return "context_summary"
     if isinstance(artifact, SkillInjectionTemplate):
@@ -81,7 +108,7 @@ def _artifact_type_name(artifact: EvolutionArtifact) -> str:
 
 
 def _serialize_payload(artifact: EvolutionArtifact) -> str:
-    """序列化 artifact payload 为 JSON（结构化 dataclass，可 diff / 回滚）."""
+    """序列化 artifact payload 为 JSON（结构化 dataclass，可 diff / 回滚）。"""
     if isinstance(artifact, ContextSummaryTemplate):
         return json.dumps({
             "version": artifact.version,
@@ -103,10 +130,13 @@ def _serialize_payload(artifact: EvolutionArtifact) -> str:
 
 
 def _deserialize_payload(row: ArtifactRow) -> EvolutionArtifact:
-    """从 payload_json 反序列化 artifact."""
+    """从 payload_json 反序列化 artifact。
+
+    extractors / filters / skill_selector 仅存类名，反序列化为空 tuple / DummySelector
+    （hot swap 时 L1 重新构造真实对象）。
+    """
     payload = json.loads(row.payload_json)
     if row.artifact_type == "context_summary":
-        # extractors/filters 仅存类名，反序列化为空 tuple（hot swap 时 L1 重新构造）
         return ContextSummaryTemplate(
             version=payload["version"],
             template_id=payload["template_id"],
@@ -127,37 +157,39 @@ def _deserialize_payload(row: ArtifactRow) -> EvolutionArtifact:
 
 
 class _DummySelector:
-    """反序列化 placeholder（L1 hot swap 时重新构造真实 selector）."""
+    """反序列化 placeholder（L1 hot swap 时重新构造真实 selector）。"""
 
     def select(self, goal: str, available_skills: list) -> tuple:
         return ()
 
 
 class VersionDAG:
-    """演化产物 version DAG + is_active 单指针 + 回滚 + hash 防环（R1）。
+    """演化产物 version DAG + is_active 单指针 + 回滚 + hash 防环。
 
-    INVARIANT:
-    - 持久化 SQLite（multiagent.db 加表，Z3 模式，INV-11）
-    - is_active 单指针（同 template_id 仅 1 行 is_active=1，INV-7）
-    - get_active 每次查 DB（不缓存，保 hot swap，INV-12）
-    - reject candidate 也存（防重复尝试）
-    - hash_exists_in_recent 近 5 版防环（INV-27）
-    - 演化失败保持旧 is_active（INV-13）
+    - 持久化 SQLite（multiagent.db 加表，与 L1 metrics 同 db 不同表）。
+    - is_active 单指针：同 template_id 仅 1 行 is_active=1。
+    - get_active 每次查 DB（不缓存，保 hot swap）。
+    - reject candidate 也存（防重复尝试）。
+    - hash_exists_in_recent 近 5 版防环。
+    - 演化失败保持旧 is_active。
     """
 
     def __init__(self, db_path: str = ".poirot/multiagent.db") -> None:
+        """初始化：建父目录 + 幂等建表。"""
         self._db_path = db_path
         self._lock = threading.Lock()
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
+        """建立连接并设置 WAL + busy_timeout。每次调用返回新连接。"""
         conn = sqlite3.connect(self._db_path, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def _init_schema(self) -> None:
+        """幂等建表（CREATE TABLE IF NOT EXISTS）。"""
         with self._lock:
             conn = self._connect()
             try:
@@ -177,10 +209,24 @@ class VersionDAG:
         rationale: str = "",
         decision: str = "accept",
     ) -> str:
-        """commit artifact + eval_result 到 DB + is_active 单指针更新（accept 时）.
+        """commit artifact + eval_result 到 DB + is_active 单指针更新（accept 时）。
 
-        reject candidate 也存（防重复尝试），但 is_active 不更新.
-        返 artifact_id.
+        - 插入 evolution_artifacts 行（is_active 初始 0）。
+        - decision == "accept" → 先把同类型同 template_id 全置 0，再把本行置 1。
+        - 插入 evolution_experiments 记录（含 eval_result_json）。
+        - reject candidate 也存（防重复尝试），但 is_active 不更新。
+
+        Args:
+            artifact: 演化产物。
+            eval_result: 评估结果（任意对象，取 candidate_score 等字段）。
+            from_artifact_id: 父版本 ID（可选）。
+            trigger_source: 触发源（写 experiment）。
+            trigger_detail: 触发详情。
+            rationale: 演化理由。
+            decision: "accept" 才更新 is_active。
+
+        Returns:
+            新 artifact_id。
         """
         artifact_id = f"art_{uuid.uuid4().hex[:12]}"
         artifact_type = _artifact_type_name(artifact)
@@ -201,7 +247,7 @@ class VersionDAG:
                      artifact.template_id, payload_json, artifact_hash,
                      rationale, now, 0),
                 )
-                # accept 时 is_active 单指针更新（同 artifact_type + template_id 仅 1 行 active）
+                # accept 时 is_active 单指针更新
                 if decision == "accept":
                     conn.execute(
                         "UPDATE evolution_artifacts SET is_active=0 WHERE artifact_type=? AND template_id=?",
@@ -237,7 +283,16 @@ class VersionDAG:
         return artifact_id
 
     def get_active(self, artifact_type: type) -> EvolutionArtifact | None:
-        """L1 每次调用查 DB 取 is_active（不缓存，保 hot swap，INV-12）."""
+        """L1 每次调用查 DB 取 is_active（不缓存，保 hot swap）。
+
+        按 artifact_type 查 is_active=1 的最新一条；无则返回 None。
+
+        Args:
+            artifact_type: ContextSummaryTemplate 或 SkillInjectionTemplate 类。
+
+        Returns:
+            反序列化后的 artifact，或 None。
+        """
         type_name = "context_summary" if artifact_type is ContextSummaryTemplate else "skill_injection"
         with self._lock:
             conn = self._connect()
@@ -264,7 +319,15 @@ class VersionDAG:
     def get_history(
         self, artifact_type: type, template_id: str
     ) -> list[ArtifactRow]:
-        """查询同 template_id 的所有版本（按 created_at 降序）."""
+        """查询同 template_id 的所有版本（按 created_at 降序）。
+
+        Args:
+            artifact_type: ContextSummaryTemplate 或 SkillInjectionTemplate 类。
+            template_id: 模板 ID。
+
+        Returns:
+            ArtifactRow 列表（按 created_at 降序）。
+        """
         type_name = "context_summary" if artifact_type is ContextSummaryTemplate else "skill_injection"
         with self._lock:
             conn = self._connect()
@@ -289,11 +352,19 @@ class VersionDAG:
         ]
 
     def rollback(self, artifact_id: str) -> None:
-        """is_active 指针回退到指定 artifact_id."""
+        """is_active 指针回退到指定 artifact_id。
+
+        流程：
+        1. 查目标 artifact 的 artifact_type + template_id。
+        2. 同 artifact_type + template_id 全部 is_active=0。
+        3. 指定 artifact is_active=1。
+
+        Args:
+            artifact_id: 要回滚到的版本 ID。
+        """
         with self._lock:
             conn = self._connect()
             try:
-                # 查 artifact 的 artifact_type + template_id
                 row = conn.execute(
                     "SELECT artifact_type, template_id FROM evolution_artifacts WHERE artifact_id=?",
                     (artifact_id,),
@@ -301,7 +372,7 @@ class VersionDAG:
                 if row is None:
                     return
                 artifact_type, template_id = row[0], row[1]
-                # 同 artifact_type + template_id 全部 is_active=0
+                # 同类型同 template_id 全部 is_active=0
                 conn.execute(
                     "UPDATE evolution_artifacts SET is_active=0 WHERE artifact_type=? AND template_id=?",
                     (artifact_type, template_id),
@@ -318,7 +389,15 @@ class VersionDAG:
     def hash_exists_in_recent(
         self, artifact_hash: str, window: int = 5
     ) -> bool:
-        """检查近 N 版是否含此 hash（防环，INV-27）."""
+        """检查近 N 版是否含此 hash（防环）。
+
+        Args:
+            artifact_hash: 待检查的 hash。
+            window: 检查最近多少版，默认 5。
+
+        Returns:
+            是否存在。
+        """
         with self._lock:
             conn = self._connect()
             try:

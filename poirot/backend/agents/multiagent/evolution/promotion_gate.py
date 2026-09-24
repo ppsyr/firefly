@@ -1,12 +1,34 @@
-"""PromotionGate — longitudinal pairs eval + Wilson 95% CI + hash 防环（R3）。
+"""PromotionGate — longitudinal pairs eval + Wilson 95% CI + hash 防环。
 
-设计（42 文档 §7.8 + spec.md PromotionGate Requirement + R3）:
-- evaluate：candidate vs baseline 各跑 task_sample → 用 L1 ResultSummarizer.success_criteria_met 评估 → Wilson 95% CI
-- decide：hash 命中近 5 版 → REJECT / candidate CI 下界 > baseline CI 上界 → ACCEPT / 否则 REJECT
-- _wilson_ci：Wilson score interval（z=1.96，小样本友好，p=0/1 不退化）
-- eval 整体超时 30min（R3.5）
-- MVP eval 来源：L1 ResultSummarizer.success_criteria_met（floor eval）
-- task 累计 ≤ 3 次（防过拟合，R3.4）
+【整体职责】
+L2 的晋升门：先评估 candidate vs baseline（longitudinal pairs，或经 L3 bridge 分发），
+再根据评估结果与 hash 防环规则决定 ACCEPT / REJECT / FAILED。
+是"变异 → 评估 → 晋升"链条的最后一环。
+
+【内容摘要】
+- EvalTask(frozen)          : 单个评估任务（一条历史 specialist 调用记录）。
+- EvalResult(frozen)        : 评估结果（candidate / baseline 分数 + CI + 元信息）。
+- Evaluator(Protocol)       : 评估器抽象（evaluate(artifact, task) -> bool）。
+- PromotionGate             : 晋升门主类（evaluate / decide）。
+- _wilson_ci()              : Wilson score interval 计算（小样本友好）。
+
+【职责边界】
+- 只负责：评估 candidate vs baseline、按 hash + CI 规则决策。
+- 不负责：变异（mutator 负责）、版本持久化（version_dag 负责）、
+  L3 内部评估实现（bridge / adapter 负责）。
+- 不持有重状态：只持有 evaluator / version_dag / bridge / _task_use_count。
+
+【INVARIANT】
+- hash 命中近 5 版 → REJECT（防环）。
+- candidate CI 下界 > baseline CI 上界 → ACCEPT。
+- eval 失败 → FAILED（保持旧 is_active）。
+- Wilson score interval：z=1.96，小样本友好，p=0/1 不退化。
+- eval 整体超时（默认 30min）→ 返回 success=False + "overall_timeout"。
+- task 累计使用次数 ≤ eval_task_max_reuse（默认 3，防过拟合）。
+- 单 task 异常 → 跳过（continue）。
+- bridge 非 None 时优先走 L3（构造 EvalContext 调 bridge.evaluate）。
+- evaluator 为 None 且 bridge 为 None → 返回失败（no evaluator configured）。
+- EvalResult 只存 candidate 的 CI；baseline CI 在 decide 里重算。
 """
 from __future__ import annotations
 
@@ -27,7 +49,15 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class EvalTask:
-    """单个评估 task——一个历史 specialist 调用记录（L2 演化时抽样传入）."""
+    """单个评估任务——一条历史 specialist 调用记录（L2 演化时抽样传入）。
+
+    字段：
+    - task_id: 任务唯一 ID（用于累计使用次数）。
+    - goal / success_criteria: 任务定义。
+    - sandbox_id: 沙箱 ID（可选）。
+    - context_snapshot_ref: 上下文快照引用（可选）。
+    - expected_outcome: 期望结果（可选）。
+    """
 
     task_id: str
     goal: str
@@ -39,9 +69,17 @@ class EvalTask:
 
 @dataclass(frozen=True)
 class EvalResult:
-    """L3 evaluate 返回的评估结果（L2 自建同构，不 import skill）.
+    """评估结果（L2 自建同构，不 import skill）。
 
-    与 skill EvalResult 同构但独立（skill 含 SkillRecord，L2 含 EvolutionArtifact）.
+    与 skill EvalResult 同构但独立——skill 含 SkillRecord，L2 含 EvolutionArtifact。
+
+    字段：
+    - candidate_score / baseline_score: 两者的平均分。
+    - ci_low / ci_high: candidate 的 Wilson CI（只存 candidate）。
+    - sample_size: 样本数。
+    - method_used: 评估方法名。
+    - success: 评估是否成功。
+    - failure_reason: 失败原因（成功时为 None）。
     """
 
     candidate_score: float
@@ -56,24 +94,24 @@ class EvalResult:
 
 
 class Evaluator(Protocol):
-    """评估器抽象（调 L1 ResultSummarizer.success_criteria_met 跑 candidate vs baseline）.
+    """评估器抽象。
 
-    evaluate(artifact, task) → bool：跑 artifact 在 task 上，返 success_criteria_met.
+    evaluate(artifact, task) -> bool：跑 artifact 在 task 上，返回 success_criteria_met。
     """
 
     def evaluate(self, artifact: EvolutionArtifact, task: EvalTask) -> bool: ...
 
 
 class PromotionGate:
-    """longitudinal pairs eval + Wilson 95% CI + hash 防环（R3）.
+    """longitudinal pairs eval + Wilson 95% CI + hash 防环。
 
-    INVARIANT:
-    - hash 命中近 5 版 → REJECT（防震，INV-7）
-    - candidate CI 下界 > baseline CI 上界 → ACCEPT（INV-24）
-    - Wilson score interval（z=1.96，小样本友好，p=0/1 不退化，INV-20）
-    - eval 整体超时 30min → 中断 + 保持旧 is_active（INV-22）
-    - task 累计 ≤ 3 次（防过拟合，R3.4）
-    - MVP eval 来源：L1 ResultSummarizer.success_criteria_met（floor eval）
+    - hash 命中近 5 版 → REJECT（防环）。
+    - candidate CI 下界 > baseline CI 上界 → ACCEPT。
+    - eval 失败 → FAILED。
+    - Wilson CI（z=1.96，小样本友好）。
+    - eval 超时（默认 30min）→ 中断 + 保持旧 is_active。
+    - task 累计 ≤ 3 次（防过拟合）。
+    - bridge 非 None 时优先走 L3。
     """
 
     def __init__(
@@ -87,6 +125,17 @@ class PromotionGate:
         z_score: float = 1.96,
         bridge: "EvalBridge | None" = None,
     ) -> None:
+        """初始化。
+
+        Args:
+            evaluator: 评估器（MVP 可为 None）；bridge 为 None 时用它做 floor eval。
+            version_dag: 版本 DAG，提供 hash_exists_in_recent 用于防环。
+            eval_timeout_seconds: 评估整体超时（秒），默认 30min。
+            eval_sample_min / eval_sample_max: 样本数范围（MVP 未使用，预留）。
+            eval_task_max_reuse: 单 task 累计最大使用次数（防过拟合），默认 3。
+            z_score: Wilson CI 的 z 值，默认 1.96。
+            bridge: L3 EvalBridge；非 None 时优先走 L3 评估。
+        """
         self._evaluator = evaluator
         self._version_dag = version_dag
         self._eval_timeout = eval_timeout_seconds
@@ -95,7 +144,7 @@ class PromotionGate:
         self._task_max_reuse = eval_task_max_reuse
         self._z = z_score
         self._bridge = bridge
-        # task 累计使用次数（防过拟合，R3.4）
+        # task 累计使用次数（防过拟合）
         self._task_use_count: dict[str, int] = {}
 
     def evaluate(
@@ -104,10 +153,24 @@ class PromotionGate:
         baseline: EvolutionArtifact,
         task_sample: list[EvalTask],
     ) -> EvalResult:
-        """longitudinal pairs eval：candidate vs baseline 各跑 task_sample.
+        """longitudinal pairs eval：candidate vs baseline 各跑 task_sample。
 
-        过滤累计超 _task_max_reuse 的 task（防过拟合）.
-        超时 → 返 EvalResult(success=False, failure_reason='overall_timeout').
+        流程：
+        1. bridge 非 None → 构造 EvalContext，调 bridge.evaluate（L3 分发）。
+        2. evaluator 为 None → 返回失败（no evaluator configured）。
+        3. 过滤累计超 _task_max_reuse 的 task（防过拟合）。
+        4. 遍历 task，各评估 candidate / baseline；单 task 异常跳过。
+        5. 每次执行前检查超时。
+        6. 全部失败 → 返回失败（all_tasks_failed）。
+        7. 算平均分 + Wilson CI，返回 EvalResult。
+
+        Args:
+            candidate: L2 变异出的新版本。
+            baseline: 当前活跃版本。
+            task_sample: 抽样出的评估任务列表。
+
+        Returns:
+            EvalResult（success / candidate_score / baseline_score / CI）。
         """
         # L3 bridge 分发：bridge 非 None 时调 bridge.evaluate(ctx)，否则既有 floor eval
         if self._bridge is not None:
@@ -156,7 +219,7 @@ class PromotionGate:
                 c_met = self._evaluator.evaluate(candidate, task)
                 b_met = self._evaluator.evaluate(baseline, task)
             except Exception:
-                # 单 task 跑挂 skip + 补抽（R3.5）
+                # 单 task 跑挂 skip
                 continue
             candidate_scores.append(1.0 if c_met else 0.0)
             baseline_scores.append(1.0 if b_met else 0.0)
@@ -190,13 +253,28 @@ class PromotionGate:
         baseline: EvolutionArtifact,
         eval_result: EvalResult,
     ) -> PromotionDecision:
-        """决策：hash 防环命中 → REJECT / candidate CI 下界 > baseline CI 上界 → ACCEPT / 否则 REJECT（INV-24）."""
-        # hash 防环：candidate hash 命中近 5 版 → REJECT（INV-7）
+        """晋升决策。
+
+        规则（顺序）：
+        1. hash 命中近 5 版 → REJECT（防环）。
+        2. eval 失败 → FAILED（保持旧 is_active）。
+        3. candidate CI 下界 > baseline CI 上界 → ACCEPT。
+        4. 否则 → REJECT。
+
+        Args:
+            candidate: 新版本产物。
+            baseline: 当前活跃版本。
+            eval_result: evaluate 产出的评估结果。
+
+        Returns:
+            PromotionDecision（ACCEPT / REJECT / FAILED）。
+        """
+        # hash 防环：candidate hash 命中近 5 版 → REJECT
         if self._version_dag is not None:
             if self._version_dag.hash_exists_in_recent(candidate.artifact_hash, window=5):
                 return PromotionDecision.REJECT
 
-        # eval 失败 → REJECT（保持旧 is_active，INV-13）
+        # eval 失败 → REJECT（保持旧 is_active）
         if not eval_result.success:
             return PromotionDecision.FAILED
 
@@ -206,7 +284,7 @@ class PromotionGate:
             eval_result.baseline_score, eval_result.sample_size, self._z
         )
 
-        # candidate CI 下界 > baseline CI 上界 → ACCEPT（INV-24）
+        # candidate CI 下界 > baseline CI 上界 → ACCEPT
         if eval_result.ci_low > b_high:
             return PromotionDecision.ACCEPT
         return PromotionDecision.REJECT
@@ -215,10 +293,18 @@ class PromotionGate:
 def _wilson_ci(
     score: float, sample_size: int, z: float = 1.96
 ) -> tuple[float, float]:
-    """Wilson score interval 计算（小样本友好，p=0/1 不退化，INV-20）.
+    """Wilson score interval 计算（小样本友好，p=0/1 不退化）。
 
     公式：p̂ ± z·√(p̂(1-p̂)/n + z²/(4n²)) / (1+z²/n)
-    z=1.96 对应 95% CI.
+    z=1.96 对应 95% CI。
+
+    Args:
+        score: 观测比例（会被 clamp 到 [0,1]）。
+        sample_size: 样本数；0 时返回 (0.0, 0.0)。
+        z: z 值，默认 1.96。
+
+    Returns:
+        (low, high) 置信区间，均 clamp 到 [0,1]。
     """
     if sample_size == 0:
         return 0.0, 0.0

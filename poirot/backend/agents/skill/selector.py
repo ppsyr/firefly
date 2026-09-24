@@ -1,14 +1,36 @@
 """SkillSelector — quality filter + LLM select。混合注入的 agent 自动选半。
 
-INVARIANT:
-- override（用户 /skill 显式）强制包含，不受 quality filter 影响
-- quality filter: 淘汰 effective_rate < threshold AND total_selections >= min
-  （< min 的新 skill 不淘汰，给数据积累——anti-loop，INV#12）
-- 候选 <= max_skills → 全返，跳过 LLM
-- 候选 > max_skills 且 llm 提供 → LLM select ≤ max
-- 候选 > max_skills 且无 llm → 按 effective_rate 降序取 top max（fallback）
-- LLM select 失败 → fallback effective_rate 排序
-- 无 store 时返空
+【整体职责】
+skill 读路径的决策核心。
+从 store 的 active skills 里，选出本轮最多 max_skills 个技能，
+供 SkillInjectionMiddleware 注入。选择策略：
+    override 强制包含 → quality filter 淘汰 → 候选裁剪（全返 / LLM / 排序 fallback）。
+
+【内容摘要】
+- SkillSelector               : 选择器主类。
+    - __init__(store, llm, max_skills, quality_threshold, min_selections)
+    - select_for_task(task, overrides) : 对外主入口，返回选中 list[SkillRecord]。
+    - _quality_filter(skills)          : 淘汰低质技能（新技能豁免）。
+    - _llm_select(candidates, task, max): 让 LLM 从候选中挑 ≤ max。
+    - _build_catalog(candidates)       : 构造喂给 LLM 的候选目录文本。
+    - _extract_json(text)              : 从可能带 markdown fence 的文本里提取 JSON。
+
+【职责边界】
+- 只负责：候选收集、quality 过滤、候选裁剪（全返 / LLM / 排序 fallback）、去重。
+- 不负责：持久化（store）、注入渲染（injector）、打点（metrics）、解析（parser）。
+- 不写 store：只读（get_active / list_active）；选择结果的打点由 middleware 完成。
+- LLM 只用于"从候选中挑 ≤ max"；候选数 ≤ max 时跳过 LLM。
+
+【INVARIANT】
+- override（用户 /skill 显式）强制包含，不受 quality filter 影响。
+- quality filter：淘汰 effective_rate < threshold AND total_selections >= min；
+  selections < min 的新 skill 不淘汰（anti-loop，给数据积累）。
+- 候选 <= max_skills → 全返，跳过 LLM。
+- 候选 > max_skills 且 llm 提供 → LLM select ≤ max。
+- 候选 > max_skills 且无 llm → 按 effective_rate 降序取 top max（fallback）。
+- LLM select 失败 → fallback effective_rate 排序。
+- 无 store 时返空。
+- 去重：同一 skill_id 只出现一次，override 优先。
 """
 from __future__ import annotations
 
@@ -34,6 +56,15 @@ class SkillSelector:
         quality_threshold: float = 0.3,
         min_selections: int = 5,
     ) -> None:
+        """保存依赖与选择参数（参数由 config 注入）。
+
+        Args:
+            store:             技能存储（提供 get_active / list_active）。
+            llm:               语言模型，可选；None 时跳过 LLM 选择，走排序 fallback。
+            max_skills:        单轮最多选中的技能数。
+            quality_threshold: quality filter 淘汰阈值。
+            min_selections:    淘汰判定的最少 selections（anti-loop）。
+        """
         self._store = store
         self._llm = llm
         self._max_skills = max_skills
@@ -45,6 +76,23 @@ class SkillSelector:
         task_description: str,
         overrides: list[str] | None = None,
     ) -> list[SkillRecord]:
+        """选本轮技能（对外主入口）。
+
+        步骤：
+            1. override 强制包含（不受 filter 影响；仅取 active + enabled）。
+            2. 取 active + enabled，做 quality filter。
+            3. 去重合并（override 优先）。
+            4. 候选 <= max → 全返，跳过 LLM。
+            5. 候选 > max 且有 llm → LLM select；成功则返回。
+            6. fallback：按 effective_rate 降序取 top max。
+
+        Args:
+            task_description: 任务描述（供 LLM 相关性判断）。
+            overrides:        用户 /skill 显式指定的 skill name 列表。
+
+        Returns:
+            选中的 list[SkillRecord]；store 为 None 时返回 []。
+        """
         if self._store is None:
             return []
         # 1. override 强制包含（不受 filter 影响）

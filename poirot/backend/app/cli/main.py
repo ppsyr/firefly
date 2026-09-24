@@ -1,3 +1,37 @@
+"""CLI 入口 — 命令行参数解析、启动配置与主循环。
+
+【整体职责】
+Poirot 的进程入口：加载 .env、解析命令行（chat / cli / run 三种模式）、引导首次配置，
+启动后进入交互主循环（TUI 或传统 CLI）。主循环负责用户输入 → 命令处理 → 意图识别 →
+流式研究 → 报告触发，并维护 cli_state（模式 / 模型 / token 展示）。
+
+【内容摘要】
+- main                 : 入口，解析参数并分发到 run / cli / 默认 chat 三种模式。
+- run_chat             : 启动 bootstrap，进入 TUI 或传统 CLI。
+- _build_stream_config : 构造 graph config（供 stream 使用）。
+- _run_chat_async      : 传统 CLI 主循环（prompt_toolkit + rich）。
+- run_chat 内嵌：_print_status / _print_welcome / _handle_report_intent / _trigger_report。
+
+【职责边界】
+- 只负责：参数解析、启动编排、交互主循环、呈现（banner / welcome / Markdown 渲染）。
+- 不负责：运行时装配（bootstrap）、Agent 执行与图逻辑（leader/agent）、
+  报告合成逻辑（agents/reporting）、命令实现细节（commands）。
+
+【INVARIANT】
+- .env 显式从项目根加载：load_dotenv(_PROJECT_ROOT / ".env")，避免从非项目根启动时
+  POIROT_SKILL_* 等配置缺失导致 skill 模块被误跳过。
+- 首次启动引导：.env 不存在时先跑 ensure_config，失败返回 1。
+- bootstrap 在 asyncio.run 之前（同步阶段）：避免 MCP 的 asyncio.run 嵌套。
+- 三种模式：
+  - 无子命令 → 默认 TUI（textual）；
+  - cli       → 传统 CLI（prompt_toolkit + rich）；
+  - run       → 单次提问，直接输出报告与 run_id / events / artifact。
+- run 模式默认 expert：--expert 默认 True，--no-expert 关闭。
+- 意图先于 graph：intent_tree.detect_and_dispatch 命中则不进 graph。
+- run 生命周期：create_run → mark_running → stream → mark_success / mark_failed。
+- 模式/模型热切换复用 thread_id + checkpointer state。
+- Ctrl+C / Ctrl+D 在输入时退出进程；/exit、/quit 退出。
+"""
 from __future__ import annotations
 
 import argparse
@@ -32,6 +66,14 @@ from poirot.backend.agents.prompts import get_prompt_manager
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """入口：解析参数并分发到各模式。
+
+    Args:
+        argv: 命令行参数；None 时取 sys.argv。
+
+    Returns:
+        int: 退出码（0 成功，1 失败）。
+    """
     # 首次启动配置向导：.env 不存在时引导用户配置
     from poirot.backend.app.cli.setup_wizard import ensure_config
     if not ensure_config(_PROJECT_ROOT):
@@ -90,6 +132,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def run_chat(provider: str | None = None, model: str | None = None, legacy: bool = False) -> int:
+    """启动 bootstrap 并进入 TUI 或传统 CLI。
+
+    Args:
+        provider: 指定 provider。
+        model: 指定模型。
+        legacy: True 走传统 CLI，False 走 TUI。
+
+    Returns:
+        int: 退出码。
+    """
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, OSError):
@@ -108,7 +160,15 @@ def run_chat(provider: str | None = None, model: str | None = None, legacy: bool
 
 
 def _build_stream_config(runtime: AppRuntime, run_context: Any) -> dict:
-    """构建 graph config（stream 用，与 LeaderAgent.run 一致）。"""
+    """构建 graph config（stream 用，与 LeaderAgent.run 一致）。
+
+    Args:
+        runtime: 应用运行时。
+        run_context: 运行上下文。
+
+    Returns:
+        dict: graph 调用配置（configurable + recursion_limit）。
+    """
     rc = run_context.config.runtime
     return {
         "configurable": {
@@ -126,6 +186,16 @@ def _build_stream_config(runtime: AppRuntime, run_context: Any) -> dict:
 
 
 async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str | None) -> int:
+    """传统 CLI 主循环：prompt_toolkit 输入 + rich 渲染 + 流式研究。
+
+    Args:
+        runtime: 应用运行时。
+        provider: 指定 provider。
+        model: 指定模型。
+
+    Returns:
+        int: 退出码。
+    """
     console = Console()
     # cli_state：主循环共享状态——mode/model 供 bottom_toolbar 显示，current_tokens/fraction/window
     # 由 renderer 收到 budget_update 事件时回填（见 stream_handler._update_budget）

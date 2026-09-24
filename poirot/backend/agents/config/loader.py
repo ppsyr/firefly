@@ -1,3 +1,34 @@
+"""配置加载器 — 合并默认配置、叠加层与 CLI 覆盖，校验并构造 AppConfig。
+
+【整体职责】
+配置装载的唯一入口：以 DEFAULT_CONFIG 为基线，按 expert_mode 叠加 EXPERT_PROFILE，
+再应用 CLI 覆盖，经校验后构造出不可变的 AppConfig。sandbox / memory 的配置从环境变量
+懒加载并注入。
+
+【内容摘要】
+- ConfigError            : 配置加载或校验失败时抛出。
+- load_config            : 主入口，合并 → 校验 → 构造 AppConfig。
+- _apply_cli_overrides   : 应用 CLI 覆盖（expert_mode + 扁平字段映射）。
+- _validate              : 校验必填字段与取值范围。
+- _build_sandbox_config  : 从 POIROT_SANDBOX_* 环境变量构造 SandboxConfig。
+- _build_memory_config   : 从 POIROT_MEMORY_* 环境变量构造 MemoryConfig。
+- _build_config          : 把 raw dict 组装为 AppConfig。
+- _deep_merge            : 递归深合并，dict 逐层覆盖，其他类型直接替换。
+
+【职责边界】
+- 只负责：配置的合并、覆盖、校验、组装，以及 sandbox / memory 的 env 懒加载。
+- 不负责：默认值的定义（defaults）、配置结构定义（schema）、provider 配置解析
+  （provider_config）、sandbox / memory 配置的内部语义（各自模块定义）。
+
+【INVARIANT】
+- 不修改全局：先 deepcopy(DEFAULT_CONFIG) 再合并，避免污染默认配置。
+- expert_mode 优先级：cli_overrides > 函数参数 > 默认 False。
+- expert_mode=True 才叠加 EXPERT_PROFILE；False 时保持 DEFAULT。
+- expert_mode 类型强校验：非 bool 抛 ConfigError。
+- 扁平 CLI 覆盖：仅支持白名单字段（logs_root / output_root / researcher_model /
+  reporter_model / save_artifact），映射到对应 section。
+- sandbox / memory 懒加载：use 为空表示禁用，值从环境变量读取。
+"""
 from __future__ import annotations
 
 import os
@@ -27,6 +58,18 @@ def load_config(
     expert_mode: bool = False,
     cli_overrides: dict[str, Any] | None = None,
 ) -> AppConfig:
+    """加载配置：合并默认 + 叠加层 + CLI 覆盖，校验后构造 AppConfig。
+
+    Args:
+        expert_mode: 是否启用 expert 模式（会被 cli_overrides 中的同名项覆盖）。
+        cli_overrides: CLI 覆盖项，含 expert_mode 与扁平字段（logs_root 等）。
+
+    Returns:
+        AppConfig: 不可变的应用配置。
+
+    Raises:
+        ConfigError: 覆盖项类型非法或校验不通过时。
+    """
     overrides = cli_overrides or {}
     # expert_mode: cli_overrides 优先，其次参数，最后默认 False
     selected_expert = bool(overrides.get("expert_mode", expert_mode))
@@ -40,6 +83,18 @@ def load_config(
 
 
 def _apply_cli_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """应用 CLI 覆盖。
+
+    - expert_mode：类型校验后写入 runtime；为 True 时叠加 EXPERT_PROFILE。
+    - 扁平字段：按白名单映射到对应 section 写入。
+
+    Args:
+        raw: 待修改的配置 dict（原地修改）。
+        overrides: CLI 覆盖项。
+
+    Raises:
+        ConfigError: expert_mode 非 bool 时。
+    """
     if "expert_mode" in overrides:
         em = overrides["expert_mode"]
         if not isinstance(em, bool):
@@ -64,6 +119,15 @@ def _apply_cli_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None
 
 
 def _validate(raw: dict[str, Any]) -> None:
+    """校验必填字段与取值范围。
+
+    Args:
+        raw: 待校验的配置 dict。
+
+    Raises:
+        ConfigError: researcher_model / reporter_model 缺失、expert_mode 非 bool、
+            max_loop_steps < 1、logs_root 缺失时。
+    """
     models = raw["models"]
     if not models.get("researcher_model"):
         raise ConfigError("researcher_model is required")
@@ -78,7 +142,11 @@ def _validate(raw: dict[str, Any]) -> None:
 
 
 def _build_sandbox_config() -> SandboxConfig:
-    """从 POIROT_SANDBOX_* 环境变量构造 SandboxConfig（懒加载，use 为空=禁用）。"""
+    """从 POIROT_SANDBOX_* 环境变量构造 SandboxConfig（懒加载，use 为空=禁用）。
+
+    Returns:
+        SandboxConfig: 沙箱配置。
+    """
     return SandboxConfig(
         use=os.environ.get("POIROT_SANDBOX_USE", ""),
         allow_host_bash=os.environ.get("POIROT_SANDBOX_ALLOW_HOST_BASH", "true").lower() != "false",
@@ -94,7 +162,11 @@ def _build_sandbox_config() -> SandboxConfig:
 
 
 def _build_memory_config() -> MemoryConfig:
-    """从 POIROT_MEMORY_* 环境变量构造 MemoryConfig（懒加载，use 为空=禁用）。"""
+    """从 POIROT_MEMORY_* 环境变量构造 MemoryConfig（懒加载，use 为空=禁用）。
+
+    Returns:
+        MemoryConfig: 记忆配置，含 phase2 子配置。
+    """
     return MemoryConfig(
         use=os.environ.get("POIROT_MEMORY_USE", ""),
         storage_path=os.environ.get("POIROT_MEMORY_STORAGE_PATH", ".poirot/memory"),
@@ -110,6 +182,14 @@ def _build_memory_config() -> MemoryConfig:
 
 
 def _build_config(raw: dict[str, Any]) -> AppConfig:
+    """把 raw dict 组装为 AppConfig。
+
+    Args:
+        raw: 已合并、已校验的配置 dict。
+
+    Returns:
+        AppConfig: 不可变应用配置，sandbox / memory 由 env 懒加载注入。
+    """
     return AppConfig(
         name=raw["name"],
         environment=raw["environment"],
@@ -126,6 +206,12 @@ def _build_config(raw: dict[str, Any]) -> AppConfig:
 
 
 def _deep_merge(target: dict[str, Any], patch: dict[str, Any]) -> None:
+    """递归深合并：dict 逐层合并，其他类型直接替换。
+
+    Args:
+        target: 目标 dict（原地修改）。
+        patch: 覆盖内容。
+    """
     for key, value in patch.items():
         if isinstance(value, dict) and isinstance(target.get(key), dict):
             _deep_merge(target[key], value)

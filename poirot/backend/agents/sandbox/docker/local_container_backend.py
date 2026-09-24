@@ -1,9 +1,54 @@
-"""Local container backend for sandbox provisioning.
+"""LocalContainerBackend — 本地容器基础设施 CRUD（Docker / Apple Container CLI）。
 
-Manages sandbox containers using Docker or Apple Container on the local machine.
-Handles container lifecycle, port allocation, and cross-process container discovery.
+【整体职责】
+实现 SandboxBackend 契约的"本地容器版本"：用 docker / Apple Container CLI 管理
+沙箱容器的创建 / 发现 / 存活检查 / 批量列举 / 销毁，以及端口分配与跨进程发现。
+不依赖 Docker SDK，直接用 subprocess 调 CLI，减少第三方依赖。
+被 DockerSandboxProvider 用作底层基础设施层。
+
+【内容摘要】
+- 模块常量：
+    _DEFAULT_IMAGE                 : 默认镜像（all-in-one-sandbox:latest）。
+    _CONTAINER_PORT                : 容器内服务端口（8080）。
+    _VIRTUAL_PATH_PREFIX           : 容器内虚拟路径前缀（/mnt/poirot/user-data）。
+    _MAX_PORT_RETRIES              : 端口重试上限（10）。
+    _DOCKER_TIMESTAMP_SENTINEL     : 时间戳解析失败时的哨兵值（0.0）。
+- 模块函数：
+    _parse_docker_timestamp        : 解析 Docker ISO 8601 时间戳（纳秒 + Z）。
+    _extract_host_port             : 从 docker inspect 条目提 host port。
+    _format_mount                  : 格式化 bind mount（Docker --mount / Apple -v）。
+    _get_free_port                 : bind 探测空闲端口。
+    _is_no_such_container_error    : 判定 stderr 是否明确"容器不存在"。
+- LocalContainerBackend            : 本地容器后端类。
+    ├─ __init__ / _detect_runtime / _container_name
+    ├─ create          : 幂等创建容器（端口重试循环）。
+    ├─ _start_container: 拼 docker run 命令并执行。
+    ├─ discover        : 按确定性 ID 查已有容器（跨进程恢复）。
+    ├─ _get_container_port: docker port 查 host port。
+    ├─ destroy         : 幂等静默停止容器（--rm 自动移除）。
+    ├─ is_alive        : 轻量 docker inspect，返 True / False / None。
+    ├─ list_running    : batch docker inspect（2 次 subprocess，非 N+1）。
+    └─ _batch_inspect  : 单次 docker inspect *names → dict。
+
+【职责边界】
+- 只负责：容器基础设施 CRUD（create / discover / destroy / is_alive / list_running）。
+- 不负责：容器内命令执行（DockerRuntime）、生命周期编排 / 缓存 / idle（provider）、
+  路径翻译（translator）、安全校验（guard）。
+- 持有状态：镜像 / 端口 / 前缀 / sandbox_root / environment / executor / runtime 类型。
+
+【INVARIANT】
+- create 幂等：同 sandbox_id 已存在则返回既有实例。
+- 容器命名 {container_prefix}-{sandbox_id}（确定性，跨进程可发现）。
+- bind mount .poirot/sandbox/{sandbox_id}:/mnt/poirot/user-data（host 可见）。
+- is_alive 轻量（docker inspect），不调 HTTP；返回 None 表示"未知"（不误杀）。
+- 端口 retry loop 10 次（bind→release→run 竞态兜底）。
+- --rm：容器停止自动移除，destroy 幂等静默（不调 docker rm）。
+- list_running batch docker inspect（2 次 subprocess，非 N+1）。
+- env vars 传 SANDBOX_ID + THREAD_ID。
+- Docker 用 --mount type=bind（避免 Windows 盘符 : 歧义）；Apple Container 用 -v。
+- macOS 优先 Apple Container，否则 Docker。
+- _is_no_such_container_error 区分"容器不存在"与 transient 错误。
 """
-
 from __future__ import annotations
 
 import json
@@ -35,7 +80,7 @@ _DOCKER_TIMESTAMP_SENTINEL = 0.0
 
 
 def _parse_docker_timestamp(raw: str) -> float:
-    """Parse Docker ISO 8601 timestamp（纳秒精度 + Z 后缀）→ epoch float。返 0.0 表未知。"""
+    """解析 Docker ISO 8601 时间戳（纳秒精度 + Z 后缀）→ epoch float；失败返 0.0。"""
     if not raw:
         return _DOCKER_TIMESTAMP_SENTINEL
     try:
@@ -69,7 +114,11 @@ def _extract_host_port(inspect_entry: dict, container_port: int) -> int | None:
 
 
 def _format_mount(runtime: str, host_path: str, container_path: str, read_only: bool) -> list[str]:
-    """格式化 bind mount。Docker 用 --mount type=bind（避免 Windows 盘符 : 歧义）。Apple Container 用 -v。"""
+    """格式化 bind mount。
+
+    - Docker 用 --mount type=bind（避免 Windows 盘符 : 歧义）。
+    - Apple Container 用 -v。
+    """
     if runtime == "docker":
         spec = f"type=bind,src={host_path},dst={container_path}"
         if read_only:
@@ -82,14 +131,14 @@ def _format_mount(runtime: str, host_path: str, container_path: str, read_only: 
 
 
 def _get_free_port(start_port: int) -> int:
-    """从 start_port 探测空闲端口（bind 测试）。"""
+    """从 start_port 起 bind 探测空闲端口。"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", start_port))
         return s.getsockname()[1]
 
 
 def _is_no_such_container_error(stderr: str, container_name: str) -> bool:
-    """判定 stderr 是否明确说容器不存在（区分 transient 错误）。"""
+    """判定 stderr 是否明确说"容器不存在"（区分 transient 错误）。"""
     msg = stderr.lower()
     if "no such object" in msg or "no such container" in msg:
         return True
@@ -99,20 +148,12 @@ def _is_no_such_container_error(stderr: str, container_name: str) -> bool:
 
 
 class LocalContainerBackend(SandboxBackend):
-    """LocalContainerBackend — Docker/Apple Container CLI CRUD。
+    """本地容器后端：Docker / Apple Container CLI CRUD。
 
-    实现 SandboxBackend ABC。用 docker CLI 创建/销毁/检查容器。
+    实现 SandboxBackend ABC。用 docker CLI 创建 / 销毁 / 检查容器。
     不依赖 Docker SDK，减少第三方依赖。
 
-    INVARIANT:
-    - create 幂等：同 sandbox_id 返回已存在的
-    - is_alive 轻量（docker inspect），不调 HTTP
-    - 容器命名 {container_prefix}-{sandbox_id}（确定性，跨进程可发现）
-    - bind mount .poirot/sandbox/{sandbox_id}:/mnt/poirot/user-data（host 可见）
-    - 端口 retry loop 10 次（bind→release→run 竞态兜底）
-    - --rm：容器停止自动移除，destroy 幂等静默
-    - list_running batch docker inspect（2 次 subprocess，非 N+1）
-    - env vars 传 SANDBOX_ID + THREAD_ID
+    核心约束见模块级 INVARIANT。
     """
 
     def __init__(
@@ -133,7 +174,7 @@ class LocalContainerBackend(SandboxBackend):
         self._runtime = self._detect_runtime()
 
     def _detect_runtime(self) -> str:
-        """macOS 优先 Apple Container，否则 Docker。"""
+        """探测容器运行时：macOS 优先 Apple Container，否则 Docker。"""
         if platform.system() == "Darwin":
             try:
                 subprocess.run(
@@ -146,6 +187,7 @@ class LocalContainerBackend(SandboxBackend):
         return "docker"
 
     def _container_name(self, sandbox_id: str) -> str:
+        """容器名 = {prefix}-{sandbox_id}（确定性，跨进程可发现）。"""
         return f"{self._prefix}-{sandbox_id}"
 
     def create(
@@ -156,6 +198,11 @@ class LocalContainerBackend(SandboxBackend):
         *,
         user_id: str | None = None,
     ) -> SandboxInfo:
+        """创建容器（幂等）：已存在则复用；否则带端口重试循环启动。
+
+        - 端口冲突（already allocated / in use）→ 换端口重试，最多 10 次。
+        - 容器名冲突 → discover 复用已存在容器。
+        """
         validate_sandbox_id(sandbox_id)
         name = self._container_name(sandbox_id)
         existing = self.discover(sandbox_id)
@@ -198,6 +245,13 @@ class LocalContainerBackend(SandboxBackend):
         thread_id: str,
         extra_mounts: list[PathMapping] | None,
     ) -> str:
+        """拼 docker run 命令并执行，返回 container_id。
+
+        - Docker 加 --security-opt seccomp=unconfined + bind_host 限制。
+        - 注入 SANDBOX_ID / THREAD_ID + 自定义 environment。
+        - bind mount sandbox_root/{sandbox_id} → /mnt/poirot/user-data。
+        - 追加 extra_mounts。
+        """
         cmd = [self._runtime, "run"]
         if self._runtime == "docker":
             cmd.extend(["--security-opt", "seccomp=unconfined"])
@@ -233,7 +287,10 @@ class LocalContainerBackend(SandboxBackend):
             raise RuntimeError(f"Failed to start sandbox container: {exc.stderr}") from exc
 
     def discover(self, sandbox_id: str) -> SandboxInfo | None:
-        """按确定性 ID 查已有实例。跨进程恢复用。"""
+        """按确定性 ID 查已有实例（跨进程恢复用）。
+
+        容器不存在 / 未运行 / 端口查不到 → 返回 None。
+        """
         validate_sandbox_id(sandbox_id)
         name = self._container_name(sandbox_id)
         try:
@@ -270,10 +327,10 @@ class LocalContainerBackend(SandboxBackend):
             pass
         return None
 
-    # ── 查询 / 销毁（Batch 4）──
+    # ── 查询 / 销毁 ──
 
     def destroy(self, info: SandboxInfo) -> None:
-        """幂等静默。--rm 保证容器停止后自动移除，不调 docker rm。"""
+        """幂等静默停止容器。--rm 保证容器停止后自动移除，不调 docker rm。"""
         target = info.container_id or info.container_name
         if not target:
             return
@@ -287,7 +344,10 @@ class LocalContainerBackend(SandboxBackend):
             logger.warning(f"Failed to stop container {target}: {exc}")
 
     def is_alive(self, info: SandboxInfo) -> bool | None:
-        """轻量 docker inspect，不调 HTTP。返 None 表未知（不误杀）。"""
+        """轻量 docker inspect 判断存活；不调 HTTP。
+
+        返回 True（运行）/ False（容器不存在）/ None（未知，不误杀）。
+        """
         name = info.container_name or self._container_name(info.sandbox_id)
         if not name:
             return None
@@ -305,7 +365,11 @@ class LocalContainerBackend(SandboxBackend):
         return None
 
     def list_running(self) -> list[SandboxInfo]:
-        """batch docker inspect（2 次 subprocess，非 N+1）。孤儿对账用。"""
+        """batch docker inspect（2 次 subprocess，非 N+1）。孤儿对账用。
+
+        - docker ps --filter name={prefix}- 拿容器名。
+        - 单次 docker inspect *names 拿 created_at + host_port。
+        """
         try:
             result = self._executor.run(
                 [self._runtime, "ps", "--filter", f"name={self._prefix}-",

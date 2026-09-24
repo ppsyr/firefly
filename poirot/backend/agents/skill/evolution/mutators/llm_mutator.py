@@ -1,14 +1,65 @@
 """LLMMutator — LLM 推理变异（FIX 编辑 + CAPTURED 生成）。
 
-约束（防"凭感觉自由改"）：
-- budget：单次最多改 max_changed_lines 行（超则截断，partial apply 前 N 改动）
-- 单维度：LLM prompt 指示一次只改一个 section
-- 保留 frontmatter：不改 name/allowed-tools（FIX 重新附加原 frontmatter）
-- diff 输出：difflib.unified_diff，返 (candidate, diff)
-- max_steps：迭代上限（调用方 EvolutionManager 控制，本类单次 mutate）
+【整体职责】
+evolution 闭环的第三环：把 EvolutionContext 变成 candidate（新 skill 记录）+ diff。
+- FIX      ：LLM 编辑现有 SKILL.md 的 body（保留 frontmatter）。
+- CAPTURED ：LLM 生成全新 SKILL.md。
+产出的 candidate 一律 is_active=False（champion 隔离），写 staging 路径。
 
-进化逻辑唯一 LLM 推理（RL/计算式不适用，37.md D-L2-3）。LLM 可自主调既有 web_search 工具。
-candidate is_active=False（champion 隔离），写 staging 路径（.poirot/skills_staging/）。
+约束（防"凭感觉自由改"）：
+- budget：单次最多改 max_changed_lines 行（超则截断，partial apply 前 N 改动）。
+- 单维度：LLM prompt 指示一次只改一个 section。
+- 保留 frontmatter：不改 name / allowed-tools（FIX 重新附加原 frontmatter）。
+- diff 输出：difflib.unified_diff，返 (candidate, diff)。
+- max_steps：迭代上限（调用方 EvolutionManager 控制，本类单次 mutate）。
+
+设计约束：
+- 进化逻辑唯一 LLM 推理（RL / 计算式不适用，37.md D-L2-3）。
+- LLM 可自主调既有 web_search 工具。
+- candidate is_active=False（champion 隔离），写 staging 路径
+  （.poirot/skills_staging/）。
+
+【内容摘要】
+模块常量：
+- _STAGING_ROOT : staging 根目录（.poirot/skills_staging）。
+
+类方法：
+- __init__(max_changed_lines, max_steps, llm)     : 保存约束与 llm。
+- mutate(ctx, llm) -> (SkillRecord, str)          : 对外主入口，按 type 分发。
+- _mutate_fix(ctx, llm) -> (candidate, diff)      : FIX 路径。
+- _mutate_capture(ctx, llm) -> (candidate, diff)  : CAPTURED 路径。
+- _llm_edit_body(body, ctx, llm) -> str           : LLM 编辑 body。
+- _llm_generate_skill(ctx, llm) -> str            : LLM 生成完整 SKILL.md。
+- _enforce_budget(orig, new, budget) -> str       : budget 截断（partial apply）。
+- _split_frontmatter(content) -> (fm, body)       : 切分 frontmatter / body。
+- _extract_frontmatter_name(fm) -> str | None     : 从 frontmatter 取 name。
+- _extract_frontmatter_desc(fm) -> str            : 从 frontmatter 取 description。
+- _compute_diff(orig, new) -> str                 : unified_diff。
+- _staging_path(name) -> Path                     : 生成 staging 文件路径。
+
+【职责边界】
+- 只负责：产 candidate + diff（写 staging），不做评估、门控、晋升、持久化。
+- 不负责：触发（triggers）、聚焦（focuser）、评估（eval_bridge）、门控（gate）、
+  落库（store）、编排（EvolutionManager）。
+- 不决定是否晋升：只产 candidate，是否 accept 由 gate 决定。
+- 不改 frontmatter：FIX 保留原 frontmatter；CAPTURED 由 LLM 生成但校验 name 合法性。
+- 不直接写 version DAG：create_version 由 EvolutionManager 在 accept 时调。
+
+【INVARIANT】
+- mutate 按 evolution_type 分发：FIX → _mutate_fix；CAPTURED → _mutate_capture；
+  其他 → 抛 ValueError。
+- candidate 一律 is_active=False（champion 隔离）。
+- FIX：lineage.parent_skill_ids=(baseline.skill_id,)；generation=baseline+1；
+  origin="FIXED"。
+- CAPTURED：parent_skill_ids=()；generation=0；origin="CAPTURED"。
+- FIX 保留 frontmatter（不改 name / allowed-tools）；
+  frontmatter 为空时 new_content = new_body。
+- CAPTURED 必须有 LLM：llm None → 抛 ValueError。
+- CAPTURED 的 name 必须匹配 [a-z0-9-]+，否则抛 ValueError。
+- budget：改动数 > max_changed_lines 时 partial apply 前 N 改动，超出回退原 body。
+- LLM 编辑失败（_llm_edit_body）→ 返原 body（不变异，不抛）。
+- FIX / CAPTURED 都写 staging 路径（.poirot/skills_staging/），文件名含随机后缀。
+- 37.md D-L2-3：进化逻辑唯一 LLM 推理（不用 RL / 计算式）。
 """
 from __future__ import annotations
 
@@ -26,7 +77,13 @@ _STAGING_ROOT = Path(".poirot/skills_staging")
 
 
 class LLMMutator:
-    """LLM 编辑 SKILL.md body（FIX）或生成新 SKILL.md（CAPTURED）。"""
+    """LLM 编辑 SKILL.md body（FIX）或生成新 SKILL.md（CAPTURED）。
+
+    构造参数：
+    - max_changed_lines : 单次最多改动行数（budget）。
+    - max_steps         : 迭代上限（由调用方 EvolutionManager 控制）。
+    - llm               : 语言模型（可 None；FIX 时 None 不变异，CAPTURED 时 None 抛错）。
+    """
 
     def __init__(
         self,
@@ -34,12 +91,29 @@ class LLMMutator:
         max_steps: int = 5,
         llm: Any | None = None,
     ) -> None:
+        """保存约束与 llm。"""
         self._max_changed_lines = max_changed_lines
         self._max_steps = max_steps
         self._llm = llm
 
     def mutate(self, ctx: EvolutionContext, llm: Any | None = None) -> tuple[SkillRecord, str]:
-        """产 (candidate SkillRecord, diff str)。candidate is_active=False。"""
+        """产 (candidate SkillRecord, diff str)（对外主入口）。
+
+        按 evolution_type 分发：
+        - FIX      → _mutate_fix
+        - CAPTURED → _mutate_capture
+        - 其他     → 抛 ValueError
+
+        Args:
+            ctx: EvolutionContext（含 evolution_type / target_skill / fix_direction 等）。
+            llm: 可选，覆盖 self._llm。
+
+        Returns:
+            (candidate, diff)；candidate.is_active=False。
+
+        Raises:
+            ValueError: evolution_type 不支持。
+        """
         llm = llm or self._llm
         if ctx.evolution_type == "FIX":
             return self._mutate_fix(ctx, llm)
@@ -50,6 +124,11 @@ class LLMMutator:
     # ── FIX ──────────────────────────────────────────────
 
     def _mutate_fix(self, ctx: EvolutionContext, llm: Any | None) -> tuple[SkillRecord, str]:
+        """FIX 路径：读原文件 → LLM 编辑 body → budget 截断 → 保留 frontmatter → 写 staging。
+
+        Returns:
+            (candidate, diff)。
+        """
         baseline = ctx.target_skill
         assert baseline is not None
         orig_content = Path(baseline.path).read_text(encoding="utf-8")
@@ -87,6 +166,17 @@ class LLMMutator:
     # ── CAPTURED ─────────────────────────────────────────
 
     def _mutate_capture(self, ctx: EvolutionContext, llm: Any | None) -> tuple[SkillRecord, str]:
+        """CAPTURED 路径：LLM 生成完整 SKILL.md → 校验 name → 写 staging。
+
+        name 优先取 frontmatter 里的 name，缺省用 ctx.suggested_name。
+        diff 固定为 "+ full new SKILL.md (CAPTURED)"。
+
+        Returns:
+            (candidate, diff)。
+
+        Raises:
+            ValueError: name 不合法（不匹配 [a-z0-9-]+）。
+        """
         new_content = self._llm_generate_skill(ctx, llm)
         # 校验 frontmatter + 提取 name
         frontmatter, body = self._split_frontmatter(new_content)
@@ -121,7 +211,16 @@ class LLMMutator:
     # ── LLM 调用 ─────────────────────────────────────────
 
     def _llm_edit_body(self, body: str, ctx: EvolutionContext, llm: Any | None) -> str:
-        """LLM 编辑 body（单维度 + budget 指令）。失败返原 body（不变）。"""
+        """LLM 编辑 body（单维度 + budget 指令）。失败返原 body（不变异）。
+
+        Args:
+            body: 当前 body。
+            ctx:  EvolutionContext（提供 fix_direction）。
+            llm:  语言模型（None → 返原 body）。
+
+        Returns:
+            编辑后 body；LLM 调用异常 → 原 body。
+        """
         if llm is None:
             return body  # 无 LLM 不变异
         try:
@@ -139,7 +238,18 @@ class LLMMutator:
             return body  # 失败不变异
 
     def _llm_generate_skill(self, ctx: EvolutionContext, llm: Any | None) -> str:
-        """LLM 生成全新 SKILL.md（CAPTURED）。失败抛（CAPTURED 必须有 LLM）。"""
+        """LLM 生成全新 SKILL.md（CAPTURED）。失败抛（CAPTURED 必须有 LLM）。
+
+        Args:
+            ctx: EvolutionContext（提供 capture_pattern / suggested_name）。
+            llm: 语言模型。
+
+        Returns:
+            SKILL.md 全文。
+
+        Raises:
+            ValueError: llm 为 None（CAPTURED 必须有 LLM）。
+        """
         if llm is None:
             raise ValueError("CAPTURED 需要 LLM 生成 SKILL.md")
         from langchain_core.messages import HumanMessage
@@ -159,6 +269,15 @@ class LLMMutator:
         """超 budget 截断：partial apply 前 budget 个改动，超出部分回退原 body。
 
         改动数按 difflib SequenceMatcher opcodes 的 max(i2-i1, j2-j1) 计。
+        改动数 <= budget → 返原 new_body。
+
+        Args:
+            orig_body: 原 body。
+            new_body:  LLM 产出的新 body。
+            budget:    允许的最大改动行数。
+
+        Returns:
+            截断后的 body（保留原 new_body 的结尾换行风格）。
         """
         orig_lines = orig_body.splitlines()
         new_lines = new_body.splitlines()
@@ -209,16 +328,19 @@ class LLMMutator:
 
     @staticmethod
     def _extract_frontmatter_name(frontmatter: str) -> str | None:
+        """从 frontmatter 提取 name 字段；无则 None。"""
         m = re.search(r"^name:\s*(.+)$", frontmatter, re.MULTILINE)
         return m.group(1).strip() if m else None
 
     @staticmethod
     def _extract_frontmatter_desc(frontmatter: str) -> str:
+        """从 frontmatter 提取 description 字段；无则 ""。"""
         m = re.search(r"^description:\s*(.+)$", frontmatter, re.MULTILINE)
         return m.group(1).strip() if m else ""
 
     @staticmethod
     def _compute_diff(orig: str, new: str) -> str:
+        """产 unified_diff（fromfile="body" / tofile="body_edited"，上下文 2 行）。"""
         diff = difflib.unified_diff(
             orig.splitlines(keepends=True), new.splitlines(keepends=True),
             fromfile="body", tofile="body_edited", n=2,
@@ -227,6 +349,10 @@ class LLMMutator:
 
     @staticmethod
     def _staging_path(name: str) -> Path:
+        """生成 staging 文件路径：.poirot/skills_staging/{name}__cand_{uuid}/SKILL.md。
+
+        目录不存在时创建。
+        """
         d = _STAGING_ROOT / f"{name}__cand_{uuid.uuid4().hex[:8]}"
         d.mkdir(parents=True, exist_ok=True)
         return d / "SKILL.md"

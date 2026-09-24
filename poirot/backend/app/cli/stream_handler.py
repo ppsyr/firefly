@@ -1,14 +1,36 @@
 """stream_handler — StreamEvent → rich 渲染。
 
-消费 PoirotStreamClient 产出的 StreamEvent，用 rich Console 实时渲染：
-- thinking：暗灰色逐 token（style="dim"）
-- answer：正常色逐 token，done 后 Markdown 整体渲染
-- tool_start：Spinner + 工具名 + 参数摘要
-- tool_end：停 Spinner，折叠摘要 ✓ tool → N results
-- error：红色
-- done：换行 + 分隔线
-"""
+【整体职责】
+消费 PoirotStreamClient 产出的 StreamEvent，用 rich Console 实时渲染流式输出的
+各类事件：thinking（折叠计时）、answer（累积后 Markdown 渲染）、tool_start/end
+（spinner + 摘要）、error、done（分隔线 + 耗时尾行）、compaction 系列，
+并把 budget_update 透传给 cli_state 供 bottom_toolbar 刷新。
 
+【内容摘要】
+- _truncate_args       : 截断工具参数为摘要字符串。
+- _result_summary      : 截断工具结果为摘要。
+- _tool_color          : 按工具名前缀分色。
+- StreamRenderer       : 渲染器主类，render 分派各事件。
+- StreamRenderer.render / render_user_input / expand_last_round
+- 各 _render_* / _flush_thinking / _stop_spinner / _update_budget
+
+【职责边界】
+- 只负责：把 StreamEvent 渲染为 rich 输出、维护渲染态 state、透传 budget 到 cli_state。
+- 不负责：事件的生产（stream_service）、cli_state 的初始化与生命周期（main）、
+  状态栏渲染（status_bar）、流式驱动（PoirotStreamClient）。
+
+【INVARIANT】
+- state 驱动：渲染态集中在 self.state（full_answer / tool_results / thinking_log /
+  _thinking_t0 / _round_active / round_t0 / model 等）。
+- thinking 折叠：逐 token 不输出，切到非 thinking 事件或 done 时统一 flush 为
+  "+ Thought: {ms}ms" 并存入 thinking_log。
+- answer 延迟渲染：逐 token 仅累积，done 时统一 Markdown 渲染一次（避免重复输出）。
+- 轮次清理：新轮首个事件（非 budget_update）清上一轮 state，保留 tool_results 供 /expand。
+- budget_update 仅透传：更新 cli_state（供 toolbar），不参与轮次状态机、不输出 console。
+- spinner 生命周期：tool_start 开 Live，tool_end / done / error 停。
+- /thinking off：跳过 thinking（不计时、不累计、不输出）。
+- 样式集中：工具按名前缀分色；thinking 橙色 #FF8C42；耗时为 dim。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -25,6 +47,14 @@ from poirot.backend.app.services.stream_service import StreamEvent
 
 
 def _truncate_args(args: dict | None) -> str:
+    """截断工具参数为摘要字符串（去掉 type 字段，单值 ≤50，整体 ≤120）。
+
+    Args:
+        args: 工具参数字典，可为 None。
+
+    Returns:
+        str: 形如 "k1=v1, k2=v2" 的摘要。
+    """
     if not args:
         return ""
     items = [f"{k}={str(v)[:50]}" for k, v in args.items() if k != "type"]
@@ -32,6 +62,14 @@ def _truncate_args(args: dict | None) -> str:
 
 
 def _result_summary(result: str | None) -> str:
+    """截断工具结果为摘要（≤80 字符）。
+
+    Args:
+        result: 工具结果文本，可为 None。
+
+    Returns:
+        str: 摘要；None 时为 "ok"。
+    """
     if not result:
         return "ok"
     if len(result) <= 80:
@@ -40,7 +78,14 @@ def _result_summary(result: str | None) -> str:
 
 
 def _tool_color(tool_name: str) -> str:
-    """按工具名前缀分色（D8）：search=cyan / fetch=blue / write=yellow / 其他=dim。"""
+    """按工具名前缀分色（D8）：search=cyan / fetch=blue / write=yellow / 其他=dim。
+
+    Args:
+        tool_name: 工具名。
+
+    Returns:
+        str: rich 颜色名。
+    """
     name = (tool_name or "").lower()
     if name.startswith(("web_search", "tavily", "search")):
         return "cyan"
@@ -59,9 +104,19 @@ class StreamRenderer:
     - tool_results：上一轮工具结果全文（供 /expand）
     - thinking_enabled：是否展示 thinking（/thinking off 关闭）
     - current_spinner：当前 Live spinner（tool_start 时开，tool_end 时停）
+
+    Attributes:
+        console: rich Console。
+        state: 渲染态字典。
     """
 
     def __init__(self, console: Console | None = None, cli_state: dict[str, Any] | None = None) -> None:
+        """初始化。
+
+        Args:
+            console: rich Console，缺省自建。
+            cli_state: 主循环共享状态（budget 透传目标），可选。
+        """
         self.console = console or Console()
         self._cli_state = cli_state
         self.state: dict[str, Any] = {
@@ -79,6 +134,11 @@ class StreamRenderer:
         }
 
     def render(self, event: StreamEvent) -> None:
+        """渲染单个事件（分派到各 _render_*）。
+
+        Args:
+            event: 流式事件。
+        """
         etype = event["type"]
 
         # budget_update：仅更新 cli_state（供 bottom_toolbar 实时刷新），不参与轮次状态机、不输出到 console
@@ -117,6 +177,11 @@ class StreamRenderer:
             self._render_compaction_end(event)
 
     def _render_thinking(self, event: StreamEvent) -> None:
+        """累积 thinking token（不逐 token 输出），首个 token 启动计时。
+
+        Args:
+            event: thinking 事件。
+        """
         # /thinking off：完全跳过（不计时、不累计 buffer、不输出折叠行）
         if not self.state["thinking_enabled"]:
             return
@@ -147,12 +212,22 @@ class StreamRenderer:
         self.state["_thinking_buffer"] = ""
 
     def _render_answer(self, event: StreamEvent) -> None:
+        """累积 answer token（不立即打印，done 后统一 Markdown 渲染）。
+
+        Args:
+            event: answer 事件。
+        """
         content = event["content"]
         if content:
             # 累积 answer 文本，不立即打印（done 后统一 Markdown 渲染，避免重复输出）
             self.state["full_answer"] += content
 
     def _render_tool_start(self, event: StreamEvent) -> None:
+        """工具开始：停旧 spinner，开新 spinner（工具名 + 参数摘要）。
+
+        Args:
+            event: tool_start 事件。
+        """
         tool_name = event["tool_name"] or "unknown"
         args_str = _truncate_args(event["tool_args"])
         spinner_text = f"{tool_name}({args_str})..." if args_str else f"{tool_name}..."
@@ -166,6 +241,11 @@ class StreamRenderer:
         self.state["_live"].start()
 
     def _render_tool_end(self, event: StreamEvent) -> None:
+        """工具结束：停 spinner，打印 ✓ 摘要，存全文供 /expand。
+
+        Args:
+            event: tool_end 事件。
+        """
         self._stop_spinner()
 
         tool_name = event["tool_name"] or "unknown"
@@ -181,6 +261,7 @@ class StreamRenderer:
             })
 
     def _render_done(self) -> None:
+        """轮次结束：Markdown 渲染累积 answer + 耗时尾行 + 分隔线，清理轮次 state。"""
         self._stop_spinner()
         # answer 累积完毕，统一 Markdown 渲染输出一次（不重复纯文本）
         full = self.state["full_answer"].strip()
@@ -203,27 +284,52 @@ class StreamRenderer:
         self.console.print("\n[dim]" + "─" * 40 + "[/dim]")
 
     def render_user_input(self, text: str) -> None:
-        """用户输入卡片化回显——蓝紫竖线 Panel 包裹，在用户提交问题后立即调用。"""
+        """用户输入卡片化回显——蓝紫竖线 Panel 包裹，在用户提交问题后立即调用。
+
+        Args:
+            text: 用户输入文本。
+        """
         body = Text(text)
         self.console.print(Panel(body, border_style="#6A5ACD", box=ROUNDED, padding=(0, 1)))
         self.console.print()
 
     def _render_error(self, event: StreamEvent) -> None:
+        """错误：停 spinner，红色打印错误内容。
+
+        Args:
+            event: error 事件。
+        """
         self._stop_spinner()
         self.console.print(f"\n[red]✗ {event['content']}[/red]")
 
     def _render_compaction_start(self, event: StreamEvent) -> None:
+        """压缩开始：dim 打印触发阶段。
+
+        Args:
+            event: compaction_start 事件。
+        """
         stage = event.get("tool_name") or ""
         self.console.print(f"\n[dim][compaction] {stage} 触发...[/dim]")
 
     def _render_compaction_progress(self, event: StreamEvent) -> None:
+        """压缩进度：dim 打印进度内容。
+
+        Args:
+            event: compaction_progress 事件。
+        """
         self.console.print(f"[dim]  {event['content']}[/dim]")
 
     def _render_compaction_end(self, event: StreamEvent) -> None:
+        """压缩结束：dim 打印完成信息与 saved 值。
+
+        Args:
+            event: compaction_end 事件。
+        """
         saved = event.get("tool_result") or ""
         self.console.print(f"[dim][compaction] 完成 {event['content']} (saved={saved})[/dim]")
 
     def _stop_spinner(self) -> None:
+        """停止当前 Live spinner（若有）。"""
         live = self.state.get("_live")
         if live is not None:
             live.stop()
@@ -234,6 +340,9 @@ class StreamRenderer:
 
         renderer 不直接渲染 budget 信息——展示归 ``status_bar.build_bottom_toolbar``
         负责；renderer 仅做数据透传。``cli_state`` 为 None 时（未注入）静默跳过。
+
+        Args:
+            event: budget_update 事件。
         """
         if self._cli_state is None:
             return

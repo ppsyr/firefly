@@ -1,13 +1,36 @@
 """PoirotStreamClient — 流式研究服务（仿 deer-flow DeerFlowClient.stream）。
 
-用 graph.astream(stream_mode=["values", "messages"]) 消费 LangGraph 原生流：
-- messages mode：token 级 delta（AIMessageChunk content + reasoning_content + tool_calls / ToolMessage）
-- values mode：完整状态快照（用于去重 + 检测 done）
+【整体职责】
+用 graph.astream(stream_mode=["values", "messages", "custom"]) 消费 LangGraph 原生流，
+把 token 级 delta（messages）、完整状态快照（values）、自定义事件（custom）标准化为
+StreamEvent 供 CLI 渲染。流式消费归本 service，不在 LeaderAgent 内（LeaderAgent 只管 run()）。
 
-产出标准化 StreamEvent 供 CLI 渲染。不在 LeaderAgent 内——LeaderAgent 只管 run()，
-流式消费归本 service。
+【内容摘要】
+- _StreamEventBase    : 流式事件标准化结构。
+- StreamEvent         : 事件类型 + 可选 budget 字段。
+- _extract_text       : 从 message content 提取纯文本（兼容 str / list[dict]）。
+- _extract_reasoning  : 提取 reasoning_content delta（thinking token）。
+- _truncate           : 截断文本。
+- _is_skills_selector_output : 检测 SkillSelector 的 JSON 输出。
+- _strip_skills_leak  : 渲染层兜底，剥离残留的 SkillSelector JSON。
+- PoirotStreamClient  : 流式客户端，stream(question) 产出 StreamEvent。
+
+【职责边界】
+- 只负责：消费 graph.astream、标准化 StreamEvent、跨模式去重、done/error 检测。
+- 不负责：渲染（stream_handler）、图执行与决策（leader/agent + middleware）、
+  run 生命周期（run_manager）、budget 的展示（status_bar）。
+
+【INVARIANT】
+- 三模式消费：values（状态快照）/ messages（token delta）/ custom（middleware 发的事件）。
+- 双模式去重：seen_ids / streamed_ids / seen_tool_call_ids 防止重复输出。
+- 内部 LLM 过滤：metadata.tags 含 "internal_llm" 的 chunk 跳过，防泄漏到 CLI。
+- selector 输出拦截：按 msg_id 累积缓冲，命中 _is_skills_selector_output 则丢弃；
+  非 {/` 开头或超 200 字符则确认非 selector 并 flush。
+- 首帧 values 预填：第一帧含 checkpoint 恢复的旧 messages，预填 seen_ids 跳过。
+- budget 零值过滤：window == 0 视为 init_budget 零快照，跳过防视觉闪烁。
+- astream 结束 yield done：无精确 done 信号，靠结束事件。
+- 残留 buffer flush：流结束后 flush 未决 answer buffer（跳过 selector 与已 streamed）。
 """
-
 from __future__ import annotations
 
 from typing import Any, AsyncIterator, TypedDict
@@ -16,9 +39,20 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, Tool
 
 
 class _StreamEventBase(TypedDict):
-    """流式事件标准化结构，供 CLI 消费渲染。"""
+    """流式事件标准化结构，供 CLI 消费渲染。
 
-    type: str  # "thinking" | "answer" | "tool_start" | "tool_end" | "skill_active" | "done" | "error" | "budget_update" | "sandbox_update" | "help_requested" | "activity_started" | "activity_finished" | "activity_heartbeat"
+    Attributes:
+        type: 事件类型（thinking / answer / tool_start / tool_end / skill_active /
+            done / error / budget_update / sandbox_update / help_requested /
+            activity_started / activity_finished / activity_heartbeat）。
+        content: 事件文本内容。
+        tool_name: 工具名。
+        tool_args: 工具参数。
+        tool_result: 工具结果。
+        msg_id: 消息 ID。
+    """
+
+    type: str
     content: str
     tool_name: str | None
     tool_args: dict | None
@@ -36,7 +70,14 @@ class StreamEvent(_StreamEventBase, total=False):
 
 
 def _extract_text(content: Any) -> str:
-    """从 message content 提取纯文本（兼容 str / list[dict]）。"""
+    """从 message content 提取纯文本（兼容 str / list[dict]）。
+
+    Args:
+        content: 消息内容。
+
+    Returns:
+        str: 提取出的文本。
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -51,12 +92,28 @@ def _extract_text(content: Any) -> str:
 
 
 def _extract_reasoning(chunk: AIMessageChunk) -> str:
-    """提取 reasoning_content delta（deepseek 等 thinking token）。"""
+    """提取 reasoning_content delta（deepseek 等 thinking token）。
+
+    Args:
+        chunk: AIMessageChunk。
+
+    Returns:
+        str: reasoning_content 文本；无则空串。
+    """
     additional = getattr(chunk, "additional_kwargs", {}) or {}
     return additional.get("reasoning_content", "") or ""
 
 
 def _truncate(text: str, limit: int = 200) -> str:
+    """截断文本至 limit 字符，超出加省略号。
+
+    Args:
+        text: 原文本。
+        limit: 长度上限。
+
+    Returns:
+        str: 截断后的文本。
+    """
     return text[:limit] + "..." if len(text) > limit else text
 
 
@@ -66,6 +123,12 @@ def _is_skills_selector_output(text: str) -> bool:
     SkillSelector._llm_select 用 llm.invoke 选 skill，返回 JSON。同步 invoke 的
     internal_llm tag 在 async 流式 metadata 中可能丢失，此函数作为 content fallback：
     提取首个 JSON 对象，解析成功且含 "skills" key 即判定为 selector 输出。
+
+    Args:
+        text: 累积文本。
+
+    Returns:
+        bool: True 表示是 selector 输出。
     """
     if not text or '"skills"' not in text:
         return False
@@ -90,6 +153,12 @@ def _strip_skills_leak(text: str) -> str:
     stream 层按 msg_id 累积检测能拦截大部分情况（纯 JSON / markdown fence），
     但 LLM 在 JSON 前加解释文字时首个 delta 不以 { 开头会直接 yield，此函数
     在渲染前清洗 full_answer：移除 {"skills":[...]} JSON 片段及其 markdown 包裹。
+
+    Args:
+        text: 待清洗文本。
+
+    Returns:
+        str: 清洗后的文本。
     """
     if not text or '"skills"' not in text:
         return text
@@ -109,9 +178,19 @@ class PoirotStreamClient:
     - messages mode 拿 token delta（thinking/answer/tool）
     - values mode 去重 + 检测完成
     - seen_ids / streamed_ids 跨模式去重
+
+    Attributes:
+        _graph: 编译后的 LangGraph graph。
+        _config: graph 调用配置。
     """
 
     def __init__(self, graph: Any, config: dict) -> None:
+        """初始化。
+
+        Args:
+            graph: 编译后的 graph。
+            config: 调用配置。
+        """
         self._graph = graph
         self._config = config
 
@@ -119,10 +198,10 @@ class PoirotStreamClient:
         """流式产出 StreamEvent。
 
         Args:
-            question: 用户研究问题
+            question: 用户研究问题。
 
         Yields:
-            StreamEvent: thinking / answer / tool_start / tool_end / done / error
+            StreamEvent: thinking / answer / tool_start / tool_end / done / error 等。
         """
         from langchain_core.messages import HumanMessage
 

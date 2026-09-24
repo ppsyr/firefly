@@ -1,11 +1,33 @@
-"""BudgetGuard — per-specialist budget 三维度记账 + per-day UTC 0 重置 + 超限 fallback lead（R5）。
+"""BudgetGuard — per-specialist budget 三维度记账 + per-day UTC 0 重置 + 超限 fallback lead。
 
-设计（42 文档 §7.9 + spec.md BudgetGuard Requirement + R5）:
-- check_and_record：三维度记账（token + cost_usd + 调用次数），cost_usd 主触发
-- get_today_usage：per-day UTC 0 点重置（R5.3）
-- 80% 预警写 metrics（不主动通知 LLM，R5.5）
-- 超限 fallback 到 lead（通过 tool 返 BudgetExceeded JSON，不污染 system prompt，INV-10/INV-32）
-- 持久化 multiagent.db specialist_budget_usage + budget_warnings 表（R5.6）
+【整体职责】
+为每个 specialist 做每日预算的记账与超限检查：三维度（tokens / cost_usd / calls）
+累加当日用量，超限时返回 allowed=False 并指定 fallback 目标为 lead；
+80% 用量时写预警记录。全部持久化到 multiagent.db。
+
+【内容摘要】
+- _BUDGET_SCHEMA_SQL           : 两张表建表 SQL（specialist_budget_usage / budget_warnings）。
+- BudgetLimit(frozen)          : per-specialist 单日预算上限。
+- _utc_date_str()              : UTC 日期字符串（per-day 重置 key）。
+- BudgetGuard                  : 记账主类（check_and_record / get_today_usage / fallback_target / get_warnings）。
+
+【职责边界】
+- 只负责：三维度记账、超限检查、80% 预警写库、按天查询。
+- 不负责：成本计算（CostRecord 由调用方构造）、主动通知 LLM（不推送，只写库）、
+  在 system prompt 中注入（通过 tool 返 JSON 通知）。
+- 不持有运行时状态：只持有 db_path / limits / warning_threshold + 锁。
+
+【INVARIANT】
+- 三维度记账：token + cost_usd + 调用次数；cost_usd 为主触发维度。
+- per-day UTC 0 点重置：日期 key 用 UTC 日期字符串。
+- 超限 fallback 固定 "lead"：不 fallback 到另一个 specialist。
+- 超限通知方式：通过 tool 返回 BudgetExceeded JSON，不污染 system prompt。
+- 80% 预警只写 metrics 表，不主动通知 LLM。
+- 持久化到 multiagent.db 的 specialist_budget_usage + budget_warnings 表。
+- 超限检查优先级：cost_usd > tokens > calls。
+- 80% 预警只在"跨过阈值且未超限"时写一次（old_pct < threshold <= new_pct）。
+- 无记录时 get_today_usage 返回全 0。
+- WAL 模式 + busy_timeout=30000 + threading.Lock 保护。
 """
 from __future__ import annotations
 
@@ -23,6 +45,7 @@ from poirot.backend.agents.multiagent.evolution.types import (
     CostRecord,
 )
 
+# budget 两张表建表 SQL（幂等）。
 _BUDGET_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS specialist_budget_usage (
     specialist_name TEXT NOT NULL,
@@ -48,9 +71,9 @@ CREATE INDEX IF NOT EXISTS idx_budget_warnings_name_date ON budget_warnings(spec
 
 @dataclass(frozen=True)
 class BudgetLimit:
-    """per-specialist 单日 budget 上限（R5.1 默认值）.
+    """per-specialist 单日预算上限。
 
-    per_day_tokens=200000, per_day_cost_usd=$20, per_day_calls=50.
+    默认值：per_day_tokens=200000 / per_day_cost_usd=$20 / per_day_calls=50。
     """
 
     per_day_tokens: int = 200000
@@ -59,19 +82,15 @@ class BudgetLimit:
 
 
 def _utc_date_str() -> str:
-    """UTC 日期字符串 'YYYY-MM-DD'（per-day 重置 key，R5.3）."""
+    """UTC 日期字符串 'YYYY-MM-DD'（per-day 重置 key）。"""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 class BudgetGuard:
-    """per-specialist budget 三维度记账 + per-day 重置 + 超限 fallback lead（R5）.
+    """per-specialist 预算三维度记账 + per-day 重置 + 超限 fallback lead。
 
-    INVARIANT:
-    - 三维度记账（token + cost_usd + 调用次数），cost_usd 主触发（INV-30，R5.2）
-    - per-day UTC 0 点重置（INV-31，R5.3）
-    - 超限 fallback lead，通过 tool 返 JSON 通知 LLM（不污染 system prompt，INV-32，R5.4）
-    - 80% 预警写 metrics，不主动通知 LLM（INV-33，R5.5）
-    - 持久化 multiagent.db（INV-R5.6）
+    三维度记账（token + cost_usd + 调用次数），cost_usd 为主触发维度；
+    per-day UTC 0 点重置；超限 fallback 到 lead；80% 预警写库不推送。
     """
 
     def __init__(
@@ -80,6 +99,13 @@ class BudgetGuard:
         limits: dict[str, BudgetLimit] | None = None,
         warning_threshold: float = 0.8,
     ) -> None:
+        """初始化。
+
+        Args:
+            db_path: SQLite 路径，默认 .poirot/multiagent.db。
+            limits: per-specialist 预算上限映射；缺省时用 BudgetLimit() 默认值。
+            warning_threshold: 预警阈值（默认 0.8，即 80%）。
+        """
         self._db_path = db_path
         self._limits = limits or {}
         self._warning_threshold = warning_threshold
@@ -88,12 +114,14 @@ class BudgetGuard:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
+        """建立连接并设置 WAL + busy_timeout。每次调用返回新连接。"""
         conn = sqlite3.connect(self._db_path, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def _init_schema(self) -> None:
+        """幂等建表（CREATE TABLE IF NOT EXISTS）。"""
         with self._lock:
             conn = self._connect()
             try:
@@ -103,7 +131,7 @@ class BudgetGuard:
                 conn.close()
 
     def _get_limit(self, specialist_name: str) -> BudgetLimit:
-        """Get specialist budget limit (default fallback)."""
+        """取 specialist 的预算上限；无配置时用默认 BudgetLimit()。"""
         return self._limits.get(specialist_name, BudgetLimit())
 
     def check_and_record(
@@ -111,10 +139,22 @@ class BudgetGuard:
         specialist_name: str,
         cost: CostRecord,
     ) -> BudgetCheckResult:
-        """Check + record (3 dimensions, cost_usd primary trigger).
+        """三维度记账 + 超限检查 + 80% 预警。
 
-        Over-limit returns BudgetCheckResult(allowed=False, reason=..., fallback_target="lead").
-        80% warning writes budget_warnings table (no LLM notification).
+        流程：
+        1. 读当日已用量（无记录则为 0）。
+        2. 累加本次用量。
+        3. UPSERT 写回 specialist_budget_usage。
+        4. 检查超限：cost_usd > tokens > calls 优先级。
+        5. 跨过 80% 阈值且未超限时写 budget_warnings。
+        6. 返回 BudgetCheckResult（allowed / reason / remaining / fallback_target）。
+
+        Args:
+            specialist_name: specialist 名。
+            cost: 本次用量（tokens / cost_usd / calls）。
+
+        Returns:
+            BudgetCheckResult；超限时 allowed=False 且 reason 非空。
         """
         limit = self._get_limit(specialist_name)
         date_str = _utc_date_str()
@@ -138,7 +178,7 @@ class BudgetGuard:
                 new_cost = current_cost + cost.cost_usd
                 new_calls = current_calls + cost.calls
 
-                # 写入用量（UPSERT）
+                # UPSERT 写入用量
                 conn.execute(
                     """INSERT INTO specialist_budget_usage
                         (specialist_name, date, tokens_used, cost_usd_used,
@@ -161,7 +201,7 @@ class BudgetGuard:
                 elif new_calls > limit.per_day_calls:
                     reason = "daily_calls_exceeded"
 
-                # 80% 预警（cost_usd 主维度）
+                # 80% 预警（cost_usd 主维度，仅跨阈值且未超限时写）
                 old_pct = current_cost / limit.per_day_cost_usd if limit.per_day_cost_usd > 0 else 0.0
                 new_pct = new_cost / limit.per_day_cost_usd if limit.per_day_cost_usd > 0 else 0.0
                 if old_pct < self._warning_threshold <= new_pct and reason is None:
@@ -205,10 +245,13 @@ class BudgetGuard:
         )
 
     def get_today_usage(self, specialist_name: str) -> dict[str, Any]:
-        """Per-day UTC 0 reset (R5.3).
+        """查询当日用量（per-day UTC 0 点重置）。
 
-        Returns today's usage dict (tokens_used / cost_usd_used / calls_used).
-        No record returns all 0.
+        Args:
+            specialist_name: specialist 名。
+
+        Returns:
+            当日用量 dict（tokens_used / cost_usd_used / calls_used）；无记录返全 0。
         """
         date_str = _utc_date_str()
         with self._lock:
@@ -231,11 +274,19 @@ class BudgetGuard:
         }
 
     def fallback_target(self, specialist_name: str) -> str:
-        """Over-limit fallback target fixed 'lead' (no other specialist, INV-10)."""
+        """超限时的 fallback 目标；固定返回 "lead"（不 fallback 另一 specialist）。"""
         return "lead"
 
     def get_warnings(self, specialist_name: str, date_str: str | None = None) -> list[dict]:
-        """Query 80% warning records (CLI inspect, no push)."""
+        """查询 80% 预警记录（CLI inspect 用，无主动推送）。
+
+        Args:
+            specialist_name: specialist 名。
+            date_str: 日期字符串；None 表示当天。
+
+        Returns:
+            预警记录 dict 列表（warning_id / warning_type / detail / timestamp）。
+        """
         date_str = date_str or _utc_date_str()
         with self._lock:
             conn = self._connect()

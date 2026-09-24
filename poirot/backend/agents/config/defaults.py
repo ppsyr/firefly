@@ -1,8 +1,34 @@
+"""默认配置与 expert 模式叠加层。
+
+【整体职责】
+定义应用在无外部配置时的基线配置（DEFAULT_CONFIG），以及 expert 模式的叠加层
+（EXPERT_PROFILE）。供 loader 加载与 deep_merge 合并，产出最终 AppConfig。
+
+【内容摘要】
+- DEFAULT_CONFIG : 默认配置字典，覆盖 runtime / models / tools / middleware /
+  reporting / observability / context_governance 各段。
+- EXPERT_PROFILE : expert 模式叠加层，load_config(expert_mode=True) 时 deep_merge 到 DEFAULT_CONFIG。
+
+【职责边界】
+- 只负责：提供默认配置值与 expert 模式的叠加值。
+- 不负责：配置加载与合并逻辑（loader）、Schema 校验（schema）、
+  配置结构定义（schema.py 的 dataclass）。
+
+【INVARIANT】
+- DEFAULT_CONFIG 是完整基线：各段（runtime / models / tools / middleware / reporting /
+  observability / context_governance）均为 dict，供 deep_merge 逐层覆盖。
+- EXPERT_PROFILE 是部分叠加：仅含需要覆盖的段与字段，未提及字段沿用 DEFAULT_CONFIG。
+- context_governance.params 不硬编码 window：window 由 DefaultStrategy.after_model
+  每轮动态解析（见下方注释）。
+- 三 profile 已废弃：原 fast/general/expert 三 profile 改为 expert_mode: bool 参数化，
+  仅保留 EXPERT_PROFILE 单一叠加层。
+"""
 from __future__ import annotations
 
 from typing import Any
 
 
+# 默认配置：应用在无外部配置时的完整基线，供 deep_merge 逐层覆盖。
 DEFAULT_CONFIG: dict[str, Any] = {
     "name": "poirot",
     "environment": "local",

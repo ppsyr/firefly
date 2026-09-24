@@ -1,3 +1,49 @@
+"""app/bootstrap.py — 应用启动与运行时装配。
+
+【整体职责】
+Poirot 应用层的启动入口：加载配置、构造 LLM、装配工具（builtin / MCP / sandbox /
+skill）、装配 multiagent、构造 CapabilityRegistry 与 LeaderAgent，产出 AppRuntime。
+同时提供运行时热切换能力（expert 模式 / MCP 工具 / model），全部保持不可变语义。
+
+【内容摘要】
+- _PROJECT_ROOT / _CST                    : 项目根路径 + 中国时区常量。
+- _resolve_relative_paths()               : 把 config 里相对路径锚定到项目根。
+- _make_thread_id()                       : 生成 thread ID。
+- _build_chat_model()                     : 按 provider 构造 chat model。
+- _check_node_available()                 : 检测 npx 是否可用（MCP 前置条件）。
+- AppRuntime                              : 运行时容器（config + registry + leader + setup）。
+- AppRuntime.run_question()               : 执行一次提问。
+- AppRuntime.switch_expert_mode()         : 热切换 expert 模式（保留 thread）。
+- AppRuntime.reload_mcp_tools()           : MCP 工具变更后重建 Leader。
+- AppRuntime.switch_model()               : 热切换 LLM provider/model。
+- _load_sandbox_provider()                : 反射加载 sandbox provider。
+- _load_memory_provider()                 : 反射加载 memory provider。
+- _build_path_mappings()                  : 从 config 构造 PathMapping 列表。
+- _build_evolution_manager()              : 装配 skill 自进化管理器（Layer 2a）。
+- _build_eval_layer()                     : 装配 skill L3 评估层。
+- bootstrap_runtime()                     : ★ 应用启动主入口。
+
+【职责边界】
+- 只负责：配置加载、组件装配、运行时容器构造、热切换。
+- 不负责：Agent 内部逻辑（leader / middleware 负责）、具体工具实现（各模块负责）、
+  CLI 交互（app/cli 负责）。
+- 不持有可变状态：AppRuntime 用 replace 语义重建，不原地修改。
+
+【INVARIANT】
+- 路径锚定：logs_root / externalize_dir / memory.storage_path 的相对路径统一锚到 _PROJECT_ROOT。
+- thread 连续性：switch_expert_mode / reload_mcp_tools / switch_model 保留
+  thread_id / thread_dir / thread_journal / capability_registry（checkpointer state 跨重建连续）。
+- 不可变语义：三个 switch_* 方法都返回新 AppRuntime，不原地修改。
+- 装配顺序固定：config → thread journal → LLM → builtin tools → MCP → sandbox →
+  skill → multiagent → memory → CapabilityRegistry → LeaderAgent。
+- subagent leaf 限制：_subagent_factory 构造的 leaf agent 不传 specialist_tools 与
+  orchestration_middleware，从工具层面杜绝无限递归。
+- multiagent 可选：enabled=false 时 setup_multiagent 返空 setup，Leader 行为不变。
+- sandbox 可选：config.sandbox.use 为空时 sandbox_provider=None，不注册 sandbox 工具。
+- skill / memory / MCP 均可选：未启用时相应组件为 None，不阻塞启动。
+- 所有可选组件装配失败都记 journal，不抛异常（除 LLM 构造失败）。
+- MCP 加载兼容运行中的 event loop：检测到 running loop 时用线程池跑 asyncio.run。
+"""
 from __future__ import annotations
 
 import random
@@ -32,18 +78,21 @@ from poirot.backend.agents.agent_tools.available import get_available_tools, sel
 from poirot.backend.agents.multiagent.bootstrap import MultiAgentSetup, setup_multiagent
 from poirot.backend.agents.multiagent.config import load_multiagent_config
 
+# 项目根路径（app/bootstrap.py 的上三级）。
 _PROJECT_ROOT = Path(__file__).parents[3]
+# 中国时区（thread ID 用）。
 _CST = timezone(timedelta(hours=8))
 
 
 def _resolve_relative_paths(config: AppConfig) -> AppConfig:
-    """把 config 里相对路径锚到 _PROJECT_ROOT——与 logs_root 同款处理。
+    """把 config 里的相对路径锚定到 _PROJECT_ROOT。
 
-    目前覆盖 ``context_governance.params.externalize_dir``（默认 ``.poirot/externalized``）。
-    之前没锚定，ExternalizerExecutor 直接 ``os.makedirs(self._dir)`` 按进程 CWD 解析——
-    用户从 PowerShell 启动 ``poirot``（默认 CWD=用户家目录）时，外化文件全部写到了
-    ``C:\\Users\\<user>\\.poirot\\externalized\\``，与项目目录下的 ``.poirot/externalized``
-    分家，用户在项目目录看不到任何外化记录（D12 现场定位）。
+    覆盖：
+    - context_governance.params.externalize_dir（默认 .poirot/externalized）
+    - memory.storage_path
+
+    目的：避免用户在不同 CWD 启动时，这些目录被解析到意外位置（如用户家目录），
+    导致项目目录下看不到外化记录 / 记忆文件。
     """
     params = dict(config.context_governance.params)
     ext_dir = params.get("externalize_dir", ".poirot/externalized")
@@ -51,7 +100,7 @@ def _resolve_relative_paths(config: AppConfig) -> AppConfig:
     if not p.is_absolute():
         p = (_PROJECT_ROOT / p).resolve()
     params["externalize_dir"] = str(p)
-    # L4 memory.storage_path 锚定 _PROJECT_ROOT（01 D12，与 externalize_dir 同款）
+    # L4 memory.storage_path 锚定 _PROJECT_ROOT（与 externalize_dir 同款）
     memory_path = Path(config.memory.storage_path)
     if not memory_path.is_absolute():
         memory_path = (_PROJECT_ROOT / memory_path).resolve()
@@ -63,12 +112,19 @@ def _resolve_relative_paths(config: AppConfig) -> AppConfig:
 
 
 def _make_thread_id() -> str:
+    """生成 thread ID：thread-<CST 时间戳>-<4 位随机串>。"""
     ts = datetime.now(_CST).strftime("%Y%m%dT%H%M%S")
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
     return f"thread-{ts}-{suffix}"
 
 
 def _build_chat_model(config: ProviderConfig) -> BaseChatModel:
+    """按 provider 构造 chat model。
+
+    - deepseek → ChatDeepSeek
+    - openai / qwen → ChatOpenAI（qwen 走 OpenAI 兼容接口，可带 base_url）
+    - 其他 → ValueError
+    """
     config.require_api_key()
     if config.provider == "deepseek":
         from langchain_deepseek import ChatDeepSeek
@@ -83,11 +139,18 @@ def _build_chat_model(config: ProviderConfig) -> BaseChatModel:
 
 
 def _check_node_available() -> bool:
+    """检测 npx 是否可用（MCP 加载的前置条件）。"""
     return shutil.which("npx") is not None
 
 
 @dataclass
 class AppRuntime:
+    """应用运行时容器。
+
+    持有 config / registry / leader_agent / multiagent_setup 等组件；
+    提供 run_question 与三种热切换方法。
+    """
+
     config: AppConfig
     capability_registry: CapabilityRegistry
     run_manager: RunManager
@@ -108,6 +171,7 @@ class AppRuntime:
         user_id: str | None = "default-user",
         run_id: str | None = None,
     ) -> AgentRunResult:
+        """执行一次提问：建 run context → 调 leader_agent.run → 标记成功/失败。"""
         effective_thread_id = thread_id or self.thread_id
         context = self.run_manager.create_run(
             thread_id=effective_thread_id,
@@ -130,9 +194,11 @@ class AppRuntime:
 
         重建：config + run_manager + leader_agent（依赖 expert_mode 编译参数）。
         保留：thread_id / thread_dir / thread_journal / capability_registry /
-        researcher_model_name（checkpointer state 跨模式连续，MCP/models 不重载）。
+        researcher_model_name。
 
-        返回新 AppRuntime 实例（不可变语义），CLI 用 runtime = runtime.switch_expert_mode(...)。
+        注意：必须传 context_governance，否则治理层中间件不挂，budget / 压缩全部失效。
+
+        返回新 AppRuntime 实例（不可变语义）。
         """
         new_config = load_config(expert_mode=expert_mode)
         logs_root = Path(new_config.runtime.logs_root)
@@ -142,11 +208,9 @@ class AppRuntime:
             new_config,
             runtime=replace(new_config.runtime, logs_root=str(logs_root)),
         )
-        # 锚定 externalize_dir 等治理层相对路径到项目根（同 logs_root 处理）
+        # 锚定 externalize_dir 等治理层相对路径到项目根
         new_config = _resolve_relative_paths(new_config)
-        # 必须传 context_governance——否则 _build_middlewares 看到 None 会跳过整个
-        # 治理层（StrategyMiddleware 不挂），切换 expert 后 budget/fraction/压缩全部失效，
-        # 与 D12 "minimal 未注册" 故障现象相同。
+        # 必须传 context_governance，否则 _build_middlewares 跳过治理层
         new_leader = make_lead_agent(
             expert_mode=expert_mode,
             capability_registry=self.capability_registry,
@@ -184,8 +248,8 @@ class AppRuntime:
     def reload_mcp_tools(self) -> AppRuntime:
         """MCP 工具变更后重建 LeaderAgent graph。
 
-        复用 switch_expert_mode 模式：重建 leader_agent（新工具注入），保留 thread_id /
-        thread_dir / thread_journal / capability_registry，checkpointer state 跨重建连续。
+        复用 switch_expert_mode 模式：重建 leader_agent（新工具注入），
+        保留 thread_id / thread_dir / thread_journal / capability_registry。
         同步完成（<1s），下轮可用（当前轮用旧 graph 跑完）。
         """
         expert_mode = self.config.runtime.expert_mode if hasattr(self.config.runtime, "expert_mode") else False
@@ -221,15 +285,18 @@ class AppRuntime:
         )
 
     def switch_model(self, provider: str, model: str | None = None) -> AppRuntime:
-        """热切换 LLM provider/model。重建 researcher+reporter model + capability_registry
-        + leader_agent，保留 thread_id / thread_dir / thread_journal / mcp_manager /
-        artifact_server / skill_manager / sandbox_provider（checkpointer state 跨切换连续）。
+        """热切换 LLM provider/model。
 
-        等价于 CLI ``--provider X --model Y`` 重启，但不丢 thread。同 ``switch_expert_mode``
-        不可变语义——返回新 AppRuntime，CLI 用 runtime = runtime.switch_model(...)。
+        重建 researcher+reporter model + capability_registry + leader_agent，
+        保留 thread_id / thread_dir / thread_journal / mcp_manager / artifact_server /
+        skill_manager / sandbox_provider（checkpointer state 跨切换连续）。
+
+        等价于 CLI --provider X --model Y 重启，但不丢 thread。
+        单 provider 模式（不走 FallbackChatModel 路由链），reporter = researcher。
 
         provider 必须是 MODEL_PROVIDERS 里 enabled 的项；model=None 用 provider 默认 model。
-        单 provider 模式（不走 FallbackChatModel 路由链），reporter = researcher。
+
+        返回新 AppRuntime（不可变语义）。
         """
         from poirot.backend.agents.config.model_router import ModelRouter
 
@@ -285,7 +352,7 @@ class AppRuntime:
 
 
 def _load_sandbox_provider(config: AppConfig) -> Any:
-    """反射加载 sandbox provider。config.sandbox.use 为空则返 None（Grill #9）。"""
+    """反射加载 sandbox provider。config.sandbox.use 为空则返回 None。"""
     sandbox_config = config.sandbox
     if not sandbox_config.use:
         return None
@@ -299,9 +366,8 @@ def _load_sandbox_provider(config: AppConfig) -> Any:
 
 
 def _load_memory_provider(config: AppConfig) -> Any:
-    """反射加载 memory provider。config.memory.use 为空则返 None。
+    """反射加载 memory provider。config.memory.use 为空则返回 None。
 
-    照抄 _load_sandbox_provider 反射模式（01 介入点 11.1）。
     config.memory.use="default" 时调 get_memory_provider()（内部 build_default_provider）。
     """
     memory_config = config.memory
@@ -330,7 +396,7 @@ def _build_path_mappings(sandbox_config: Any) -> list:
 def _build_evolution_manager(skill_manager: Any, llm: Any, journal: Any) -> Any:
     """建 EvolutionManager（Layer 2a）注入 SkillManager。
 
-    lazy import evolution 模块（避免 skill → evolution → skill 循环）。
+    lazy import evolution 模块（避免 skill → evolution → skill 循环依赖）。
     """
     from poirot.backend.agents.skill.evolution.focus.ive_focuser import IVEFocuser
     from poirot.backend.agents.skill.evolution.eval.programmatic_bridge import (
@@ -418,6 +484,22 @@ def bootstrap_runtime(
     model: str | None = None,
     cli_overrides: dict[str, Any] | None = None,
 ) -> AppRuntime:
+    """★ 应用启动主入口：装配所有组件，返回 AppRuntime。
+
+    装配顺序：
+    1. 加载 config + 锚定相对路径。
+    2. 建 thread journal。
+    3. 构造 LLM（单 provider 或路由）。
+    4. 加载 builtin 工具。
+    5. 加载 MCP 工具（npx 可用时）。
+    6. 装配 sandbox（config.sandbox.use 非空时）。
+    7. 装配 skill（含 evolution / eval，可选）。
+    8. 装配 multiagent（enabled=true 时；含 subagent factory）。
+    9. 装配 memory。
+    10. 构造 CapabilityRegistry。
+    11. 构造 LeaderAgent。
+    12. 打包 AppRuntime。
+    """
     config = load_config(expert_mode=expert_mode, cli_overrides=cli_overrides)
     logs_root = Path(config.runtime.logs_root)
     if not logs_root.is_absolute():
@@ -426,10 +508,10 @@ def bootstrap_runtime(
         config,
         runtime=replace(config.runtime, logs_root=str(logs_root)),
     )
-    # 锚定 externalize_dir 等治理层相对路径到项目根（同 logs_root 处理）
+    # 锚定 externalize_dir 等治理层相对路径到项目根
     config = _resolve_relative_paths(config)
 
-    # Thread-level setup — journal created BEFORE MCP/LLM loading.
+    # ── Thread-level setup：journal 在 MCP/LLM 加载之前创建 ──
     thread_id = _make_thread_id()
     threads_root = logs_root / "threads"
     thread_dir = threads_root / thread_id
@@ -443,7 +525,7 @@ def bootstrap_runtime(
         "provider": provider or "default",
     })
 
-    # LLM construction — 角色化智能路由（deepseek 兜底），或 CLI --provider 强制单 provider。
+    # ── LLM 构造：角色化智能路由（deepseek 兜底），或 CLI --provider 强制单 provider ──
     from poirot.backend.agents.config.model_router import ModelRouter
 
     router = ModelRouter()
@@ -466,11 +548,10 @@ def bootstrap_runtime(
         })
         researcher_model_name = "routed:" + ",".join(router.chain_names("researcher"))
 
-    # MCP tool loading — 通过 McpManager 门面加载，配置化 + 熔断器 + fallback。
+    # ── MCP 工具加载：通过 McpManager 门面，配置化 + 熔断器 + fallback ──
     tools: dict[str, Any] = {}
 
     # builtin 工具（ddg_search / read_snapshot）——始终注册，MCP 未启用时的唯一搜索来源。
-    # 之前遗漏此调用导致 MCP 关闭时 agent 无任何搜索工具可用。
     builtin_tools = get_available_tools(groups=["core"])
     for t in builtin_tools:
         tools[t.name] = t
@@ -488,6 +569,7 @@ def bootstrap_runtime(
 
                 try:
                     asyncio.get_running_loop()
+                    # 已在 event loop 中：用线程池跑 asyncio.run
                     import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                         pool.submit(asyncio.run, mcp_manager.load_startup()).result()
@@ -524,8 +606,7 @@ def bootstrap_runtime(
             file=sys.stderr,
         )
 
-    # Registry + LeaderAgent — built ONCE per thread, reused across runs.
-    # Sandbox 装配（Grill #9：config 配了 provider 就加载，不论模式）
+    # ── Sandbox 装配（config 配了 provider 就加载，不论模式）──
     sandbox_provider = _load_sandbox_provider(config)
     sandbox_tools = []
     artifact_server = None
@@ -544,7 +625,7 @@ def bootstrap_runtime(
         artifact_server = ArtifactServer()
         artifact_server.start()
 
-    # Skill 模块加载 — build_skill_manager 读 .env，enabled=false 或无目录返 None。
+    # ── Skill 模块加载：build_skill_manager 读 .env，enabled=false 或无目录返 None ──
     skill_manager = None
     skill_injection_middleware = None
     skill_metrics_middleware = None
@@ -584,19 +665,17 @@ def bootstrap_runtime(
 
     all_tools = {**tools, **{t.name: t for t in sandbox_tools}}
 
-    # Multi-Agent orchestration 装配 — enabled=false 时返空 setup（lead agent 行为不变）
+    # ── Multi-Agent orchestration 装配：enabled=false 时返空 setup（lead agent 行为不变）──
     ma_config = load_multiagent_config()
 
-    # Bug A 修复：注入 agent_factory 让 SubagentRuntime 可用（设计文档 46 §4.1）
-    # _subagent_factory 构造 leaf-role lead agent（复用 lead agent 构造，但 leaf 不能再 delegate）。
-    # 闭包捕获本函数局部变量（registry / config / sandbox_provider / 各 middleware）。
     def _subagent_factory() -> Any:
-        """Leaf-role lead agent factory for self-copy subagent.
+        """Leaf-role lead agent factory，供 self-copy subagent 使用。
 
         复用 lead agent 构造逻辑，但 leaf role 限制：
-        - specialist_tools=None（leaf 看不到 delegate_to_* tool，不能再 spawn）
+        - specialist_tools=None（leaf 看不到 delegate_to_*，不能再 spawn）
         - orchestration_middleware=None（leaf 不挂 OrchestrationMiddleware）
-        这些限制让子 agent 无法递归 spawn（INVARIANT：max_spawn_depth=1 leaf-only MVP）。
+
+        这些限制让子 agent 无法递归 spawn（leaf-only MVP）。
         """
         return make_lead_agent(
             expert_mode=expert_mode,
@@ -619,7 +698,7 @@ def bootstrap_runtime(
         agent_factory=_subagent_factory,
     )
 
-    # 同步 AppConfig.memory → 全局单例（middleware/worker/manager 从 get_memory_config() 取）
+    # ── Memory 装配：同步 AppConfig.memory → 全局单例，启动 worker ──
     set_memory_config(config.memory)
     memory_provider = _load_memory_provider(config)
     memory_worker = None
@@ -627,6 +706,8 @@ def bootstrap_runtime(
         memory_worker = start_memory_worker(memory_provider.manager(), researcher_model)
         import atexit
         atexit.register(shutdown_memory_worker)
+
+    # ── CapabilityRegistry 构造：聚合所有能力 ──
     registry = CapabilityRegistry(
         models={"researcher": researcher_model, "reporter": reporter_model},
         tools=all_tools,
@@ -638,6 +719,8 @@ def bootstrap_runtime(
         subagent_provider=ma_setup.subagent_provider,
         memory_provider=memory_provider,
     )
+
+    # ── LeaderAgent 构造：注入工具 + 中间件 ──
     leader_agent = make_lead_agent(
         expert_mode=expert_mode,
         capability_registry=registry,
@@ -659,6 +742,7 @@ def bootstrap_runtime(
         "tools_count": len(tools),
     })
 
+    # ── 打包 AppRuntime ──
     return AppRuntime(
         config=config,
         capability_registry=registry,

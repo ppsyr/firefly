@@ -1,10 +1,35 @@
 """首次启动配置向导 — 检测 .env 不存在时引导用户完成最小配置。
 
-设计原则：
-- 接口小：ensure_config(project_root) → bool，一个入口
-- 不依赖 .env（向导运行前 .env 不存在，不能读 env）
-- 用 rich 渲染 + input() 交互，不引入新依赖
-- 生成的 .env 从 .env.example 模板填充，保证字段完整
+【整体职责】
+在首次启动（.env 不存在）时，以交互式向导引导用户配置最小可运行项：选择 provider、
+输入 API Key、选择可选功能（skill / MCP / sandbox），并从模板生成 .env 文件。
+若检测到环境变量中已有任意 provider 的 API Key（Docker env_file 模式），跳过向导。
+
+【内容摘要】
+- _console                    : rich Console 单例。
+- ensure_config               : 入口，检查 .env / env 注入，必要时启动向导。
+- _has_any_provider_key       : 检查环境变量中是否已有 provider API Key。
+- _run_wizard                 : 交互式向导主流程。
+- _ask_yes_no                 : 是/否提问，回车取默认值。
+- _ask_sandbox                : 沙箱模式选择，返回 provider 路径或空串。
+- _build_env_content          : 从模板填充用户输入，生成 .env 内容。
+- _MINIMAL_TEMPLATE           : .env.example 缺失时的最小模板。
+- update_env_file             : 更新 .env 中指定 key（供 TUI 配置面板调用）。
+
+【职责边界】
+- 只负责：检测配置是否就绪、交互式采集配置、生成/更新 .env 文件。
+- 不负责：配置的加载与校验（loader）、provider 的实现与模型构造（provider_config）、
+  TUI 配置面板的呈现（tui 模块，仅调用 update_env_file）。
+
+【INVARIANT】
+- 接口小：对外仅 ensure_config(project_root) -> bool 与 update_env_file。
+- 不依赖 .env：向导运行前 .env 不存在，不读 env 做判断（除 _has_any_provider_key 检查已注入的 env）。
+- 无新依赖：仅用 rich + 内置 input()。
+- 模板驱动：生成的 .env 从 .env.example 填充，字段完整；缺失时回退 _MINIMAL_TEMPLATE。
+- Docker 兼容：env 已注入 provider key 时跳过向导。
+- 至少一个 provider：未配置任何 provider 时不允许退出循环。
+- 逐行替换：只替换 KEY= 行，注释与其他行原样保留。
+- 取消可退：Ctrl+C / EOFError 时返回 False，不写文件。
 """
 from __future__ import annotations
 
@@ -23,8 +48,11 @@ def ensure_config(project_root: Path) -> bool:
     Docker 模式下 env_file 注入环境变量但容器内无 .env 文件——
     若已检测到任意 provider API key 在环境变量中，跳过向导。
 
+    Args:
+        project_root: 项目根目录（.env 所在位置）。
+
     Returns:
-        True = 配置已就绪（文件存在 / env 已注入 / 刚创建），False = 用户取消
+        bool: True = 配置已就绪（文件存在 / env 已注入 / 刚创建），False = 用户取消。
     """
     env_path = project_root / ".env"
     if env_path.exists():
@@ -36,7 +64,11 @@ def ensure_config(project_root: Path) -> bool:
 
 
 def _has_any_provider_key() -> bool:
-    """检查环境变量中是否已有任意 provider 的 API key。"""
+    """检查环境变量中是否已有任意 provider 的 API key。
+
+    Returns:
+        bool: 任一非 fake provider 的 env_key 非空则 True。
+    """
     import os
     from poirot.backend.agents.config.provider_profile import PROVIDER_PROFILES
 
@@ -49,7 +81,15 @@ def _has_any_provider_key() -> bool:
 
 
 def _run_wizard(project_root: Path, env_path: Path) -> bool:
-    """交互式配置向导主流程。"""
+    """交互式配置向导主流程。
+
+    Args:
+        project_root: 项目根目录。
+        env_path: 目标 .env 路径。
+
+    Returns:
+        bool: True = 生成成功；False = 用户取消。
+    """
     # 延迟导入，避免在已有 .env 时加载 provider_profile
     from poirot.backend.agents.config.provider_profile import PROVIDER_PROFILES
 
@@ -123,7 +163,15 @@ def _run_wizard(project_root: Path, env_path: Path) -> bool:
 
 
 def _ask_yes_no(prompt: str, default: bool = False) -> bool:
-    """是/否提问，回车取默认值。"""
+    """是/否提问，回车取默认值。
+
+    Args:
+        prompt: 提问文本。
+        default: 回车时的默认值。
+
+    Returns:
+        bool: 用户选择。
+    """
     hint = "Y/n" if default else "y/N"
     raw = input(f"{prompt} ({hint}): ").strip().lower()
     if not raw:
@@ -132,7 +180,11 @@ def _ask_yes_no(prompt: str, default: bool = False) -> bool:
 
 
 def _ask_sandbox() -> str:
-    """沙箱配置选择。返回 provider 路径或空串。"""
+    """沙箱配置选择。返回 provider 路径或空串。
+
+    Returns:
+        str: Local / Docker provider 路径；不启用则空串。
+    """
     _console.print("  [1] Local — 本机进程（开发调试）")
     _console.print("  [2] Docker — 容器隔离（需 Docker）")
     _console.print("  [回车] 不启用")
@@ -151,7 +203,18 @@ def _build_env_content(
     mcp: bool,
     sandbox: str,
 ) -> str:
-    """从模板 .env.example 读取，填充用户输入的值，生成 .env 内容。"""
+    """从模板 .env.example 读取，填充用户输入的值，生成 .env 内容。
+
+    Args:
+        project_root: 项目根目录。
+        configs: provider → {api_key, base_url, model} 配置。
+        skill: 是否启用 Skill 系统。
+        mcp: 是否启用 MCP 工具。
+        sandbox: 沙箱 provider 路径；空串表示不启用。
+
+    Returns:
+        str: 生成的 .env 内容。
+    """
     template_path = project_root / ".env.example"
     if template_path.exists():
         lines = template_path.read_text(encoding="utf-8").splitlines()
@@ -200,6 +263,10 @@ def update_env_file(env_path: Path, overrides: dict[str, str]) -> None:
     """更新 .env 文件中指定 key 的值，保留其他行原样。
 
     供 TUI 配置面板（Ctrl+B）调用：读取当前 .env → 替换 KEY= 行 → 写回。
+
+    Args:
+        env_path: .env 路径。
+        overrides: key → value 覆盖映射。
     """
     if not env_path.exists():
         return
@@ -214,4 +281,3 @@ def update_env_file(env_path: Path, overrides: dict[str, str]) -> None:
                 continue
         result.append(line)
     env_path.write_text("\n".join(result) + "\n", encoding="utf-8")
-

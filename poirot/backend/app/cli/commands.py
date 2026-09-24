@@ -1,12 +1,33 @@
-"""commands — CLI 命令系统（/help /clear /expert /default /report /exit /expand /thinking /tools /model /thread /prompt）。
+"""commands — CLI 命令系统（/help /clear /expert /default /report /exit /expand /thinking /tools /model /thread /prompt /skill /mcp）。
 
-命令以 / 开头，``handle_command`` 从 ``CommandRegistry`` 查 handler 分发。
-返回 True 表示退出 CLI，False 继续循环。
+【整体职责】
+提供 CLI 的斜杠命令体系：以 `/` 开头的输入由 handle_command 从 CommandRegistry 查
+handler 分发，各 handler 统一签名（接收 CommandContext，返回 bool | None）。
+返回 True 表示退出 CLI，False/None 表示继续循环。
 
-``_cmd_help`` 文案与 ``/`` 补全菜单的 ``display_meta`` 共用同一份 ``CommandSpec.description``，
-避免两处维护。``CommandRegistry.register_skill()`` 预留接口见 ``registry.py``。
+【内容摘要】
+- CommandContext        : 单次命令调用的上下文，统一 handler 签名。
+- _cmd_help / _cmd_clear / _cmd_expert / _cmd_default / _cmd_report / _cmd_exit
+- _cmd_expand / _cmd_thinking / _cmd_tools / _cmd_model / _cmd_thread / _cmd_prompt
+- _cmd_skill / _cmd_mcp : 技能与 MCP 的子命令族。
+- _registry            : 模块级命令注册表（注册全部 builtin 命令）。
+- get_registry         : 供 main.py 构造补全器时取注册表。
+- handle_command       : 命令分发入口。
+
+【职责边界】
+- 只负责：命令解析与分发、命令的呈现（console 输出）、设置 pending_* 标志。
+- 不负责：命令触发的实际动作（切换模式 / 报告合成 / MCP 重载 / 模型切换由 main 主循环
+  消费 pending_* 后执行）、补全实现（command_completer）、注册表实现（registry）。
+
+【INVARIANT】
+- 统一签名：handler(ctx: CommandContext) -> bool | None；只有 _cmd_exit 返回 True。
+- 单一注册表：_registry 模块级唯一，get_registry 返回同一实例。
+- 描述共用：/help 文案与补全菜单的 display_meta 共用 CommandSpec.description，避免两处维护。
+- pending 标志解耦：需要主循环动作的命令（/expert /default /report /model /mcp reload）
+  只设置 state 里的 pending_*，由 main 消费——避免 commands 依赖 main。
+- pending_report 哨兵区分："" 表示 pending 无 topic，None 表示未设 pending。
+- 未命中命令：打印 Unknown command 并返回 False（不退出）。
 """
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,7 +41,15 @@ from poirot.backend.app.cli.stream_handler import StreamRenderer
 
 @dataclass
 class CommandContext:
-    """单次命令调用的上下文——统一 ``_cmd_*`` 函数签名，让 ``handle_command`` 能通过 registry 泛化分发。"""
+    """单次命令调用的上下文——统一 ``_cmd_*`` 函数签名，让 ``handle_command`` 能通过 registry 泛化分发。
+
+    Attributes:
+        console: rich Console。
+        renderer: 流式渲染器（/expand /thinking 用）。
+        state: 主循环共享状态（pending_* / skill_override 等）。
+        runtime: 应用运行时。
+        arg: 命令参数（命令名之后的部分）。
+    """
 
     console: Console
     renderer: StreamRenderer
@@ -33,21 +62,25 @@ class CommandContext:
 
 
 def _cmd_help(ctx: CommandContext) -> None:
+    """列出全部已注册命令及描述。"""
     ctx.console.print("[bold]Available commands:[/bold]")
     for spec in _registry.list_all():
         ctx.console.print(f"  [cyan]{spec.name}[/cyan]     {spec.description}")
 
 
 def _cmd_clear(ctx: CommandContext) -> None:
+    """清屏。"""
     ctx.console.clear()
 
 
 def _cmd_expert(ctx: CommandContext) -> None:
+    """设置 pending_expert_mode=True，由主循环下轮切换。"""
     ctx.state["pending_expert_mode"] = True
     ctx.console.print("[green]Mode will switch to expert next round[/green]")
 
 
 def _cmd_default(ctx: CommandContext) -> None:
+    """设置 pending_expert_mode=False，由主循环下轮切换。"""
     ctx.state["pending_expert_mode"] = False
     ctx.console.print("[green]Mode will switch to default next round[/green]")
 
@@ -61,14 +94,17 @@ def _cmd_report(ctx: CommandContext) -> None:
 
 
 def _cmd_exit(ctx: CommandContext) -> bool:
+    """退出 CLI。"""
     return True
 
 
 def _cmd_expand(ctx: CommandContext) -> None:
+    """展开上一轮工具结果与 Thought 段（/expand）。"""
     ctx.renderer.expand_last_round()
 
 
 def _cmd_thinking(ctx: CommandContext) -> None:
+    """切换 Thought 折叠行显示（on|off），与 stream_handler._render_thinking 联动。"""
     # 语义：toggle Thought 折叠行（非逐 token 流）——与 stream_handler._render_thinking 联动
     if ctx.arg == "off":
         ctx.renderer.state["thinking_enabled"] = False
@@ -82,6 +118,7 @@ def _cmd_thinking(ctx: CommandContext) -> None:
 
 
 def _cmd_tools(ctx: CommandContext) -> None:
+    """列出可用工具（含 MCP）。"""
     try:
         from poirot.backend.agents.agent_tools.available import get_available_tools
         tools = get_available_tools(include_mcp=True)
@@ -93,6 +130,11 @@ def _cmd_tools(ctx: CommandContext) -> None:
 
 
 def _cmd_model(ctx: CommandContext) -> None:
+    """模型命令：无参显示当前路由链；有参 <provider> [model] 设 pending_model_switch。
+
+    Args:
+        ctx: 命令上下文。
+    """
     arg = ctx.arg.strip()
     # 无参：显示当前路由链
     if not arg:
@@ -123,6 +165,7 @@ def _cmd_model(ctx: CommandContext) -> None:
 
 
 def _cmd_thread(ctx: CommandContext) -> None:
+    """显示线程信息：thread_id / thread_dir / 最近 run 列表（读 events.jsonl）。"""
     ctx.console.print(f"[bold]Thread ID:[/bold] [cyan]{ctx.runtime.thread_id}[/cyan]")
     ctx.console.print(f"[bold]Thread dir:[/bold] [dim]{ctx.runtime.thread_dir}[/dim]")
     try:
@@ -148,7 +191,11 @@ def _cmd_thread(ctx: CommandContext) -> None:
 
 
 def _cmd_prompt(ctx: CommandContext) -> None:
-    """Prompt 管理命令：/prompt list | /prompt show <cat/name> | /prompt reload"""
+    """Prompt 管理命令：/prompt list | /prompt show <cat/name> | /prompt reload。
+
+    Args:
+        ctx: 命令上下文。
+    """
     from poirot.backend.agents.prompts import get_prompt_manager
 
     pm = get_prompt_manager()
@@ -196,6 +243,9 @@ def _cmd_skill(ctx: CommandContext) -> None:
     - off：清 override（不禁用 skill 本身，agent 仍可自动 select）
     - enable/disable <name>：运行时持久 enable/disable（store.set_enabled，跨重启）
     - install <path> [name]：parser.install 拷到 skills/ + re-discover（S2）
+
+    Args:
+        ctx: 命令上下文。
     """
     arg = ctx.arg.strip()
     if arg == "list":
@@ -485,6 +535,9 @@ def _cmd_mcp(ctx: CommandContext) -> None:
 
     - list：展示 servers + transport + 工具数 + 健康状态
     - reload：设 pending_mcp_reload，主循环检测后 runtime.reload_mcp_tools() 重建 graph
+
+    Args:
+        ctx: 命令上下文。
     """
     arg = ctx.arg.strip()
     mgr = getattr(ctx.runtime, "mcp_manager", None)
@@ -548,6 +601,16 @@ def handle_command(
 
     从 ``CommandRegistry.get(name)`` 查 handler，构造 ``CommandContext`` 后调用。
     未命中时打印 ``Unknown command`` 并返回 False。
+
+    Args:
+        cmd: 完整命令文本（含 / 与参数）。
+        console: rich Console。
+        renderer: 流式渲染器。
+        state: 主循环共享状态。
+        runtime: 应用运行时。
+
+    Returns:
+        bool: True 表示退出 CLI。
     """
     parts = cmd.strip().split(maxsplit=1)
     name = parts[0].lower()

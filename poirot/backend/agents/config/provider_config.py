@@ -1,3 +1,38 @@
+"""模型提供者配置 — 从 ProviderProfile 解析 ProviderConfig，并构造 ChatModel。
+
+【整体职责】
+负责 provider 维度的配置解析与模型构造：读取环境变量把 ProviderProfile 解析为
+ProviderConfig（含 key / base_url / model / 优先级 / 窗口），提供按 provider 或按角色
+（researcher / reporter / reflection）的选择与路由，并最终按 provider kind 分发构造
+BaseChatModel。
+
+【内容摘要】
+- ProviderConfigError       : provider 配置缺失或非法时抛出。
+- ProviderConfig            : 单个 provider 的解析后配置（frozen）。
+- _resolve_profile          : 从 ProviderProfile 读 env，解析为 ProviderConfig。
+- _all_configs              : 解析全部 profile 为 ProviderConfig（含 disabled）。
+- select_provider_config    : 按 provider 或默认优先级选择配置（可覆盖 model）。
+- get_provider_config       : 按 provider 名取配置。
+- _find_provider            : 在候选中按名查找，找不到则抛错。
+- MODEL_ROUTES              : 角色 → provider 偏好链（链尾恒含 deepseek 兜底）。
+- discover_available_providers : 返回 enabled 且 key 非空（或免 key）的 provider，按 priority 升序。
+- _is_no_key                : provider 是否免 API key（fake / ollama）。
+- route_chain_for           : 按角色路由链筛 provider，保证 deepseek 兜底。
+- build_chat_model          : 按 provider kind 构造 BaseChatModel。
+
+【职责边界】
+- 只负责：provider 配置解析、选择、路由，以及 ChatModel 的构造。
+- 不负责：ProviderProfile 的定义（provider_profile）、环境变量名声明（profile）、
+  模型路由的上层决策（model_router）、配置 Schema（schema）。
+
+【INVARIANT】
+- 延迟读 env：环境变量在 _resolve_profile 中读取，不在模块加载时读，利于测试 monkeypatch。
+- provider 可单独禁用：每个 provider 支持 {NAME}_ENABLED=false。
+- 免 key provider：fake / ollama 经 no_key_required 跳过 api_key 校验。
+- 路由链尾兜底：route_chain_for 保证 deepseek 在链尾（若可用）。
+- optional 依赖缺失提示：anthropic / gemini / ollama 的 langchain 包未安装时抛
+  ProviderConfigError 并提示安装对应 optional-dependencies。
+"""
 from __future__ import annotations
 
 import os
@@ -16,6 +51,19 @@ class ProviderConfigError(ValueError):
 
 @dataclass(frozen=True)
 class ProviderConfig:
+    """单个 provider 的解析后配置。
+
+    Attributes:
+        provider: provider 名称。
+        model: 模型名。
+        api_key: API key（免 key provider 可为空）。
+        base_url: 自定义 base URL；无则为 None。
+        priority: 优先级，数值越小越优先。
+        default: 是否为默认 provider。
+        enabled: 是否启用。
+        window: 上下文窗口（token）；0 表示未知，由 resolve_window_size 兜底。
+    """
+
     provider: str
     model: str
     api_key: str
@@ -26,6 +74,7 @@ class ProviderConfig:
     window: int = 0  # 上下文窗口（token），0=未知，由 resolve_window_size 兜底
 
     def require_api_key(self) -> str:
+        """校验并返回 api_key；为空则抛 ProviderConfigError。"""
         if not self.api_key:
             raise ProviderConfigError(f"api_key is empty for provider: {self.provider}")
         return self.api_key
@@ -36,6 +85,12 @@ def _resolve_profile(profile: ProviderProfile) -> ProviderConfig:
 
     env 变量名在 profile 声明，值在此处读取（不在模块加载时读，利于测试 monkeypatch）。
     每个 provider 支持 {NAME}_ENABLED=false 单独禁用。
+
+    Args:
+        profile: provider 档案，声明 env 变量名与默认值。
+
+    Returns:
+        ProviderConfig: 解析后的 provider 配置。
     """
     api_key = os.environ.get(profile.env_key, "")
     base_url = os.environ.get(profile.env_base_url, "") or profile.default_base_url
@@ -62,6 +117,15 @@ def select_provider_config(
     provider: str | None = None,
     model: str | None = None,
 ) -> ProviderConfig:
+    """选择 provider 配置。
+
+    Args:
+        provider: 指定 provider 名；为 None 时按 default / priority 选默认。
+        model: 指定模型名；非空时覆盖所选配置的 model。
+
+    Returns:
+        ProviderConfig: 选中的配置。
+    """
     candidates = [c for c in _all_configs() if c.enabled]
     if provider:
         selected = _find_provider(candidates, provider)
@@ -83,10 +147,12 @@ def select_provider_config(
 
 
 def get_provider_config(provider: str) -> ProviderConfig:
+    """按 provider 名取配置。"""
     return select_provider_config(provider=provider)
 
 
 def _find_provider(candidates: list[ProviderConfig], provider: str) -> ProviderConfig:
+    """在候选中按名查找 provider；找不到则抛 ProviderConfigError。"""
     for candidate in candidates:
         if candidate.provider == provider:
             return candidate
@@ -142,6 +208,12 @@ def build_chat_model(config: ProviderConfig):
 
     optional provider（anthropic/gemini/ollama）的 langchain 包未安装时
     抛 ProviderConfigError 提示安装对应 optional-dependencies。
+
+    Args:
+        config: provider 配置。
+
+    Returns:
+        BaseChatModel: 对应 provider kind 的 LangChain ChatModel 实例。
     """
     profile = get_provider_profile(config.provider)
     if profile is None:

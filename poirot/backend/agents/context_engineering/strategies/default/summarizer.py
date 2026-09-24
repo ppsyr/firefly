@@ -1,3 +1,21 @@
+"""SummarizerExecutor — P4 全量摘要执行器。
+
+【整体职责】
+P4（fraction >= 0.80）时，把旧消息交给 LLM 压成一条 summary HumanMessage，
+并做 pairing 保护：
+    - 切分点不能落在 ToolMessage 上（_snap_to_pairing）；
+    - preserved 段的孤立 ToolMessage / 孤立 AIMessage(tool_calls) 要移到 to_summarize；
+    - to_summarize 段里的孤立 ToolMessage 先外化（_externalize_orphans），路径写进摘要。
+
+【与 strategy.py / externalizer.py 的关系】
+    strategy.before_model 的 P4 分支：snapshot → summarize_if_pending(..., externalizer)
+    summarizer 内部复用 externalizer.externalize_if_needed 处理孤立 ToolMessage。
+
+【产出 messages_patch】
+    [RemoveMessage(id=REMOVE_ALL_MESSAGES), summary_msg, *preserved]
+    即：清空全部消息，再插入 summary + 保留的近期消息。
+"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -21,10 +39,34 @@ class SummarizerExecutor:
     """P4 全量 summarize + pairing 保护。"""
 
     def __init__(self, model: Any = None, preserve_recent: int = 6) -> None:
+        """构造摘要器。
+
+        Args:
+            model:           摘要用模型（strategy 传入 summarize_model 或 model）。
+            preserve_recent: 保留最近 N 条消息不摘要。
+        """
         self._model = model
         self._preserve_recent = preserve_recent
 
     def summarize_if_pending(self, governance: dict | None, messages: list, externalizer: ExternalizerExecutor) -> GovernanceResult | None:
+        """若 pending 含 P4，则执行全量摘要，返回 GovernanceResult。
+
+        Args:
+            governance:   现有 governance。
+            messages:     当前消息列表。
+            externalizer: ExternalizerExecutor，用于外化孤立 ToolMessage。
+
+        Returns:
+            GovernanceResult（state_patch=summary 相关，messages_patch=[RemoveAll, summary, *preserved]）；
+            非 P4 / 无模型 / 无可摘要内容时返回 None。
+
+        流程：
+            1. _partition 切分 to_summarize / preserved（含 pairing 校正）。
+            2. _externalize_orphans 把 to_summarize 里的孤立 ToolMessage 外化，收集路径。
+            3. _call_llm 生成摘要文本（失败 fallback "压缩失败，保留最近对话。"）。
+            4. 若有外化路径，追加到摘要文本末尾。
+            5. 构造 summary HumanMessage + RemoveAll + preserved 作为 messages_patch。
+        """
         governance = governance or {}
         pending = (governance.get("default") or {}).get("pending") or []
         if "P4" not in pending:
@@ -47,6 +89,19 @@ class SummarizerExecutor:
         )
 
     def _partition(self, messages: list) -> tuple[list, list]:
+        """切分 to_summarize / preserved，并做 pairing 校正。
+
+        Args:
+            messages: 当前消息列表。
+
+        Returns:
+            (to_summarize, preserved)。
+
+        规则：
+            - 若消息数 <= preserve_recent，返回 ([], messages)。
+            - 否则 cut = n - preserve_recent，再 _snap_to_pairing 校正。
+            - preserved 段孤立 tool / ai 消息由 _strip_orphan_tools 移到 to_summarize。
+        """
         n = len(messages)
         if n <= self._preserve_recent:
             return [], messages
@@ -61,7 +116,16 @@ class SummarizerExecutor:
 
     @staticmethod
     def _strip_orphan_tools(preserved: list) -> tuple[list, list]:
-        """preserved 中孤立 ToolMessage 或孤立 AIMessage(tool_calls) 移除，防 pairing 断裂。"""
+        """preserved 中孤立 ToolMessage 或孤立 AIMessage(tool_calls) 移除，防 pairing 断裂。
+
+        Args:
+            preserved: 保留段消息列表。
+
+        Returns:
+            (clean, orphans)：
+                clean   = pairing 完好的消息；
+                orphans = 被移出的孤立消息（交给 to_summarize）。
+        """
         ai_tc_ids: set[str] = set()
         for msg in preserved:
             if isinstance(msg, AIMessage):
@@ -88,6 +152,18 @@ class SummarizerExecutor:
         return clean, orphans
 
     def _snap_to_pairing(self, messages: list, cut: int) -> int:
+        """把切分点向前对齐到 pairing 完整的位置。
+
+        若 messages[cut] 是 ToolMessage，且 messages[cut-1] 是带 tool_calls 的 AIMessage，
+        则 cut 前移 1，保证 AIMessage 与其 ToolMessage 不被切开。
+
+        Args:
+            messages: 消息列表。
+            cut:      初始切分点。
+
+        Returns:
+            校正后的切分点。
+        """
         while cut < len(messages) and isinstance(messages[cut], ToolMessage):
             if cut > 0 and isinstance(messages[cut - 1], AIMessage) and messages[cut - 1].tool_calls:
                 cut -= 1
@@ -96,6 +172,15 @@ class SummarizerExecutor:
         return cut
 
     def _externalize_orphans(self, messages: list, externalizer: ExternalizerExecutor) -> list[str]:
+        """把 to_summarize 里孤立 ToolMessage 外化，返回路径列表。
+
+        Args:
+            messages:     to_summarize 段。
+            externalizer: ExternalizerExecutor。
+
+        Returns:
+            外化文件路径列表（可能为空）。
+        """
         ai_tc_ids: set[str] = set()
         for msg in messages:
             if isinstance(msg, AIMessage):
@@ -114,6 +199,20 @@ class SummarizerExecutor:
         return paths
 
     def _call_llm(self, messages: list) -> str | None:
+        """调 LLM 生成摘要文本。
+
+        Args:
+            messages: to_summarize 段。
+
+        Returns:
+            摘要文本；模型缺失或调用异常返回 None。
+
+        细节：
+            - 通过 prompts 管理器加载 "context_engineering/default/summarize" 提示词，
+              把历史拼进 messages_text。
+            - config.tags=["internal_llm"] 标记内部调用，
+              防 astream(stream_mode="messages") 捕获后泄漏到 CLI。
+        """
         if not self._model:
             return None
         try:
@@ -129,6 +228,14 @@ class SummarizerExecutor:
 
     @staticmethod
     def _format_history(messages: list) -> str:
+        """把消息列表格式化成 "[类型] 内容前 500 字" 的文本块。
+
+        Args:
+            messages: 消息列表。
+
+        Returns:
+            多行字符串，每行一条消息。
+        """
         lines: list[str] = []
         for msg in messages:
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
@@ -136,6 +243,15 @@ class SummarizerExecutor:
         return "\n".join(lines)
 
     def _update_summary(self, governance: dict, summary_text: str) -> dict:
+        """把 summary 文本与 id 写回 governance，并累加 summarize_count。
+
+        Args:
+            governance:   现有 governance。
+            summary_text: 摘要文本。
+
+        Returns:
+            更新后的 governance（default.summary / summary_id / metrics.summarize_count）。
+        """
         g = dict(governance or {})
         d = dict(g.get("default") or {})
         d["summary"] = summary_text

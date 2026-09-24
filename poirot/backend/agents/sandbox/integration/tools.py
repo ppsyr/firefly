@@ -1,3 +1,39 @@
+"""Sandbox 工具工厂 — 把 Sandbox 能力包装成 Agent 可调用的 @tool 工具集。
+
+【整体职责】
+基于给定的 SandboxProvider，工厂式地构造一组 LangChain @tool（bash / read_file /
+write_file / list_dir / str_replace / present_files），供 Agent 在工具调用中使用。
+工具内部通过 ContextVar 取当前 sandbox_id，再经 provider.get 拿到 Sandbox 实例。
+
+【内容摘要】
+- _BASH_OUTPUT_MAX_CHARS : bash 输出截断阈值（10000 字符）。
+- WRITE_FILE_MAX_BYTES   : write_file 非 append 模式下的单次写入上限（5 MiB）。
+- _truncate_output       : 长输出截断，超限追加 omitted 提示。
+- _ensure_sandbox        : 从 ContextVar 取 sandbox_id + provider.get 拿 Sandbox；
+                           缺失时抛 SandboxRuntimeError / SandboxNotFoundError。
+- _make_bash_tool        : 构造 bash 工具（受 allow_host_bash 控制是否注册）。
+- _make_read_file_tool   : 构造 read_file 工具。
+- _make_write_file_tool  : 构造 write_file 工具（含大小上限 + append 语义）。
+- _make_list_dir_tool    : 构造 list_dir 工具（树形输出）。
+- _make_str_replace_tool : 构造 str_replace 工具（按 sandbox+path 加锁串行化）。
+- _make_present_files_tool: 构造 present_files 工具（声明交付物，校验路径前缀）。
+- make_sandbox_tools     : 工厂入口；闭包捕获 provider，产出工具列表。
+
+【职责边界】
+- 只负责：把 Sandbox 能力包装成 @tool、参数校验、输出截断/格式化、按需加锁。
+- 不负责：Sandbox 的创建与生命周期（provider）、路径转换（translator）、
+  安全校验（guard）、sandbox_id 的设置（middleware）。
+- 闭包持有 provider 引用：工具通过 provider 间接访问 Sandbox，本身不持有 Sandbox 实例。
+
+【INVARIANT】
+- 所有工具通过 _ensure_sandbox 统一取 Sandbox，不直接 new / 不直接持有。
+- bash 输出超 _BASH_OUTPUT_MAX_CHARS 自动截断。
+- write_file 非 append 且内容超 WRITE_FILE_MAX_BYTES 时拒绝写入，提示改用 append 分块。
+- str_replace 按 (sandbox.id, path) 加 file_operation_lock，保证同文件读改写串行。
+- present_files 只接受 /mnt/poirot/user-data/ 前缀的路径，否则拒绝。
+- allow_host_bash=False 时不注册 bash 工具（S2 安全加固）。
+- 工具数量：注册 bash 时 6 个，否则 5 个。
+"""
 from __future__ import annotations
 
 from langchain_core.tools import BaseTool, tool
@@ -20,7 +56,7 @@ WRITE_FILE_MAX_BYTES = 5 * 1024 * 1024
 def _truncate_output(
     output: str, max_chars: int = _BASH_OUTPUT_MAX_CHARS
 ) -> str:
-    """截断长输出，超限加提示。"""
+    """截断长输出；超限时保留前 max_chars 字符并追加 omitted 提示。"""
     if len(output) <= max_chars:
         return output
     return (
@@ -30,7 +66,11 @@ def _truncate_output(
 
 
 def _ensure_sandbox(provider: SandboxProvider) -> Sandbox:
-    """从 ContextVar 取 sandbox_id + provider.get 获取 Sandbox。"""
+    """从 ContextVar 取 sandbox_id，再经 provider.get 获取 Sandbox。
+
+    未绑定 sandbox_id 时抛 SandboxRuntimeError；
+    provider 中查无此 sandbox 时抛 SandboxNotFoundError。
+    """
     sandbox_id = get_sandbox_id()
     if sandbox_id is None:
         raise SandboxRuntimeError(
@@ -145,10 +185,10 @@ def _make_str_replace_tool(provider: SandboxProvider) -> BaseTool:
 
 
 def make_sandbox_tools(provider: SandboxProvider, allow_host_bash: bool = True) -> list[BaseTool]:
-    """工厂：构造 sandbox 工具集，闭包捕获 provider。
+    """工厂入口：构造 sandbox 工具集，闭包捕获 provider。
 
     返回 6 个 @tool：bash / read_file / write_file / list_dir / str_replace / present_files。
-    工具内部用 ContextVar get_sandbox_id 获取 sandbox_id + provider.get 获取 Sandbox。
+    工具内部用 ContextVar get_sandbox_id 取 sandbox_id，再经 provider.get 拿 Sandbox。
     allow_host_bash=False 时不注册 bash 工具（S2 安全加固）。
     """
     tools = []

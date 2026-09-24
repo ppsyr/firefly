@@ -1,13 +1,31 @@
 """Skill 配置层 — .env 读取 + frozen dataclass。
 
-INVARIANT:
-- POIROT_SKILL_ENABLED 缺省 false（opt-in，与 MCP 一致）→ build_skill_manager 返 None，既有行为不影响
-- POIROT_SKILL_DB_PATH 缺省 .poirot/skills.db，相对项目根
-- POIROT_SKILL_DIRS 逗号分隔多个扫描目录，缺省 ("skills/",)
-- POIROT_SKILL_MAX_INJECT 缺省 3，单轮最多注入 skill 数
-- POIROT_SKILL_QUALITY_THRESHOLD 缺省 0.3，quality filter 淘汰阈值
-- POIROT_SKILL_MIN_SELECTIONS 缺省 5，淘汰判定最少 selections（anti-loop）
-- int/float 转换失败 → 用默认值，不抛
+【整体职责】
+定义 skill 子系统的配置对象，并从环境变量（POIROT_SKILL_*）加载配置。
+配置为不可变（frozen dataclass），供 SkillManager / selector / evolution / eval 读取。
+
+【内容摘要】
+- _PROJECT_ROOT              ：项目根路径（parents[4]），用于把相对路径锚定到项目根。
+- _anchor(path)              ：把相对路径锚到项目根，绝对路径原样返回。
+- SkillConfig                ：skill 顶层配置（enabled / 存储 / 选择阈值 / 进化 / hub）。
+- SkillEvalConfig            ：Layer 3 eval 配置（判分 / 契约检查 / 窗口 / 权重等）。
+- load_skill_config()        ：从 os.environ 读取并构造 SkillConfig。
+
+【职责边界】
+- 只负责：配置字段定义 + 环境变量读取 + 路径锚定 + 类型转换。
+- 不负责：配置的校验之外的行为、skill 的发现 / 选择 / 打点 / 进化 / 评估逻辑。
+- 不做运行期热更新：每次 load_skill_config() 重新从 env 读取。
+
+【INVARIANT】
+- 所有 POIROT_SKILL_ENABLED 缺省 false（opt-in，与 MCP 一致）；
+  false 时 build_skill_manager 返 None，不影响既有行为。
+- db_path 缺省 .poirot/skills.db，相对项目根（锚定后 CWD 无关）。
+- skill_dirs 缺省 ("skills/",)，环境变量以逗号分隔多个目录。
+- max_inject 缺省 3，单轮最多注入 skill 数。
+- quality_threshold 缺省 0.3，quality filter 淘汰阈值。
+- min_selections 缺省 5，淘汰判定最少 selections（anti-loop，给新 skill 积累数据的机会）。
+- int / float 转换失败 → 用默认值，不抛异常。
+- 相对路径统一经 _anchor 锚定到项目根，避免从非项目根启动时误跳过。
 """
 from __future__ import annotations
 
@@ -15,14 +33,23 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# 项目根——config.py 位于 poirot/backend/agents/skill/，parents[4] 即项目根。
-# db_path / skill_dirs 默认相对路径，锚定到项目根后 CWD 无关，避免从非项目根
-# 启动时 skill 模块因找不到 skills/ 目录或 .env 被误跳过（与 logs_root 同款处理）。
+# 项目根：config.py 位于 poirot/backend/agents/skill/，parents[4] 即项目根。
+# db_path / skill_dirs 的默认值为相对路径，锚定到项目根后与 CWD 无关，
+# 避免从非项目根启动时因找不到 skills/ 目录或 .env 而被误跳过
+# （与 logs_root 同款处理）。
 _PROJECT_ROOT = Path(__file__).parents[4]
 
 
 def _anchor(path: str) -> str:
-    """相对路径锚到项目根；绝对路径原样返回。"""
+    """相对路径锚定到项目根；绝对路径原样返回。
+
+    Args:
+        path: 待处理的路径字符串。
+
+    Returns:
+        绝对路径字符串：相对路径拼到 _PROJECT_ROOT 后 resolve，
+        绝对路径直接返回原值。
+    """
     p = Path(path)
     if p.is_absolute():
         return path
@@ -31,14 +58,36 @@ def _anchor(path: str) -> str:
 
 @dataclass(frozen=True)
 class SkillConfig:
-    """Skill 模块顶层配置。
+    """Skill 模块顶层配置（不可变）。
 
-    enabled: 是否启用 skill 模块（缺省 false，false 时 build_skill_manager 返 None）
-    db_path: SQLite 路径（相对项目根）
-    skill_dirs: skill 扫描目录元组
-    max_inject: 单轮最多注入 skill 数
-    quality_threshold: quality filter 淘汰阈值（effective_rate < threshold 且 selections >= min）
-    min_selections: 淘汰判定最少 selections（anti-loop，给新 skill 数据积累机会）
+    基础开关与存储：
+    - enabled            : 是否启用 skill 模块（缺省 false；false 时
+                           build_skill_manager 返 None）。
+    - db_path            : SQLite 路径（相对项目根，构造前已锚定）。
+    - skill_dirs         : skill 扫描目录元组。
+    - include_builtin    : 是否加载内置 core 技能。
+
+    选择与淘汰（供 SkillSelector）：
+    - max_inject         : 单轮最多注入 skill 数。
+    - quality_threshold  : quality filter 淘汰阈值
+                           （effective_rate < threshold 且 selections >= min 时淘汰）。
+    - min_selections     : 淘汰判定最少 selections（anti-loop，给新 skill 数据积累机会）。
+
+    自进化（Layer 2a，默认 false opt-in）：
+    - evolve_enabled          : 是否启用自进化。
+    - evolve_threshold        : 触发进化的分数阈值。
+    - evolve_min_selections   : 触发进化的最少 selections。
+    - evolve_cooldown_turns   : 两次进化之间的冷却轮数。
+    - evolve_mutate_budget    : 变异预算。
+    - evolve_max_steps        : 单次进化最大步数。
+
+    Layer 3 eval：
+    - eval_config        : SkillEvalConfig，评估配置。
+
+    Skill Hub（H8，默认 true opt-in）：
+    - hub_enabled             : 是否启用技能中心。
+    - hub_quarantine_enabled  : 是否启用隔离区。
+    - hub_audit_log           : 是否记录审计日志。
     """
     enabled: bool = False
     db_path: str = ".poirot/skills.db"
@@ -63,7 +112,23 @@ class SkillConfig:
 
 @dataclass(frozen=True)
 class SkillEvalConfig:
-    """Layer 3 eval 配置（D-L3-8 默认 opt-in false）。"""
+    """Layer 3 eval 配置（D-L3-8，默认 opt-in false）。
+
+    开关：
+    - enabled            : eval 总开关。
+    - judgment_enabled   : 启用技能判断分析。
+    - task_judge_enabled : 启用任务质量评判。
+    - contract_check     : 启用响应契约检查。
+    - async_eval         : 是否异步评估。
+    - skip_no_skill      : 无技能时跳过评估。
+
+    参数：
+    - runtime_window     : 运行时追踪窗口大小。
+    - degradation_delta  : 退化判定增量阈值。
+    - captured_min_score : 捕获所需最低分。
+    - max_messages_chars : 送入评估的最大消息字符数。
+    - task_weights       : 任务评分权重元组。
+    """
     enabled: bool = False
     judgment_enabled: bool = True
     task_judge_enabled: bool = True
@@ -78,9 +143,13 @@ class SkillEvalConfig:
 
 
 def load_skill_config() -> SkillConfig:
-    """从 os.environ 读 POIROT_SKILL_* + 默认值。
+    """从 os.environ 读取 POIROT_SKILL_* 构造 SkillConfig，缺省用默认值。
 
-    int/float 转换失败时用默认值，不抛异常。
+    转换规则：int / float 转换失败时使用默认值，不抛异常
+    （保证坏的环境变量不会阻断启动）。
+
+    Returns:
+        SkillConfig：由环境变量与默认值组装而成的不可变配置。
     """
     enabled = os.environ.get("POIROT_SKILL_ENABLED", "false").lower() == "true"
     db_path = _anchor(os.environ.get("POIROT_SKILL_DB_PATH", ".poirot/skills.db"))

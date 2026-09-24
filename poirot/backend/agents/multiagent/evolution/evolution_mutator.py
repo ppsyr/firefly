@@ -1,12 +1,39 @@
-"""EvolutionMutator — LLM 演化执行（R2）。
+"""EvolutionMutator — LLM 演化执行。
 
-设计（42 文档 §7.7 + spec.md EvolutionMutator Requirement + R2）:
-- evolve_context_summary / evolve_skill_injection 调 LLM 单次 + 结构化 JSON 输出 + rationale 字段
-- 最多重试 2 次（含首次共 3 次），失败保持旧 is_active + 写 metrics（INV-14）
-- 多字段自由演化（不限制单字段，R2.4）
-- 输入样本按 failure_category 聚类取 top（每类 2 个，上限 5，INV-17，由 FailureFocuser 生成）
-- evolution_model 默认 None（继承 lead，R2.5，INV-18）
-- LLM 调用失败/JSON parse 失败/schema 不匹配/字段非法 → 重试 1 次
+【整体职责】
+用 LLM 对当前活跃模板做单次变异：调用 LLM 生成结构化 JSON，解析并校验后
+产出新的 candidate（ContextSummaryTemplate 或 SkillInjectionTemplate）。
+失败时最多重试 max_retries 次，全部失败则保持旧 is_active。
+
+【内容摘要】
+- _EVOLUTION_FAILURE_TYPES      : 演化失败类型常量（4 类）。
+- LLMCaller(Protocol)           : LLM 调用抽象。
+- EvolutionResult(dataclass)    : 单次演化结果。
+- EvolutionMutator              : 变异主类（evolve_context_summary / evolve_skill_injection）。
+- _SchemaMismatchError / _IllegalFieldError : 内部重试异常。
+- _DummySelector                : selector 占位（L1 hot swap 时重构造）。
+- 5 个模块级辅助函数              : 序列化 current / 失败统计 / 失败样本 / lessons；校验 extractors / filters。
+- _CONTEXT_SUMMARY_SCHEMA / _SKILL_INJECTION_SCHEMA : LLM prompt schema。
+
+【职责边界】
+- 只负责：构造 prompt、调 LLM、解析 JSON、schema 校验、构造 candidate。
+- 不负责：触发（TriggerManager 负责）、失败聚类（FailureFocuser 负责）、
+  评估与晋升（PromotionGate 负责）、持久化（VersionDAG 负责）。
+- 不持有运行时状态：llm_caller / evolution_model 由构造注入。
+
+【INVARIANT】
+- 单次 LLM 调用 + 结构化 JSON 输出 + rationale 字段。
+- 最多重试 max_retries 次（含首次共 max_retries+1 次），失败保持旧 is_active。
+- 多字段自由演化：不限制只改一个字段。
+- 输入样本按 failure_category 聚类取 top（由 FailureFocuser 生成）。
+- evolution_model 默认 None：继承 lead 模型。
+- llm_caller 为 None → 直接返回失败（failure_type="llm_timeout"）。
+- 重试时把 error_hint 拼进 prompt（针对不同失败类型给不同提示）。
+- 清理 LLM 输出中的 markdown fence（```json ... ```）。
+- 校验 extractors / filters / skill_selector 是否在 available 列表（非法抛 _IllegalFieldError）。
+- 新版本号：v{int(current.version[1:]) + 1}。
+- extractors / filters 反序列化为空 tuple（L1 hot swap 时重新构造）。
+- lessons 参数来自 L3 DecisionLog（作输入样本，不注入 prompt 之外的副作用）。
 """
 from __future__ import annotations
 
@@ -24,7 +51,7 @@ from poirot.backend.agents.multiagent.evolution.types import (
 
 logger = logging.getLogger(__name__)
 
-# 演化失败类型（写 metrics 用）
+# 演化失败类型（写 metrics 用）。
 _EVOLUTION_FAILURE_TYPES = (
     "llm_timeout",
     "json_parse",
@@ -34,9 +61,9 @@ _EVOLUTION_FAILURE_TYPES = (
 
 
 class LLMCaller(Protocol):
-    """LLM 调用抽象（R2.5：默认 None 继承 lead，可注入测试 mock）.
+    """LLM 调用抽象（默认 None 继承 lead，可注入测试 mock）。
 
-    call(prompt) → str：返 LLM 原始文本输出（期望 JSON）。
+    call(prompt) → str：返回 LLM 原始文本输出（期望 JSON）。
     """
 
     def call(self, prompt: str) -> str: ...
@@ -44,7 +71,16 @@ class LLMCaller(Protocol):
 
 @dataclass
 class EvolutionResult:
-    """单次演化结果（成功/失败 + candidate artifact + rationale + 失败类型）."""
+    """单次演化结果。
+
+    字段：
+    - success: 是否成功。
+    - candidate: 成功时的 candidate artifact；失败时为 None。
+    - rationale: 结果说明。
+    - failure_type: _EVOLUTION_FAILURE_TYPES 之一；成功时为空串。
+    - retries: 实际重试次数。
+    - llm_model / input_tokens / output_tokens / latency_ms: LLM 调用指标。
+    """
 
     success: bool
     candidate: EvolutionArtifact | None = None
@@ -58,15 +94,10 @@ class EvolutionResult:
 
 
 class EvolutionMutator:
-    """LLM 演化执行（R2）.
+    """LLM 演化执行。
 
-    INVARIANT:
-    - 单次 LLM 调用 + 结构化 JSON 输出 + rationale 字段（INV-14，R2.1）
-    - 最多重试 2 次（含首次共 3 次），失败保持旧 is_active（INV-14/INV-15）
-    - 多字段自由演化（R2.4）
-    - 输入样本按 failure_category 聚类取 top（INV-17，FailureFocuser 生成）
-    - evolution_model 默认 None 继承 lead（INV-18，R2.5）
-    - LLM 调用失败/JSON parse/schema/字段非法 → 重试 1 次（R2.2）
+    单次 LLM 调用 + 结构化 JSON 输出 + rationale；最多重试 max_retries 次；
+    失败保持旧 is_active；多字段自由演化。
     """
 
     def __init__(
@@ -75,6 +106,13 @@ class EvolutionMutator:
         evolution_model: str | None = None,
         max_retries: int = 2,
     ) -> None:
+        """初始化。
+
+        Args:
+            llm_caller: LLM 调用抽象；None 时演化直接失败。
+            evolution_model: 演化用的模型名；None 继承 lead。
+            max_retries: 最大重试次数，默认 2（含首次共 3 次）。
+        """
         self._llm_caller = llm_caller
         self._evolution_model = evolution_model
         self._max_retries = max_retries
@@ -85,7 +123,7 @@ class EvolutionMutator:
         failures: FailureStats,
         lessons: tuple[str, ...] = (),
     ) -> EvolutionResult:
-        """演化 ContextSummaryTemplate（CONTEXT_INSUFFICIENT 占主导时调）."""
+        """演化 ContextSummaryTemplate（CONTEXT_INSUFFICIENT 占主导时调）。"""
         return self._evolve(
             current, failures, "context_summary",
             _CONTEXT_SUMMARY_SCHEMA, lessons,
@@ -97,7 +135,7 @@ class EvolutionMutator:
         failures: FailureStats,
         lessons: tuple[str, ...] = (),
     ) -> EvolutionResult:
-        """演化 SkillInjectionTemplate（ABILITY_INSUFFICIENT 占主导时调）."""
+        """演化 SkillInjectionTemplate（ABILITY_INSUFFICIENT 占主导时调）。"""
         return self._evolve(
             current, failures, "skill_injection",
             _SKILL_INJECTION_SCHEMA, lessons,
@@ -111,7 +149,17 @@ class EvolutionMutator:
         schema: dict,
         lessons: tuple[str, ...] = (),
     ) -> EvolutionResult:
-        """单次 LLM + 结构化 JSON + 重试 2（R2.1/R2.2）."""
+        """单次 LLM + 结构化 JSON + 重试 max_retries 次。
+
+        流程：
+        1. llm_caller 为 None → 直接返回失败。
+        2. 构造初始 prompt。
+        3. 循环尝试（首次 + max_retries 次）：
+           - 调 llm_caller.call(prompt)
+           - 解析 + 校验 → 成功返回
+           - 各类异常 → 记 last_error + 重写 prompt（带 error_hint）+ 继续
+        4. 全部失败 → 返回失败（failure_type=last_error）。
+        """
         if self._llm_caller is None:
             return EvolutionResult(
                 success=False,
@@ -185,7 +233,11 @@ class EvolutionMutator:
         error_hint: str = "",
         lessons: tuple[str, ...] = (),
     ) -> str:
-        """构造 LLM prompt（42 文档 §7.7 骨架 + error_hint 重试 + L3 lessons）."""
+        """构造 LLM prompt。
+
+        包含：当前模板 JSON / 失败统计 / 代表失败样本 / available 列表 /
+        输出 schema / error_hint（重试时）。
+        """
         current_json = _serialize_current(current, artifact_type)
         failure_cases = _serialize_failure_samples(failures)
         lessons_section = _serialize_lessons(lessons) if lessons else ""
@@ -223,7 +275,15 @@ Output JSON schema:
         artifact_type: str,
         schema: dict,
     ) -> EvolutionArtifact:
-        """解析 LLM JSON 输出 + schema 校验 + 构造 candidate."""
+        """解析 LLM JSON 输出 + schema 校验 + 构造 candidate。
+
+        流程：
+        1. 清理 markdown fence（```json ... ```）。
+        2. json.loads。
+        3. 校验 required 字段。
+        4. 按 artifact_type 构造 ContextSummaryTemplate 或 SkillInjectionTemplate。
+        5. 校验 extractors / filters / skill_selector 是否在 available 列表。
+        """
         # 清理 markdown fence
         cleaned = raw_output.strip()
         if cleaned.startswith("```"):
@@ -277,22 +337,22 @@ Output JSON schema:
 
 
 class _SchemaMismatchError(Exception):
-    """LLM 输出 schema 不匹配（重试用）."""
+    """LLM 输出 schema 不匹配（触发重试）。"""
 
 
 class _IllegalFieldError(Exception):
-    """LLM 输出字段值非法（重试用）."""
+    """LLM 输出字段值非法（触发重试）。"""
 
 
 class _DummySelector:
-    """演化产物 selector placeholder（L1 hot swap 时重新构造）."""
+    """演化产物 selector 占位（L1 hot swap 时重新构造）。"""
 
     def select(self, goal: str, available_skills: list) -> tuple:
         return ()
 
 
 def _serialize_current(current: EvolutionArtifact, artifact_type: str) -> str:
-    """序列化当前 active 模板为 JSON."""
+    """序列化当前 active 模板为 JSON。"""
     if isinstance(current, ContextSummaryTemplate):
         return json.dumps({
             "version": current.version,
@@ -314,7 +374,7 @@ def _serialize_current(current: EvolutionArtifact, artifact_type: str) -> str:
 
 
 def _serialize_failure_categories(failures: FailureStats) -> str:
-    """序列化 failure_category 统计."""
+    """序列化 failure_category 统计。"""
     lines = []
     for cat, count in failures.by_category.items():
         lines.append(f"- {cat.value}: {count}")
@@ -324,7 +384,7 @@ def _serialize_failure_categories(failures: FailureStats) -> str:
 
 
 def _serialize_failure_samples(failures: FailureStats) -> str:
-    """序列化失败样本（每类 top 2，上限 5）."""
+    """序列化失败样本（每类 top 2，上限 5）。"""
     samples = []
     for cat, records in failures.sample_failures.items():
         for r in records:
@@ -338,7 +398,7 @@ def _serialize_failure_samples(failures: FailureStats) -> str:
 
 
 def _serialize_lessons(lessons: tuple[str, ...]) -> str:
-    """序列化 L3 DecisionLog lessons（L2 演化时作输入样本，L3-7.4 决策 b）."""
+    """序列化 L3 DecisionLog lessons（L2 演化时作输入样本）。"""
     if not lessons:
         return ""
     lines = ["Historical lessons from past runs (L3 DecisionLog):"]
@@ -350,7 +410,7 @@ def _serialize_lessons(lessons: tuple[str, ...]) -> str:
 def _validate_extractors(
     names: list[str], available: list[str]
 ) -> tuple:
-    """校验 extractor 名是否在 available 列表（非法抛 _IllegalFieldError）."""
+    """校验 extractor 名是否在 available 列表（非法抛 _IllegalFieldError）。"""
     valid = [n for n in names if n in available]
     if len(valid) != len(names):
         invalid = [n for n in names if n not in available]
@@ -361,7 +421,7 @@ def _validate_extractors(
 def _validate_filters(
     names: list[str], available: list[str]
 ) -> tuple:
-    """校验 filter 名是否在 available 列表."""
+    """校验 filter 名是否在 available 列表（非法抛 _IllegalFieldError）。"""
     valid = [n for n in names if n in available]
     if len(valid) != len(names):
         invalid = [n for n in names if n not in available]
@@ -369,7 +429,7 @@ def _validate_filters(
     return ()
 
 
-# LLM prompt schema（42 文档 §7.7）
+# LLM prompt schema：ContextSummaryTemplate 的可用 extractors / filters + 输出 schema。
 _CONTEXT_SUMMARY_SCHEMA = {
     "available_extractors": [
         "LastNMessages", "CodeSnippetsFromMessages", "ErrorLogsFromMessages",
@@ -393,6 +453,7 @@ _CONTEXT_SUMMARY_SCHEMA = {
     },
 }
 
+# LLM prompt schema：SkillInjectionTemplate 的可用 selectors + 输出 schema。
 _SKILL_INJECTION_SCHEMA = {
     "available_selectors": [
         "KeywordMatch", "LLMClassify", "SemanticMatch",

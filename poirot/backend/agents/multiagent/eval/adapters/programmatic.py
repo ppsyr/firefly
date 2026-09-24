@@ -1,13 +1,29 @@
-"""L3 ProgrammaticAdapter — programmatic eval（success_criteria_met + Wilson CI）.
+"""L3 ProgrammaticAdapter — programmatic eval（success_criteria_met + Wilson CI）。
 
-设计（43 文档 §4.3.1 + §11.3 L3-3.4 + spec.md ProgrammaticAdapter Requirement）:
-- 部分复用 L1 ResultSummarizer.success_criteria_met（保 floor，通过 evaluator callable 注入）
-- 简单规则检查独立实现（输出格式 / artifact 完整性，MVP 阶段 evaluator 内含）
-- 复用 L2 _wilson_ci（import from evolution/promotion_gate，INV-20 小样本友好）
-- 复用 L2 Evaluator Protocol（evaluate(artifact, task) → bool）
-- task 超时/异常 skip（不补抽，R3.5 同 L2 PromotionGate pattern）
-- 全 task 失败返 success=False
-- health_check: evaluator 非 None 时 True
+【整体职责】
+实现 EvalAdapter 契约：让 candidate 与 baseline 在同一批 task_sample 上各跑一遍，
+用 evaluator 判定每个 task 的 success_criteria_met（bool），再算 Wilson 95% 置信区间，
+返回 EvalResult。是 L3 里最基础的评估方法。
+
+【内容摘要】
+- ProgrammaticAdapter : 评估器主类，实现 evaluate + health_check。
+
+【职责边界】
+- 只负责：遍历 task_sample 调 evaluator、聚合分数、算 Wilson CI、返回 EvalResult。
+- 不负责：task_sample 抽样（L2 负责）、晋升决策（L2 PromotionGate 负责）、
+  evaluator 实现（bootstrap 注入）、LLM 评分（llm_judge adapter 负责）。
+- 不持有运行时状态：evaluator / z 由构造注入。
+
+【INVARIANT】
+- 实现 EvalAdapter Protocol（evaluate + health_check）——无需显式继承。
+- method_used 固定为 "programmatic"。
+- evaluator 为 None → evaluate 返回 success=False + failure_reason="no evaluator configured"。
+- 单任务异常 → 跳过（continue）；全 task 失败 → success=False + "all_tasks_failed"。
+- 置信区间用 Wilson CI（_wilson_ci），z_score 默认 1.96（95%）——小样本友好。
+- 复用 L2 Evaluator Protocol（evaluate(artifact, task) -> bool）。
+- 简单规则检查（输出格式 / artifact 完整性）由 evaluator 内含，不在本类实现。
+- health_check：evaluator 非 None 即可用。
+- MVP evaluator=None：floor eval 由 L2 PromotionGate 直接调 facade；本 adapter 数据驱动触发后才装配。
 """
 from __future__ import annotations
 
@@ -22,11 +38,10 @@ from poirot.backend.agents.multiagent.evolution.promotion_gate import (
 
 
 class ProgrammaticAdapter:
-    """programmatic eval——success_criteria_met + Wilson 95% CI.
+    """programmatic 评估器——success_criteria_met + Wilson 95% CI。
 
-    实现 EvalAdapter Protocol（evaluate + health_check）.
-    evaluator: L2 Evaluator Protocol（evaluate(artifact, task) → bool），由 bootstrap 注入.
-    MVP evaluator=None（floor eval 由 L2 PromotionGate 直接调，L3 ProgrammaticAdapter 数据驱动触发后才装配）.
+    实现 EvalAdapter Protocol（evaluate + health_check）。
+    evaluator 由 bootstrap 注入（MVP 可为 None，数据驱动触发后才装配）。
     """
 
     def __init__(
@@ -34,10 +49,26 @@ class ProgrammaticAdapter:
         evaluator: Evaluator | None = None,
         z_score: float = 1.96,
     ) -> None:
+        """初始化。
+
+        Args:
+            evaluator: 单个任务的评估器（evaluate(artifact, task) -> bool）；
+                为 None 时 evaluate 直接返回失败。
+            z_score: Wilson CI 的 z 值，默认 1.96（95% 置信度）。
+        """
         self._evaluator = evaluator
         self._z = z_score
 
     def evaluate(self, ctx: EvalContext) -> EvalResult:
+        """对 task_sample 逐个评估 candidate / baseline，返回聚合 EvalResult。
+
+        流程：
+        1. evaluator 为 None → 返回失败（no evaluator configured）。
+        2. 遍历 task_sample，对 candidate / baseline 各调一次 evaluator。
+        3. 单任务异常 → 跳过；全部失败 → 返回失败（all_tasks_failed）。
+        4. 计算 candidate / baseline 平均分 + Wilson CI。
+        5. 返回 EvalResult（success=True, method_used="programmatic"）。
+        """
         if self._evaluator is None:
             return EvalResult(
                 candidate_score=0.0, baseline_score=0.0,
@@ -81,4 +112,5 @@ class ProgrammaticAdapter:
         )
 
     def health_check(self) -> bool:
+        """健康检查：evaluator 已配置即可用。"""
         return self._evaluator is not None

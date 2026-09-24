@@ -1,17 +1,36 @@
-"""PiCredentialProvider — 双轨凭证解析（决策 3：config 优先 + env 兜底）。
+"""PiCredentialProvider — 双轨凭证解析（config 优先 + env 兜底）。
 
-设计（spec.md PiCredentialProvider Requirement + design_docs/46 §10.3.4）:
-- 双轨凭证解析：config 优先 + env 兜底
-- 国内 provider 优先（DeepSeek/Kimi/MiniMax/Xiaomi 靠前，便宜优先）
-- pi CLI 可执行 + 任意 API key 即可用（不强制 auth.json 文件存在）
-- 凭证缺失返 None（specialist 标 disabled）
-- 凭证不写 ThreadState（INV#8）
+【整体职责】
+发现 Pi specialist 的凭证：先确认 pi CLI 可执行，再按四级优先级解析凭证
+（config 显式 api_key > config 显式 provider 对应的 env > 遍历所有 provider env >
+auth.json 文件），返回 PiCredential。凭证缺失时返回 None（不抛异常）。
 
-凭证解析优先级（决策 3）：
-1. config 显式 api_key（config_provider + config_api_key）
-2. config 显式 provider → 找对应 env var
-3. 遍历所有 provider env var（国内优先顺序）
-4. auth.json 文件（~/.pi/agent/auth.json）
+【内容摘要】
+- PiCredential               : 凭证数据类，含 provider / api_key / auth_file。
+- PiCredentialProvider       : 凭证发现主类，实现 get_credential()。
+- get_credential()           : 四级优先级解析凭证，返 PiCredential | None。
+- _is_pi_installed()         : 检测 pi CLI 是否在 PATH。
+- _resolve_auth_path()       : 解析 auth.json 路径（支持 PI_CODING_AGENT_DIR 覆盖）。
+- _provider_env_map()        : provider → env var 映射（国内 provider 靠前）。
+
+【职责边界】
+- 只负责：检测 pi CLI、按优先级解析凭证、读取文件路径。
+- 不负责：刷新凭证、存储凭证、管理凭证生命周期、写 ThreadState。
+- 不持有运行时状态：每次 get_credential 重新解析。
+
+【INVARIANT】
+- 凭证不写 ThreadState：返回的 PiCredential 只传给 specialist runtime。
+- 前置条件：pi CLI 必须在 PATH；不在则直接返回 None（即使有 API key）。
+- 四级解析优先级固定：
+  1. config 显式 api_key（config_provider 缺省时默认 "anthropic"）
+  2. config 显式 provider → 对应 env var
+  3. 遍历 _provider_env_map（国内 provider 靠前）
+  4. auth.json 文件（~/.pi/agent/auth.json，支持 PI_CODING_AGENT_DIR 覆盖）
+- 不强制要求凭证文件存在：任意 API key env 都能用。
+- 凭证缺失返 None，不抛异常（调用方据此把 specialist 标 disabled）。
+- 国内 provider 优先（DeepSeek / Kimi / MiniMax / Xiaomi / ZAI 靠前）——
+  顺序即优先级，便宜优先。
+- kind 固定为 "pi"。
 """
 from __future__ import annotations
 
@@ -25,11 +44,12 @@ from poirot.backend.agents.multiagent.credential_provider import Credential
 
 @dataclass(frozen=True)
 class PiCredential(Credential):
-    """Pi agent 凭证（kind="pi"）。
+    """Pi agent 凭证（kind 固定 "pi"）。
 
-    provider: 用户偏好的 provider（anthropic/deepseek/kimi/...）
-    api_key: 直接 API key（可选，config 显式时填）
-    auth_file: ~/.pi/agent/auth.json 路径（env 兜底时填）
+    三个字段按来源填充：
+    - provider: 用户偏好的 provider（anthropic / deepseek / kimi / ...）
+    - api_key: 直接 API key（config 显式或 env 命中时填）
+    - auth_file: auth.json 路径（env 兜底时填）
     """
 
     kind: str = "pi"
@@ -39,18 +59,18 @@ class PiCredential(Credential):
 
 
 class PiCredentialProvider:
-    """双轨凭证解析：config 优先 + env 兜底（决策 3）。
+    """双轨凭证解析：config 优先 + env 兜底。
 
     与 CodexCredentialProvider（读 ~/.codex/auth.json）不同：
-    - Pi 不强制要求凭证文件存在
-    - 任何 API key env var 都能用
-    - 只需 pi CLI 可执行（PATH 查找）+ 任意一个 API key 即可
+    - Pi 不强制要求凭证文件存在；
+    - 任何 API key env var 都能用；
+    - 只需 pi CLI 可执行（PATH 查找）+ 任意一个 API key 即可。
 
-    凭证解析优先级（决策 3）：
-    1. config 显式 api_key（最高优先级）
-    2. config 显式 provider → 找对应 env var
-    3. 遍历所有 provider env var（国内 provider 优先：DeepSeek/Kimi/MiniMax/Xiaomi 靠前）
-    4. auth.json 文件（~/.pi/agent/auth.json，支持 PI_CODING_AGENT_DIR 覆盖）
+    四级解析优先级：
+    1. config 显式 api_key（最高）
+    2. config 显式 provider → 对应 env var
+    3. 遍历所有 provider env var（国内 provider 优先）
+    4. auth.json 文件（~/.pi/agent/auth.json）
     """
 
     def __init__(
@@ -58,10 +78,26 @@ class PiCredentialProvider:
         config_provider: str | None = None,
         config_api_key: str | None = None,
     ) -> None:
+        """初始化。
+
+        Args:
+            config_provider: config 里显式指定的 provider（可选）。
+            config_api_key: config 里显式指定的 API key（可选）。
+        """
         self._config_provider = config_provider
         self._config_api_key = config_api_key
 
     def get_credential(self) -> PiCredential | None:
+        """发现 Pi 凭证。
+
+        流程：
+        1. pi CLI 不在 PATH → None。
+        2. config 显式 api_key → 返回（provider 缺省 "anthropic"）。
+        3. config 显式 provider → 查对应 env var，命中则返回。
+        4. 遍历 _provider_env_map（国内优先）→ 命中则返回。
+        5. auth.json 文件存在 → 返回（仅带 auth_file）。
+        6. 都未命中 → None。
+        """
         # 1. 检测 pi CLI 是否可执行
         if not self._is_pi_installed():
             return None
@@ -99,14 +135,14 @@ class PiCredentialProvider:
         return shutil.which("pi") is not None
 
     def _resolve_auth_path(self) -> Path | None:
-        """~/.pi/agent/auth.json 路径（支持 PI_CODING_AGENT_DIR 覆盖）。"""
+        """解析 auth.json 路径：PI_CODING_AGENT_DIR 覆盖优先，否则 ~/.pi/agent/auth.json。"""
         configured = os.getenv("PI_CODING_AGENT_DIR")
         if configured:
             return Path(configured) / "auth.json"
         return Path.home() / ".pi" / "agent" / "auth.json"
 
     def _provider_env_map(self) -> dict[str, str]:
-        """Pi 支持的 provider → env var 映射（国内优先顺序，决策 3）。
+        """Pi 支持的 provider → env var 映射。
 
         顺序即优先级：国内常用 provider 靠前（便宜优先），国外靠后。
         """

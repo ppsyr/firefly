@@ -1,14 +1,44 @@
 """PiRuntime — RPC mode 协议实现（pi --mode rpc 子进程 + stdio JSON-RPC）。
 
-设计（spec.md PiRuntime Requirement + design_docs/46 §10.3）:
-- sync only MVP（INV#5，同 CodexRuntime/ClaudeCodeRuntime）
-- 每次 invoke 启动新 pi 子进程 + 完成关闭（不做 pool）
-- 传 goal + context_summary + success_criteria（决策 5：MVP 不定制 system prompt，
-  靠 _build_prompt 在 user message 塞 context + 三段输出格式要求）
-- 超时 kill + crash SpecialistCrashError
-- pi 黑盒：pi CLI 自带 model + 自管 ReAct loop（INV#1/INV#2）
-- 决策 1：强制走 Poirot SpecialistMcpServer（--no-builtin-tools + -e poirot-sandbox-bridge）
-- 决策 3：凭证 env 透传（国内 provider 优先）
+【整体职责】
+实现 SpecialistRuntime 契约：每次 invoke 启动一个 `pi --mode rpc` 子进程，
+通过 stdin 发 prompt、从 stdout 读 JSON 事件流，收集文本增量与 token 用量，
+返回 SpecialistRawResult。强制走 Poirot SpecialistMcpServer（禁用 pi 自带工具）。
+
+【内容摘要】
+- PiRuntimeConfig             : runtime 配置（命令 / mode 参数 / provider / model / thinking）。
+- PiRuntime                   : runtime 主类，实现 invoke()。
+- invoke()                    : 同步入口：起进程 → 发 prompt → 收事件 → 归一化异常。
+- _run_rpc_session()          : 启动子进程 + 读写 stdio 的 JSON-RPC 会话。
+- _build_command()            : 组装 pi CLI 命令（含 --no-builtin-tools + -e extension）。
+- _build_env()                : 透传凭证 env（国内 provider 优先）+ MCP endpoint。
+- _build_prompt()             : 构造 prompt（goal + context + criteria + 三段输出格式）。
+- _extract_usage()            : 从 agent_end 事件提取 TokenUsage。
+- _resolve_mcp_endpoint()     : 解析 SpecialistMcpServer 的 stdio 启动命令。
+- _poirot_extension_path()    : 返回 Poirot sandbox bridge extension 的路径。
+
+【职责边界】
+- 只负责：启动 pi 子进程、发 prompt、收事件、抽输出与 usage、异常归一化。
+- 不负责：上下文摘要（ContextSummarizer 负责）、结果摘要（ResultSummarizer 负责）、
+  凭证发现（CredentialProvider 负责）、沙箱生命周期（sandbox 层负责）。
+- 不持有运行时状态：每次 invoke 启动新进程 + 完成关闭，不做 pool。
+
+【INVARIANT】
+- sync only：对外只暴露同步 invoke。
+- 每次 invoke 启动新进程，完成即关闭，不做 pool。
+- pi 黑盒：pi CLI 自带 model + 自管 ReAct loop，Poirot 不介入内部。
+- 强制走 SpecialistMcpServer：命令必带 `--no-builtin-tools` 与
+  `-e <pi-sandbox-bridge/index.ts>`，禁用 pi 自带工具。
+- 不传 --system-prompt：MVP 不定制 system prompt，靠 _build_prompt 在 user message
+  塞 context + 三段输出格式要求。
+- env 透传走白名单：凭证 env（国内 provider 靠前）+ PI_CODING_AGENT_DIR +
+  POIROT_SANDBOX_MCP_ENDPOINT（sandbox_id 非 None 时）。
+- 无命中 env → 返回 None（子进程继承父 env）；有命中 → {**os.environ, **auth_env}。
+- 异常映射：TimeoutExpired → SpecialistTimeoutError；FileNotFoundError →
+  SpecialistStartupError；SpecialistError 子类原样抛出；其他 → SpecialistCrashError。
+- 事件处理：message_update(text_delta) 累积输出；agent_end 提取 usage 并结束；
+  extension_error 转 SpecialistCrashError。
+- 进程清理：finally 里关 stdin、terminate、wait(5s)，超时则 kill。
 """
 from __future__ import annotations
 
@@ -38,9 +68,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class PiRuntimeConfig:
-    """Pi runtime 配置（决策 5：不定制 system prompt，靠 _build_prompt）。
+    """Pi runtime 配置。
 
-    provider/model/thinking_level 留空时用 pi 默认（pi 自己选）。
+    provider / model / thinking_level 留空时用 pi 默认（pi 自己选）。
     """
 
     command: str = "pi"
@@ -52,22 +82,39 @@ class PiRuntimeConfig:
 
 
 class PiRuntime:
-    """Pi coding agent runtime via RPC mode (stdio JSON-RPC).
+    """Pi coding agent runtime（RPC mode，stdio JSON-RPC）。
 
-    sync only MVP（同 CodexRuntime/ClaudeCodeRuntime）。
-    每次 invoke 启动新 pi 子进程 + 完成关闭。
-
-    决策 1（设计文档 46 §10.5）：强制走 Poirot SpecialistMcpServer——
-    --no-builtin-tools 禁用 pi 自带 read/write/edit/bash，
-    -e poirot-sandbox-bridge 加载 Poirot sandbox bridge extension，
-    所有操作走 Poirot MCP 8 接口（经过 PathTranslator + SecurityGuard）。
+    sync only；每次 invoke 启动新 pi 子进程 + 完成关闭。
+    强制走 Poirot SpecialistMcpServer：--no-builtin-tools 禁用 pi 自带
+    read/write/edit/bash，-e poirot-sandbox-bridge 加载 Poirot sandbox bridge
+    extension，所有操作走 Poirot MCP 接口。
     """
 
     def __init__(self, config: PiRuntimeConfig | None = None, sandbox_provider=None) -> None:
+        """初始化。
+
+        Args:
+            config: PiRuntimeConfig；为 None 时用默认配置。
+            sandbox_provider: 沙箱 provider，用于解析 MCP endpoint 的 sandbox URL 参数。
+        """
         self._config = config or PiRuntimeConfig()
         self._sandbox_provider = sandbox_provider
 
     def invoke(self, request: SpecialistRequest) -> SpecialistRawResult:
+        """执行 specialist 调用：启动 pi RPC 会话，返回原始输出 + token 用量。
+
+        异常映射：
+        - subprocess.TimeoutExpired → SpecialistTimeoutError。
+        - FileNotFoundError → SpecialistStartupError（命令不存在）。
+        - SpecialistError 子类 → 原样抛出（不包装）。
+        - 其他异常 → SpecialistCrashError。
+
+        Args:
+            request: specialist 调用请求（含 goal / timeout_seconds / sandbox_id）。
+
+        Returns:
+            含 raw_output / usage / duration_seconds 的 SpecialistRawResult。
+        """
         start = time.time()
         try:
             raw_output, usage = self._run_rpc_session(request)
@@ -94,7 +141,18 @@ class PiRuntime:
     def _run_rpc_session(
         self, request: SpecialistRequest
     ) -> tuple[str, TokenUsage | None]:
-        """启动 pi --mode rpc 子进程，发 prompt，收 events，返 final text + usage。"""
+        """启动 pi --mode rpc 子进程，发 prompt，收 events，返回 final text + usage。
+
+        流程：
+        1. _build_command + _build_env。
+        2. subprocess.Popen 启动子进程。
+        3. 写一行 JSON prompt 到 stdin。
+        4. 逐行读 stdout，解析 JSON 事件：
+           - message_update(text_delta)：累积文本。
+           - agent_end：从最后一条 assistant message 抽 usage，结束循环。
+           - extension_error：转 SpecialistCrashError。
+        5. finally：关 stdin、terminate、wait(5s)，超时则 kill。
+        """
         cmd = self._build_command(request)
         env = self._build_env(request)
 
@@ -158,7 +216,12 @@ class PiRuntime:
                 proc.kill()
 
     def _build_command(self, request: SpecialistRequest) -> list[str]:
-        """组装 pi CLI 命令（决策 1：--no-builtin-tools + -e poirot-sandbox-bridge）。"""
+        """组装 pi CLI 命令。
+
+        包含：mode 参数、provider / model / thinking（若配置）、
+        `--no-builtin-tools`、`-e <extension 路径>`、extra_args。
+        不传 --system-prompt（MVP 靠 _build_prompt 在 user message 塞 context）。
+        """
         cmd = [self._config.command, *self._config.mode_args]
         if self._config.provider:
             cmd.extend(["--provider", self._config.provider])
@@ -166,22 +229,26 @@ class PiRuntime:
             cmd.extend(["--model", self._config.model])
         if self._config.thinking_level:
             cmd.extend(["--thinking", self._config.thinking_level])
-        # 决策 1：禁用 pi 自带工具，加载 Poirot sandbox bridge extension
+        # 禁用 pi 自带工具，加载 Poirot sandbox bridge extension
         cmd.extend(["--no-builtin-tools"])
         cmd.extend(["-e", str(self._poirot_extension_path())])
-        # 决策 5：不传 --system-prompt（MVP 靠 _build_prompt 在 user message 塞 context）
+        # 不传 --system-prompt（MVP 靠 _build_prompt 在 user message 塞 context）
         cmd.extend(self._config.extra_args)
         return cmd
 
     def _build_env(self, request: SpecialistRequest) -> dict[str, str] | None:
-        """透传凭证 env vars + Poirot sandbox MCP endpoint（决策 1 + 决策 3）。
+        """透传凭证 env vars + Poirot sandbox MCP endpoint。
 
-        决策 3：凭证 env 国内 provider 优先（DeepSeek/Kimi/MiniMax/Xiaomi 靠前）。
-        决策 1：传 POIROT_SANDBOX_MCP_ENDPOINT（sandbox_id 绑定）给 pi extension。
-        返 merge 后的 env（父 env + auth vars 覆盖），保证 PATH/HOME 等基础 env 可用。
+        - 凭证 env：国内 provider 优先（DeepSeek/Kimi/MiniMax/Xiaomi 靠前），
+          国外大厂与聚合服务在后。
+        - PI_CODING_AGENT_DIR：自定义配置目录（可选）。
+        - POIROT_SANDBOX_MCP_ENDPOINT：sandbox_id 非 None 时传入，
+          供 pi extension 连接 Poirot SpecialistMcpServer。
+        - 无命中 → 返回 None（子进程继承父 env）。
+        - 有命中 → {**os.environ, **auth_env}，保证 PATH/HOME 等基础 env 可用。
         """
         auth_env: dict[str, str] = {}
-        # 国内 provider 优先（决策 3，便宜优先）
+        # 国内 provider 优先（便宜优先）
         pi_env_vars = [
             "DEEPSEEK_API_KEY",
             "KIMI_API_KEY",
@@ -209,7 +276,7 @@ class PiRuntime:
         if pi_dir:
             auth_env["PI_CODING_AGENT_DIR"] = pi_dir
 
-        # 决策 1：传 Poirot SpecialistMcpServer endpoint（sandbox_id 绑定）
+        # 传 Poirot SpecialistMcpServer endpoint（sandbox_id 绑定）
         if request.sandbox_id:
             auth_env["POIROT_SANDBOX_MCP_ENDPOINT"] = self._resolve_mcp_endpoint(
                 request.sandbox_id
@@ -221,10 +288,11 @@ class PiRuntime:
         return {**os.environ, **auth_env}
 
     def _build_prompt(self, request: SpecialistRequest) -> str:
-        """构造给 pi 的 prompt（决策 5：MVP 不定制 system prompt）。
+        """构造给 pi 的 prompt。
 
         pi 用自己的默认 system prompt（通用 coding agent）。
-        Poirot 在 user message 里塞 goal + context_summary + success_criteria + 三段输出格式要求。
+        Poirot 在 user message 里塞 goal + context_summary + success_criteria +
+        三段输出格式要求（What You Did / Success / Gaps）。
         """
         parts = [request.goal]
         if request.context_summary:
@@ -249,7 +317,11 @@ class PiRuntime:
     def _extract_usage(
         self, usage_data: dict[str, Any]
     ) -> TokenUsage | None:
-        """从 pi agent_end 事件的 usage 字段提取 TokenUsage。"""
+        """从 pi agent_end 事件的 usage 字段提取 TokenUsage。
+
+        - usage_data 为空 → None。
+        - tokens 缺失或类型错误 → None。
+        """
         if not usage_data:
             return None
         try:
@@ -265,8 +337,9 @@ class PiRuntime:
     def _resolve_mcp_endpoint(self, sandbox_id: str) -> str:
         """解析 Poirot SpecialistMcpServer endpoint（sandbox_id 绑定）。
 
-        MVP：返回 SpecialistMcpServer 的 stdio 启动命令（pi extension 通过此命令连接）。
-        块 D3：若 sandbox_provider 有 SandboxInfo，追加 --sandbox-url + --sandbox-root。
+        MVP：返回 SpecialistMcpServer 的 stdio 启动命令字符串
+        （pi extension 通过此命令连接）。
+        若 sandbox_provider 有 SandboxInfo，追加 --sandbox-url + --sandbox-root。
         """
         parts = [
             "python",
@@ -279,11 +352,11 @@ class PiRuntime:
         return " ".join(parts)
 
     def _poirot_extension_path(self) -> str:
-        """Poirot sandbox bridge extension 路径（随 Poirot 安装）。
+        """返回 Poirot sandbox bridge extension 的路径。
 
-        决策 1：pi extension 注册 8 工具转发到 Poirot SpecialistMcpServer。
-        extension 文件在 P4 batch 创建（当前路径返回预期位置，extension 不存在时
-        pi 会报 extension_error，由 _run_rpc_session 捕获为 SpecialistCrashError）。
+        extension 注册 8 个工具转发到 Poirot SpecialistMcpServer。
+        路径基于 Poirot 包安装位置动态解析；extension 文件不存在时
+        pi 会报 extension_error，由 _run_rpc_session 捕获为 SpecialistCrashError。
         """
         from poirot.backend.agents.multiagent import __path__ as pkg_path
 

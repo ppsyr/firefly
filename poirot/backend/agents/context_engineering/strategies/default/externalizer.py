@@ -1,3 +1,30 @@
+"""ExternalizerExecutor — 工具结果外化执行器。
+
+【整体职责】
+把超长的 tool result 从消息里"搬"到磁盘，消息本身只留 preview + 文件路径，
+从而节省上下文 token。两类入口：
+
+    1. externalize_if_needed(tool_result)
+       单条外化，用于 wrap_tool_call（工具刚返回时立即判断）。
+       判定：content 文本长度 > 阈值（按工具元数据可调）。
+       成功：返回替换版 ToolMessage（content=preview，additional_kwargs 打
+             POIROT_EXTERNALIZED / PATH / META 标记）。
+       失败/未超阈：返回 None。
+
+    2. externalize_history(messages)
+       批量外化，用于 P1（before_model 里 fraction >= 0.40）。
+       策略：FIFO（按 message_index 从小到大）+
+             近 exempt_rounds 轮豁免 +
+             每轮至少保留最新 1 条 +
+             幂等（已打 POIROT_EXTERNALIZED 的跳过）。
+       返回需要替换的 ToolMessage 列表（同 id → add_messages 替换）。
+
+【与 strategy.py 的关系】
+    strategy.wrap_tool_call 调 externalize_if_needed（单条）
+    strategy.before_model 的 P1 分支调 externalize_history（批量）
+    summarizer._externalize_orphans 也调 externalize_if_needed（孤立 ToolMessage）
+"""
+
 from __future__ import annotations
 
 import json
@@ -33,6 +60,16 @@ class ExternalizerExecutor:
         exempt_rounds: int = 2,
         tool_metadata: dict[str, dict] | None = None,
     ) -> None:
+        """构造外化器。
+
+        Args:
+            externalize_dir: 外化文件目录。
+            min_chars:       默认字符阈值（无工具元数据时用）。
+            preview_chars:   替换后 preview 保留的字符数。
+            exempt_rounds:   近 N 轮豁免外化。
+            tool_metadata:   {tool_name: {"typical_output_tokens": N}}，
+                             有则阈值取 max(min_chars, N*4)。
+        """
         self._dir = externalize_dir
         self._min_chars = min_chars
         self._preview_chars = preview_chars
@@ -40,7 +77,14 @@ class ExternalizerExecutor:
         self._tool_metadata = tool_metadata or {}
 
     def _get_threshold(self, tool_name: str | None) -> int:
-        """按工具元数据调阈值。有元数据取 max(min_chars, typical_tokens * 4)，无走 min_chars。"""
+        """按工具元数据调阈值。有元数据取 max(min_chars, typical_tokens * 4)，无走 min_chars。
+
+        Args:
+            tool_name: 工具名。
+
+        Returns:
+            该工具适用的字符阈值。
+        """
         if tool_name and tool_name in self._tool_metadata:
             typical_tokens = self._tool_metadata[tool_name].get("typical_output_tokens", 0)
             if typical_tokens > 0:
@@ -51,6 +95,12 @@ class ExternalizerExecutor:
         """外化单个 ToolMessage：写盘成功 → 返替换版（preview + path）；失败 → 返 None。
 
         支持 str 和 list[dict] content 格式（MCP 工具常返回 list）。
+
+        Args:
+            tool_result: 原始 ToolMessage。
+
+        Returns:
+            替换版 ToolMessage（已打外化标记）；未超阈 / 已外化 / 写盘失败返回 None。
         """
         if tool_result.additional_kwargs.get(POIROT_EXTERNALIZED):
             return None
@@ -70,6 +120,20 @@ class ExternalizerExecutor:
         """FIFO 外化：近 exempt_rounds 轮豁免 + 每轮保 1 + 幂等跳过。
 
         返回替换后的 ToolMessage 列表（同 id → add_messages 替换），不含未改消息。
+
+        Args:
+            messages: 当前完整消息列表。
+
+        Returns:
+            需替换的 ToolMessage 列表；无候选返回 None。
+
+        筛选规则：
+            - 按 HumanMessage 切 turn；
+            - 跳过近 exempt_rounds 轮；
+            - 每个 turn 的 ToolMessage 保留最后 1 条，其余候选；
+            - 已打 POIROT_EXTERNALIZED 的跳过；
+            - 文本长度 <= min_chars 的跳过；
+            - 候选按 message_index 升序（FIFO）依次外化。
         """
         turns = self._partition_turns(messages)
         # 诊断日志
@@ -126,7 +190,15 @@ class ExternalizerExecutor:
 
     @staticmethod
     def _partition_turns(messages: list) -> list[list[tuple[int, Any]]]:
-        """按 HumanMessage 分 turn，返回 [(message_index, message)] 列表的列表。"""
+        """按 HumanMessage 分 turn，返回 [(message_index, message)] 列表的列表。
+
+        Args:
+            messages: 当前消息列表。
+
+        Returns:
+            每个 turn 是 [(原 message 索引, message), ...]。
+            以 HumanMessage 为 turn 起点。
+        """
         turns: list[list[tuple[int, Any]]] = []
         current: list[tuple[int, Any]] = []
         for i, msg in enumerate(messages):
@@ -141,6 +213,7 @@ class ExternalizerExecutor:
         return turns
 
     def _is_externalizable(self, msg: ToolMessage) -> bool:
+        """判断单条 ToolMessage 是否超阈可外化（当前未被调用，保留工具方法）。"""
         text = self._extract_text(msg.content)
         return len(text) > self._min_chars
 
@@ -149,6 +222,12 @@ class ExternalizerExecutor:
         """从 ToolMessage content（str | list[dict] | list[str]）提取纯文本。
 
         MCP 工具常返回 list[{"type": "text", "text": "..."}] 格式。
+
+        Args:
+            content: ToolMessage.content。
+
+        Returns:
+            拼接后的纯文本。
         """
         if isinstance(content, str):
             return content
@@ -163,6 +242,19 @@ class ExternalizerExecutor:
         return str(content) if content is not None else ""
 
     def _write_to_disk(self, content: str, tool_call_id: str | None, tool_name: str | None) -> str | None:
+        """把内容写到磁盘。
+
+        能解析成 JSON 就存 .json（缩进格式化），否则存 .txt。
+        文件名：``<tool_name>-<tool_call_id 前 12 位>.<ext>``。
+
+        Args:
+            content:      要写的文本。
+            tool_call_id: 用于生成文件名。
+            tool_name:    用于生成文件名。
+
+        Returns:
+            写入路径；失败返回 None。
+        """
         try:
             os.makedirs(self._dir, exist_ok=True)
             safe_name = (tool_name or "unknown").replace("/", "_").replace("\\", "_")

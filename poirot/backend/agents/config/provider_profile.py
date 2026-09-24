@@ -1,13 +1,34 @@
-"""Provider profiles — declarative provider definitions.
+"""Provider profiles — 声明式 provider 定义。
 
-每个 provider 声明一次：API 类型、env 变量名、默认端点/模型/窗口、优先级。
-provider_config.py 在调用时读 env 解析为 ProviderConfig，不在模块加载时读 env
-（利于测试 monkeypatch）。
+【整体职责】
+以声明式的方式定义所有内置 provider 的静态元信息：API 类型（kind）、env 变量名、
+默认端点 / 模型 / 窗口、优先级、是否默认、是否免 key。供 provider_config 在调用时
+读取 env 解析为 ProviderConfig，并据 kind 决定构造哪个 LangChain class。
 
-设计借鉴 hermes-agent ProviderProfile，但遵循 Poirot 规范：
-- frozen dataclass（声明层不可变）
-- 接口小：只声明，不构造 client（构造在 build_chat_model）
-- kind 枚举决定 LangChain class，避免 if-else 散落
+【内容摘要】
+- ProviderKind           : provider → LangChain class 的映射类型（Literal）。
+- ProviderProfile        : 声明式 provider 配置模板（frozen dataclass）。
+- PROVIDER_PROFILES      : 内置 provider 注册表，新增 provider 只需追加一项。
+- _PROFILE_MAP           : name → ProviderProfile 的索引。
+- get_provider_profile   : 按 name 查 profile，不存在返 None。
+- list_provider_profiles : 返回全部 profile。
+
+【职责边界】
+- 只负责：声明 provider 的静态元信息、提供查询接口。
+- 不负责：读 env 解析（provider_config）、构造 client（build_chat_model）、
+  路由决策（model_router / MODEL_ROUTES）。
+
+【INVARIANT】
+- frozen dataclass：声明层不可变。
+- 接口小：只声明，不构造 client（构造在 build_chat_model）。
+- kind 驱动分发：kind 枚举决定 LangChain class，避免 if-else 散落。
+- 延迟读 env：env 变量名在此声明，值在 provider_config 解析时读，不在模块加载时读
+  （利于测试 monkeypatch）。
+- 新增 provider：在本列表追加一项 + .env.example 补对应 env 变量即可。
+
+【设计借鉴】
+借鉴 hermes-agent 的 ProviderProfile，但遵循 Poirot 规范：
+frozen dataclass、接口小、kind 枚举。
 """
 from __future__ import annotations
 
@@ -20,7 +41,21 @@ ProviderKind = Literal["deepseek", "openai_compat", "anthropic", "gemini", "olla
 
 @dataclass(frozen=True)
 class ProviderProfile:
-    """声明式 provider 配置模板。env 变量名在此声明，值在 provider_config 解析时读。"""
+    """声明式 provider 配置模板。env 变量名在此声明，值在 provider_config 解析时读。
+
+    Attributes:
+        name: provider 名（如 "deepseek" / "openai" / "anthropic"）。
+        kind: 决定 build_chat_model 用哪个 LangChain class。
+        env_key: API key 的 env 变量名（如 "DEEPSEEK_API_KEY"）。
+        env_base_url: base_url 的 env 变量名。
+        env_model: model 的 env 变量名。
+        default_base_url: env 未设时的默认端点。
+        default_model: env 未设时的默认模型。
+        default_window: 默认上下文窗口（token 数）。
+        priority: 降级链优先级（小 = 优先）。
+        is_default: 是否为默认 provider。
+        no_key_required: 是否无需 API key（fake / ollama 等）。
+    """
 
     name: str                          # "deepseek", "openai", "anthropic"...
     kind: ProviderKind                 # 决定 build_chat_model 用哪个 LangChain class

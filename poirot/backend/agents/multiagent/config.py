@@ -1,10 +1,32 @@
-"""MultiAgentConfig — multi-agent orchestration configuration.
+"""MultiAgentConfig — 多 Agent 编排配置。
 
-设计（spec.md bootstrap Requirement + design.md §2）:
-- frozen dataclass，enabled=false 默认（opt-in）
-- STARTUP_ONLY_FIELDS 标记启动时确定的字段（不可热切换）
-- 从 env vars 加载（POIROT_MULTIAGENT_*）
-- OrchestrationState + merge_orchestration 在 state/types.py + state/reducers.py（Batch 3 已实现）
+【整体职责】
+定义 multiagent 层的全部配置结构，并从环境变量（POIROT_MULTIAGENT_*）加载。
+配置覆盖四个层面：编排主配置（MultiAgentConfig）、L2 进化层（L2Config）、
+L3 评估层（L3Config）、预算控制（BudgetConfig / SpecialistBudgetLimit）。
+
+【内容摘要】
+- L2Config                  : L2 进化层配置（触发周期、冷却、退化阈值、成本/延迟告警等）。
+- L3Config                  : L3 评估层配置（评估方法、LLM 评判权重、健康检查窗口等）。
+- SpecialistBudgetLimit     : 单个 specialist 的每日预算上限。
+- BudgetConfig              : 各 specialist 的预算上限集合 + 全局告警阈值。
+- MultiAgentConfig          : 编排主配置（启用开关、specialist 列表、并发/超时、Pi 专属配置）。
+- STARTUP_ONLY_FIELDS       : 标记启动时确定、不可热切换的字段集合。
+- load_multiagent_config()  : 从环境变量构造 MultiAgentConfig 的唯一入口。
+
+【职责边界】
+- 只负责：定义配置结构、字段默认值、从 env 加载、标记 startup-only 字段。
+- 不负责：配置校验（由 loader 层负责）、配置热更新、运行时状态管理。
+- 不持有运行时状态：全部为 frozen dataclass，构造后不可变。
+
+【INVARIANT】
+- 全部配置类 frozen：保证线程安全，可安全跨 Agent / 跨线程共享。
+- MultiAgentConfig.enabled 默认 True（default + expert 模式都装配 multiagent）；
+  与早期"opt-in 默认关闭"的注释相反，以代码为准。
+- L2 / L3 默认 enabled=False：数据驱动触发，不默认开启。
+- STARTUP_ONLY_FIELDS 中的字段一旦启动不可改，热更新时须忽略。
+- 所有环境变量读取均带默认值兜底：类型转换失败（ValueError）时回退默认，不抛异常。
+- 空字符串环境变量（如 Pi 的 provider / api_key / model）表示"未配置"，由下游判空。
 """
 from __future__ import annotations
 
@@ -14,9 +36,11 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class L2Config:
-    """L2 evolution layer config (R4 + R6 + R7).
+    """L2 进化层配置。
 
-    enabled=false default (data-driven trigger).
+    enabled=False 默认——数据驱动触发，不默认开启。
+    涵盖：触发周期、冷却、反循环窗口、失败统计、退化检测、成本/延迟告警、
+    进化模型、评估采样、意图识别等。
     """
 
     enabled: bool = False
@@ -46,10 +70,10 @@ class L2Config:
 
 @dataclass(frozen=True)
 class L3Config:
-    """L3 eval layer config (43 doc §8).
+    """L3 评估层配置。
 
-    enabled=false default (data-driven trigger).
-    llm_judge_weights 复用 skill TaskQualityJudge 权重值（D-L3-13）.
+    enabled=False 默认——数据驱动触发，不默认开启。
+    llm_judge_weights 复用 skill TaskQualityJudge 的权重值。
     """
 
     enabled: bool = False
@@ -72,7 +96,10 @@ class L3Config:
 
 @dataclass(frozen=True)
 class SpecialistBudgetLimit:
-    """Per-specialist daily budget limit (R5.1)."""
+    """单个 specialist 的每日预算上限。
+
+    三个维度：token 数、成本（美元）、调用次数。
+    """
 
     per_day_tokens: int = 200000
     per_day_cost_usd: float = 20.0
@@ -81,7 +108,10 @@ class SpecialistBudgetLimit:
 
 @dataclass(frozen=True)
 class BudgetConfig:
-    """Budget config (R5). warning_threshold=0.8 (80% warning)."""
+    """预算配置。
+
+    warning_threshold=0.8：使用量达到上限的 80% 时告警。
+    """
 
     codex: SpecialistBudgetLimit = field(default_factory=SpecialistBudgetLimit)
     claude: SpecialistBudgetLimit = field(default_factory=SpecialistBudgetLimit)
@@ -92,10 +122,19 @@ class BudgetConfig:
 
 @dataclass(frozen=True)
 class MultiAgentConfig:
-    """Multi-agent orchestration configuration.
+    """多 Agent 编排主配置。
 
-    enabled=true 默认——default + expert 模式都装配 multiagent。
-    用 POIROT_MULTIAGENT_ENABLED=false 可显式关闭。
+    enabled=True 默认——default + expert 模式都装配 multiagent。
+    可用 POIROT_MULTIAGENT_ENABLED=false 显式关闭。
+
+    字段分组：
+    - 编排主控：enabled / specialists_use / auto_approve / max_concurrent /
+      timeout_seconds / max_steps。
+    - subagent 专属：subagent_tool_groups / subagent_max_steps /
+      subagent_timeout_seconds。
+    - 指标与健康：metrics_db_path / metrics_health_threshold / metrics_min_invoked。
+    - Pi 专属：specialists_pi_* 系列。
+    - 子层配置：l2 / budget / l3。
     """
 
     enabled: bool = True
@@ -110,19 +149,20 @@ class MultiAgentConfig:
     metrics_db_path: str = ".poirot/multiagent.db"
     metrics_health_threshold: float = 0.4
     metrics_min_invoked: int = 5
-    # Pi specialist 配置（决策 2 + 决策 3 + 决策 5）
+    # Pi specialist 配置
     specialists_pi_provider: str = ""
     specialists_pi_api_key: str = ""
     specialists_pi_auto_install: bool = True
     specialists_pi_model: str = ""
     specialists_pi_thinking_level: str = "medium"
-    # L2 evolution layer config (default enabled=false, data-driven trigger)
+    # L2 进化层配置（默认关闭，数据驱动触发）
     l2: L2Config = field(default_factory=L2Config)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
-    # L3 eval layer config (default enabled=false, data-driven trigger)
+    # L3 评估层配置（默认关闭，数据驱动触发）
     l3: L3Config = field(default_factory=L3Config)
 
 
+# 启动时确定、不可热切换的字段。热更新配置时须忽略这些字段。
 STARTUP_ONLY_FIELDS = frozenset({
     "enabled",
     "specialists_use",
@@ -133,6 +173,7 @@ STARTUP_ONLY_FIELDS = frozenset({
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
+    """读取布尔型环境变量；未设置或值不在白名单内时回退默认。"""
     val = os.getenv(name)
     if val is None:
         return default
@@ -140,6 +181,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _env_int(name: str, default: int) -> int:
+    """读取整型环境变量；转换失败时回退默认，不抛异常。"""
     try:
         return int(os.getenv(name, str(default)))
     except ValueError:
@@ -147,6 +189,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
+    """读取浮点型环境变量；转换失败时回退默认，不抛异常。"""
     try:
         return float(os.getenv(name, str(default)))
     except ValueError:
@@ -154,6 +197,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _env_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """读取逗号分隔的元组型环境变量；空值或全空白时回退默认。"""
     val = os.getenv(name, "")
     if not val:
         return default
@@ -161,7 +205,11 @@ def _env_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def load_multiagent_config() -> MultiAgentConfig:
-    """Load multiagent config from env vars (POIROT_MULTIAGENT_*)."""
+    """从环境变量（POIROT_MULTIAGENT_*）加载 multiagent 配置。
+
+    未设置的字段一律走默认值；类型转换失败也回退默认。
+    这是构造 MultiAgentConfig 的唯一入口。
+    """
     return MultiAgentConfig(
         enabled=_env_bool("POIROT_MULTIAGENT_ENABLED", True),
         specialists_use=_env_tuple("POIROT_MULTIAGENT_SPECIALISTS", ("pi", "codex", "claude", "subagent")),
@@ -175,7 +223,7 @@ def load_multiagent_config() -> MultiAgentConfig:
         metrics_db_path=os.getenv("POIROT_MULTIAGENT_DB_PATH", ".poirot/multiagent.db"),
         metrics_health_threshold=_env_float("POIROT_MULTIAGENT_HEALTH_THRESHOLD", 0.4),
         metrics_min_invoked=_env_int("POIROT_MULTIAGENT_MIN_INVOKED", 5),
-        # Pi specialist 配置（决策 2 + 决策 3 + 决策 5）
+        # Pi specialist 配置
         specialists_pi_provider=os.getenv("POIROT_MULTIAGENT_PI_PROVIDER", ""),
         specialists_pi_api_key=os.getenv("POIROT_MULTIAGENT_PI_API_KEY", ""),
         specialists_pi_auto_install=_env_bool("POIROT_MULTIAGENT_PI_AUTO_INSTALL", True),

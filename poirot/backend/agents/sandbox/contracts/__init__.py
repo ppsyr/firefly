@@ -1,6 +1,6 @@
 """Sandbox 抽象契约层（Protocol + ABC）。
 
-方案 C 三组件契约 + Provider/Provisioner 契约。
+三组件契约 + Provider/Provisioner 契约。
 具体实现见 runtimes/ / translators/ / guards/ / local/ / docker/。
 """
 

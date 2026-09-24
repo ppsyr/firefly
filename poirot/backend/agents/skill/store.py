@@ -1,13 +1,57 @@
 """SkillStore — SQLite + WAL + version DAG + 4 计数器打点。
 
-INVARIANT:
-- 内容/索引分离：只存 path + content_hash，SKILL.md 全文留文件（source of truth）
-- WAL 模式 + busy_timeout=30000 + threading.Lock 保护写连接
-- PRAGMA user_version 记 schema 版本，启动跑迁移链（from_v → from_v+1 → ... → to_v）
-- is_active 单指针：每 name 仅 1 active，回滚切指针不删除（B2 实现）
-- 4 计数器 programmatic 打点（B3 实现 record_selection/record_outcome）
+【整体职责】
+skill 基础层的持久化实现。
+用 SQLite（WAL 模式）存储技能记录、版本血缘（version DAG）、
+质量打点（4 计数器 + judgment）、进化记录、L3 eval 记录，
+并提供注册 / 发现 / 版本管理 / 打点 / 查询接口。
 
-本 batch（B1b）仅含 schema + 迁移。CRUD/metrics 在 B2/B3。
+它是全链路的数据落点：
+- 上游：parser 产出 SkillRecord → 本模块 discover/register 写入。
+- 下游：selector 读 active skills；middleware 写打点；evolution/eval 读写记录。
+
+【内容摘要】
+模块常量 / 函数：
+- _SCHEMA_VERSION            ：当前 schema 版本号（=3）。
+- _SCHEMA_SQL                ：建表 SQL（幂等，含 8 张表 + 索引）。
+- _migrate_v1_v2(conn)       ：v1→v2 增量迁移（加 skill_evolutions）。
+- _migrate_v2_v3(conn)       ：v2→v3 增量迁移（加 L3 eval 三表）。
+类：
+- SkillStore(Protocol)       ：存储接口抽象，声明基础层契约。
+- SQLiteSkillStore           ：SQLite 实现（本模块主体）。
+
+SQLiteSkillStore 方法分组：
+- 构造 / schema ：__init__ / _init_schema / _migrate
+- 注册 / 发现   ：register / get / get_active / list_active / set_enabled /
+                  discover / _upsert_record
+- version DAG   ：create_version / get_versions / rollback
+- 打点 / 查询   ：record_selection / record_outcome / get_metrics /
+                  get_top_skills / health_check
+- evolution     ：record_evolution / get_evolution_history
+- eval 持久化   ：save_judgment / get_judgments / save_task_score /
+                  get_task_scores / save_eval_run
+- 辅助          ：_row_to_record / close
+
+【职责边界】
+- 只负责：持久化、schema 迁移、版本指针切换、计数器累加、查询与排序。
+- 不负责：技能解析（parser）、选择（selector）、注入（injector）、
+  打点触发时机（middleware）、进化决策（evolution）、评估逻辑（eval）。
+- 不生成 skill_id：注册与建版本时由调用方传入 record.skill_id。
+- 不 runtime import L2/L3 类型：EvolutionRecord / EvalSkillJudgment /
+  TaskQualityScore / EvalRun 走 duck-type（TYPE_CHECKING + 方法内延迟 import），
+  避免 L1 ↔ L2 ↔ L3 循环依赖。
+
+【INVARIANT】
+- 内容/索引分离：只存 path + content_hash，SKILL.md 全文留文件（source of truth）。
+- WAL 模式 + busy_timeout=30000；写连接由 threading.Lock 保护。
+- PRAGMA user_version 记 schema 版本，启动时跑迁移链（from_v → ... → to_v）。
+- is_active 单指针：每个 name 仅 1 个 active；rollback 只切指针，不删除行。
+- 4 计数器 programmatic 打点：record_selection / record_outcome 零 LLM 依赖。
+- register 幂等：同 skill_id 二次 register 不覆盖、不报错。
+- create_version 遇重复 skill_id 抛 ValueError（保护单指针不变量）。
+- record_selection / record_outcome 对不存在的 skill_id 静默跳过，不抛。
+- get_top_skills / health_check：total_selections < min_selections 不参与
+  淘汰/排序判定（anti-loop，给新技能积累数据的机会）。
 """
 from __future__ import annotations
 
@@ -130,9 +174,9 @@ CREATE INDEX IF NOT EXISTS idx_ser_layer ON skill_eval_runs(eval_layer, timestam
 
 
 def _migrate_v1_v2(conn: Any) -> None:
-    """v1→v2: 加 skill_evolutions 表（Layer 2 实验记录）。
+    """v1 → v2：新增 skill_evolutions 表（Layer 2 实验记录）。
 
-    _SCHEMA_SQL 已含此表（IF NOT EXISTS 幂等），此函数确保存量 v1 DB 升级时建表。
+    _SCHEMA_SQL 已含此表（IF NOT EXISTS 幂等）；本函数用于存量 v1 DB 升级。
     """
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS skill_evolutions (
@@ -154,9 +198,10 @@ def _migrate_v1_v2(conn: Any) -> None:
 
 
 def _migrate_v2_v3(conn: Any) -> None:
-    """v2→v3: 加 L3 eval 三表（skill_eval_judgments / task_quality_scores / skill_eval_runs）。
+    """v2 → v3：新增 L3 eval 三表。
 
-    _SCHEMA_SQL 已含此三表（IF NOT EXISTS 幂等），此函数确保存量 v2 DB 升级时建表。
+    新增 skill_eval_judgments / task_quality_scores / skill_eval_runs。
+    _SCHEMA_SQL 已含此三表（IF NOT EXISTS 幂等）；本函数用于存量 v2 DB 升级。
     """
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS skill_eval_judgments (
@@ -197,12 +242,14 @@ def _migrate_v2_v3(conn: Any) -> None:
 
 
 class SkillStore(Protocol):
-    """基础层存储接口。实现可选 SQLite / jsonl / Nacos（MVP 用 SQLiteSkillStore）。
+    """基础层存储接口抽象。
+
+    实现可替换（SQLite / jsonl / Nacos）；MVP 使用 SQLiteSkillStore。
 
     INVARIANT:
-    - 内容/索引分离：只存 path + content_hash，SKILL.md 全文留文件
-    - is_active 单指针：每 name 仅 1 active，rollback 切指针不删除
-    - version DAG：create_version 建 new node + 旧 node deactive + lineage_parents
+    - 内容/索引分离：只存 path + content_hash，SKILL.md 全文留文件。
+    - is_active 单指针：每个 name 仅 1 active；rollback 切指针不删除。
+    - version DAG：create_version 建新 node + 旧 node deactive + lineage_parents。
     """
 
     # 注册 / 发现
@@ -218,8 +265,8 @@ class SkillStore(Protocol):
     def get_versions(self, name: str) -> list[SkillRecord]: ...
     def rollback(self, skill_id: str) -> None: ...
 
-    # quality metrics 打点（基础层，L2/L3 只读）
-    # INVARIANT #5-#9: 4 计数器零 LLM 贯穿，applied 混合，task_completed run 级归因
+    # quality metrics 打点（基础层；L2/L3 只读）
+    # 4 计数器零 LLM 贯穿；applied 混合；task_completed run 级归因
     def record_selection(self, skill_id: str) -> None: ...
     def record_outcome(
         self,
@@ -242,7 +289,7 @@ class SkillStore(Protocol):
         min_selections: int = 5,
     ) -> list[SkillHealth]: ...
 
-    # evolution 实验记录（Layer 2 写，本层持久化；record duck-type，history 返 dict 供 L2 包装）
+    # evolution 实验记录（Layer 2 写，本层持久化；duck-type，不 runtime import L2）
     def record_evolution(self, record: "EvolutionRecord") -> str: ...
     def get_evolution_history(
         self, skill_name: str, limit: int = 20,
@@ -250,16 +297,24 @@ class SkillStore(Protocol):
 
 
 class SQLiteSkillStore:
-    """skill 基础层存储。SQLite + WAL + version DAG + 4 计数器打点。
+    """skill 基础层存储实现：SQLite + WAL + version DAG + 4 计数器打点。
 
     INVARIANT:
-    - 内容/索引分离：只存 path + content_hash（SKILL.md 全文留文件）
-    - WAL + busy_timeout=30000，threading.Lock 保护写连接
-    - PRAGMA user_version 记 schema 版本，启动跑迁移链
-    - B1b 仅 schema + 迁移；CRUD/metrics 在 B2/B3
+    - 内容/索引分离：只存 path + content_hash（SKILL.md 全文留文件）。
+    - WAL + busy_timeout=30000；threading.Lock 保护写连接。
+    - PRAGMA user_version 记 schema 版本，启动时跑迁移链。
     """
 
     def __init__(self, db_path: str | Path) -> None:
+        """打开（或创建）DB，建父目录，初始化 schema。
+
+        组装规则：
+            1. 保存 db_path，创建父目录（exist_ok=True）。
+            2. 建 threading.Lock（保护写连接）。
+            3. sqlite3.connect（check_same_thread=False，允许多线程共享）。
+            4. row_factory = sqlite3.Row（按列名取值）。
+            5. 调 _init_schema：建表 + 设 WAL + 跑迁移。
+        """
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._mu = threading.Lock()
@@ -271,7 +326,7 @@ class SQLiteSkillStore:
         self._init_schema()
 
     def _init_schema(self) -> None:
-        """建表 + WAL + user_version 迁移。构造时持锁。"""
+        """建表 + 设 WAL/busy_timeout + 按 user_version 跑迁移。构造时持锁。"""
         with self._mu:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
@@ -283,11 +338,11 @@ class SQLiteSkillStore:
             self._conn.commit()
 
     def _migrate(self, from_v: int, to_v: int) -> None:
-        """schema 版本链迁移。from_v → from_v+1 → ... → to_v。
+        """按版本链逐级迁移：from_v → from_v+1 → ... → to_v。
 
-        v1→v2: 加 skill_evolutions 表（Layer 2 实验记录）。
-        v2→v3: 加 skill_eval_judgments + task_quality_scores + skill_eval_runs 三表（Layer 3 eval）。
-        新增版本时在 migrations 注册 (v, v+1) 迁移函数。
+        v1→v2：加 skill_evolutions（Layer 2 实验记录）。
+        v2→v3：加 skill_eval_judgments / task_quality_scores / skill_eval_runs（Layer 3 eval）。
+        新增版本时在 migrations 注册 (v, v+1) → 迁移函数。
         """
         migrations: dict[tuple[int, int], Any] = {
             (1, 2): _migrate_v1_v2,
@@ -303,11 +358,15 @@ class SQLiteSkillStore:
     # ── 注册 / 发现 ──────────────────────────────────────────
 
     def register(self, record: SkillRecord) -> str:
-        """幂等注册。INSERT OR IGNORE；已存在 skill_id 返回现有不覆盖。
+        """幂等注册元数据（INSERT OR IGNORE）。
 
-        INVARIANT: 同 skill_id 二次 register 不覆盖、不报错。
-        计数器（total_selections 等）由 schema DEFAULT 0 初始化，record 携带的
-        metrics 值不写入（register 只注册元数据 + path + content_hash）。
+        已存在 skill_id 时返回现有、不覆盖、不报错。
+        只写元数据 + path + content_hash；计数器由 schema DEFAULT 0 初始化，
+        record 携带的 metrics 值不写入。
+        若 record 带 lineage.parent_skill_ids，同步写 skill_lineage_parents。
+
+        Returns:
+            record.skill_id。
         """
         with self._mu:
             self._conn.execute(
@@ -333,7 +392,10 @@ class SQLiteSkillStore:
             return record.skill_id
 
     def get(self, skill_id: str) -> SkillRecord | None:
-        """查单条。还原 allowed_tools tuple + lineage parent_skill_ids。"""
+        """按 skill_id 查单条；不存在返回 None。
+
+        还原 allowed_tools（tuple）+ lineage.parent_skill_ids。
+        """
         with self._mu:
             row = self._conn.execute(
                 "SELECT * FROM skill_records WHERE skill_id=?", (skill_id,)
@@ -343,7 +405,7 @@ class SQLiteSkillStore:
             return self._row_to_record(row)
 
     def get_active(self, name: str) -> SkillRecord | None:
-        """查 name 的 active 版本（is_active=1）。"""
+        """按 name 查 active 版本（is_active=1）；不存在返回 None。"""
         with self._mu:
             row = self._conn.execute(
                 "SELECT * FROM skill_records WHERE name=? AND is_active=1", (name,)
@@ -351,7 +413,7 @@ class SQLiteSkillStore:
             return self._row_to_record(row) if row else None
 
     def list_active(self) -> list[SkillRecord]:
-        """所有 is_active=1 的 skill。"""
+        """返回所有 is_active=1 的 skill。"""
         with self._mu:
             rows = self._conn.execute(
                 "SELECT * FROM skill_records WHERE is_active=1"
@@ -359,9 +421,10 @@ class SQLiteSkillStore:
             return [self._row_to_record(r) for r in rows]
 
     def set_enabled(self, skill_id: str, enabled: bool) -> bool:
-        """运行时持久 enable/disable。UPDATE enabled WHERE skill_id，返命中。持锁。
+        """持久化 enable/disable 运行时状态；返回是否命中行。
 
-        不经 frontmatter（frontmatter 是初始 enabled，store 是运行时态）。跨重启生效。
+        注意：frontmatter 的 enabled 是初始值，本方法写的是 store 运行时态，
+        跨重启生效。
         """
         with self._mu:
             cur = self._conn.execute(
@@ -372,12 +435,15 @@ class SQLiteSkillStore:
             return cur.rowcount > 0
 
     def discover(self, dirs: list[Path], origin: str = "IMPORTED") -> list[SkillRecord]:
-        """扫描 dirs 找 SKILL.md，parse（origin）→ upsert → 返回列表。
+        """扫描 dirs 下所有 SKILL.md，解析后 upsert，返回记录列表。
 
-        INVARIANT: lazy import parser（避免循环依赖）。
-        origin: IMPORTED（用户 skill，sidecar）| BUILTIN（核心 skill，确定性 id）。
-        skill_id 已存在时同步文件变更（path/content_hash/description/
-        allowed_tools/enabled），保证 discover 后索引不过期。
+        Args:
+            dirs:   待扫描目录列表。
+            origin: IMPORTED（用户技能，sidecar）| BUILTIN（核心技能，确定性 id）。
+
+        行为：已存在 skill_id 时同步文件变更（path / content_hash / description /
+        allowed_tools / enabled），保证 discover 后索引不过期。
+        内部 lazy import parser，避免循环依赖。
         """
         from poirot.backend.agents.skill.parser import parse_skill_file
 
@@ -428,10 +494,15 @@ class SQLiteSkillStore:
     # ── version DAG ──────────────────────────────────────────
 
     def create_version(self, parent_id: str, record: SkillRecord, origin: str) -> str:
-        """建新 version node。新 is_active=1 + 同名旧 is_active=0 + lineage_parents。
+        """创建新 version node：新 node active + 同名旧 node deactive + 写血缘。
 
-        INVARIANT: 新 skill_id 由调用方传入 record.skill_id（不在此生成）。
-        重复 skill_id 抛 ValueError（保护 is_active 单指针不变量）。
+        行为：
+        - 新 skill_id 由调用方通过 record.skill_id 传入，本方法不生成。
+        - 若 skill_id 已存在 → 抛 ValueError（保护 is_active 单指针不变量）。
+        - 写 skill_lineage_parents(skill_id, parent_id)。
+
+        Returns:
+            record.skill_id。
         """
         with self._mu:
             ts = utc_now_iso()
@@ -461,7 +532,7 @@ class SQLiteSkillStore:
             return record.skill_id
 
     def get_versions(self, name: str) -> list[SkillRecord]:
-        """返回 name 所有版本，ORDER BY generation ASC。"""
+        """返回 name 的所有版本，按 generation 升序。"""
         with self._mu:
             rows = self._conn.execute(
                 "SELECT * FROM skill_records WHERE name=? ORDER BY generation ASC",
@@ -470,9 +541,9 @@ class SQLiteSkillStore:
             return [self._row_to_record(r) for r in rows]
 
     def rollback(self, skill_id: str) -> None:
-        """激活指定 node + 同名其他 node deactive。不删除任何行。
+        """激活指定 node，并把同名其他 node deactive。不删除任何行。
 
-        INVARIANT: 切 is_active 指针，旧 node 仍存在。
+        skill_id 不存在时静默返回。
         """
         with self._mu:
             row = self._conn.execute(
@@ -493,9 +564,9 @@ class SQLiteSkillStore:
     # ── quality metrics 打点 / 查询 ──────────────────────────
 
     def record_selection(self, skill_id: str) -> None:
-        """total_selections += 1。持锁 + commit。
+        """total_selections += 1；同时更新 last_updated。
 
-        INVARIANT #6: selections 在 before_model 注入时打（确定）。
+        打点时机：before_model 注入时（确定命中）。
         skill_id 不存在时静默（UPDATE 0 行，不抛）。
         """
         with self._mu:
@@ -514,14 +585,15 @@ class SQLiteSkillStore:
         task_completed: bool,
         note: str = "",
     ) -> None:
-        """归因打点：applied 混合 + task_completed run 级。原子事务。
+        """归因打点：applied 混合 + task_completed run 级。单事务原子。
 
-        INVARIANT #7-#9:
-        - applied True → total_applied += 1
-        - applied True AND task_completed → total_completions += 1
-        - applied False AND NOT task_completed → total_fallbacks += 1
-        - applied None（guidance-skill）→ 三计数器均不变，只插 judgment
-        skill_id 不存在时静默跳过（避免孤立 judgment）。
+        计数器规则：
+        - applied is True                  → total_applied += 1
+        - applied is True 且 completed     → total_completions += 1
+        - applied is False 且 not completed→ total_fallbacks += 1
+        - applied is None（guidance-skill）→ 三计数器均不变，只插 judgment 行
+
+        skill_id 不存在时静默跳过（避免写入孤立 judgment）。
         """
         with self._mu:
             # 先验存在，不存在则跳过（避免孤立 judgment 行）
@@ -555,7 +627,14 @@ class SQLiteSkillStore:
             self._conn.commit()
 
     def get_metrics(self, skill_id: str) -> SkillMetrics | None:
-        """读 4 计数器，算 4 rate（零除保护）。不存在返 None。"""
+        """读 4 计数器并算出 4 个 rate（除零保护）。不存在返回 None。
+
+        rate 计算：
+        - applied_rate    = applied / selections
+        - completion_rate = completions / applied
+        - effective_rate  = completions / selections
+        - fallback_rate   = fallbacks / selections
+        """
         with self._mu:
             row = self._conn.execute(
                 "SELECT total_selections, total_applied, total_completions, "
@@ -586,12 +665,11 @@ class SQLiteSkillStore:
         metric: str = "effective_rate",
         min_selections: int = 5,
     ) -> list[SkillRecord]:
-        """按 metric 降序返 top n active skill。
+        """按 metric 降序返回 top n 个 active skill。
 
-        INVARIANT #12: total_selections < min_selections 不参与排序
-        （anti-loop，给新 skill 数据积累）。
-        metric ∈ {effective_rate, applied_rate, completion_rate, fallback_rate}。
-        统一降序，调用方解释含义。
+        metric ∈ {effective_rate, applied_rate, completion_rate, fallback_rate}；
+        统一降序，由调用方解释含义。
+        total_selections < min_selections 的 skill 不参与排序（anti-loop）。
         """
         with self._mu:
             rows = self._conn.execute(
@@ -608,9 +686,9 @@ class SQLiteSkillStore:
         threshold: float = 0.4,
         min_selections: int = 5,
     ) -> list[SkillHealth]:
-        """标 degraded = effective_rate < threshold AND selections >= min。
+        """标记 degraded 技能：effective_rate < threshold 且 selections >= min。
 
-        INVARIANT #12: selections < min → degraded=False（数据不足不判）。
+        selections < min_selections 时 degraded=False（数据不足不判）。
         """
         results: list[SkillHealth] = []
         for rec in self.list_active():
@@ -631,9 +709,10 @@ class SQLiteSkillStore:
     # ── evolution 实验记录（Layer 2 写，本层持久化）──────────
 
     def record_evolution(self, record: "EvolutionRecord") -> str:
-        """写 skill_evolutions 表。record duck-type（EvolutionRecord 实例，L1 不 runtime import L2）。
+        """写 skill_evolutions 表（INSERT OR REPLACE）。返回 evolution_id。
 
-        INSERT OR REPLACE（同 evolution_id 重写）。持锁。
+        record 走 duck-type（不 runtime import L2 类型）。
+        同 evolution_id 会被覆盖。timestamp 为空时用 utc_now_iso()。
         """
         with self._mu:
             self._conn.execute(
@@ -663,9 +742,9 @@ class SQLiteSkillStore:
     def get_evolution_history(
         self, skill_name: str, limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """回溯 skill 的 evolution 历史。返 list[dict]（L2 包装为 EvolutionRecord）。
+        """查 skill 的 evolution 历史，按 timestamp 降序，limit 截断。
 
-        按 timestamp 降序（最新在前），limit 截断。
+        返回 list[dict]（由 L2 自行包装为 EvolutionRecord）。
         """
         with self._mu:
             rows = self._conn.execute(
@@ -675,10 +754,10 @@ class SQLiteSkillStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    # ── eval 持久化（Layer 3 写，本层持久化；duck-type，L1 不 runtime import L3）──
+    # ── eval 持久化（Layer 3 写，本层持久化；duck-type，不 runtime import L3）──
 
     def save_judgment(self, judgment: "EvalSkillJudgment") -> str:
-        """写 skill_eval_judgments 表。INSERT OR REPLACE。持锁。"""
+        """写 skill_eval_judgments 表（INSERT OR REPLACE）。返回 judgment_id。"""
         with self._mu:
             self._conn.execute(
                 """INSERT OR REPLACE INTO skill_eval_judgments
@@ -701,7 +780,7 @@ class SQLiteSkillStore:
     def get_judgments(
         self, skill_id: str, limit: int = 20,
     ) -> list["EvalSkillJudgment"]:
-        """回溯 skill 的 SkillJudgment 历史。按 timestamp 降序。"""
+        """查 skill 的 SkillJudgment 历史，按 timestamp 降序，limit 截断。"""
         from poirot.backend.agents.skill.eval.types import SkillJudgment
         with self._mu:
             rows = self._conn.execute(
@@ -723,7 +802,7 @@ class SQLiteSkillStore:
         ]
 
     def save_task_score(self, score: "TaskQualityScore") -> str:
-        """写 task_quality_scores 表。INSERT OR REPLACE。持锁。"""
+        """写 task_quality_scores 表（INSERT OR REPLACE）。返回 score_id。"""
         with self._mu:
             self._conn.execute(
                 """INSERT OR REPLACE INTO task_quality_scores
@@ -746,7 +825,7 @@ class SQLiteSkillStore:
             return score.score_id
 
     def get_task_scores(self, task_id: str) -> "TaskQualityScore | None":
-        """查 task 的 TaskQualityScore。"""
+        """按 task_id 查 TaskQualityScore；不存在返回 None。"""
         from poirot.backend.agents.skill.eval.types import TaskQualityScore
         with self._mu:
             row = self._conn.execute(
@@ -768,7 +847,7 @@ class SQLiteSkillStore:
         )
 
     def save_eval_run(self, run: "EvalRun") -> str:
-        """写 skill_eval_runs 表。INSERT OR REPLACE。持锁。"""
+        """写 skill_eval_runs 表（INSERT OR REPLACE）。返回 eval_run_id。"""
         with self._mu:
             self._conn.execute(
                 """INSERT OR REPLACE INTO skill_eval_runs
@@ -790,9 +869,10 @@ class SQLiteSkillStore:
 
     # ── helpers ──────────────────────────────────────────────
 
-    # TODO(perf): list_active/get_versions hot path 批量取 lineage（当前 N+1，skill<20 可接受）
+    # TODO(perf): list_active/get_versions 属 hot path 批量取 lineage
+    # （当前 N+1，skill < 20 可接受）
     def _row_to_record(self, row: sqlite3.Row) -> SkillRecord:
-        """sqlite Row → SkillRecord。还原 allowed_tools tuple + lineage。"""
+        """sqlite Row → SkillRecord：还原 allowed_tools（tuple）与 lineage。"""
         parent_rows = self._conn.execute(
             "SELECT parent_skill_id FROM skill_lineage_parents WHERE skill_id=?",
             (row["skill_id"],),
@@ -824,6 +904,7 @@ class SQLiteSkillStore:
         )
 
     def close(self) -> None:
+        """关闭 DB 连接（持锁；关闭后 _conn 置 None）。"""
         with self._mu:
             self._conn.close()
             self._conn = None

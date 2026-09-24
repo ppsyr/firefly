@@ -1,11 +1,32 @@
-"""MultiAgentMetricsStore — SQLite metrics for specialist orchestration.
+"""MultiAgentMetricsStore — multiagent 编排的 SQLite 指标存储。
 
-设计（spec.md MultiAgentMetricsStore Requirement + design.md §6）:
-- .poirot/multiagent.db SQLite（WAL + busy_timeout + threading.Lock）
-- specialist_records 表：name + 4 计数器（selections/invoked/completions/fallbacks）
-- specialist_judgments 表：run_id + specialist + success + duration + gap
-- health_check：completion_rate < threshold AND invoked >= min → degraded
-- 不进 ThreadState（design.md §2 metrics 分离）
+【整体职责】
+以 SQLite 持久化 multiagent 的运行指标与辅助数据，供健康检查、L2 进化、L3 评估读取。
+存储 9 张表：specialist 计数器、judgment 明细、进化产物/实验、L2 指标、
+预算用量/告警、L2 阻断模式、决策日志（主表 + 归档表）。
+
+【内容摘要】
+- _SCHEMA_VERSION / _SCHEMA_SQL  : schema 版本与建表 SQL（9 张表）。
+- SpecialistMetrics              : specialist 聚合指标（从 specialist_records 派生）。
+- SpecialistHealth               : specialist 健康状态（health_check 输出）。
+- MultiAgentMetricsStore         : 存储主类，提供打点、查询、健康检查、决策日志、归档等方法。
+
+【职责边界】
+- 只负责：SQLite 建表、打点写入、指标查询、决策日志存取与归档。
+- 不负责：指标消费决策（health_check 只判定，不触发动作）、L2/L3 业务逻辑
+  （通过 MetricsView 协议暴露数据给它们）、specialist 执行。
+- 不进 ThreadState：指标与线程状态分离。
+
+【INVARIANT】
+- WAL 模式 + busy_timeout=30000 + threading.Lock 保护写：保证并发安全。
+- PRAGMA user_version 记 schema 版本，首次启动建表；版本过低时重建。
+- 4 计数器 programmatic 打点：selection / invoked / completion / fallback。
+- 所有写操作持锁；读操作也持锁（简化并发，代价可接受）。
+- completion_rate / fallback_rate 分母为 0 时返回 0.0，不抛异常。
+- failure_category 以字符串存储（enum .value），避免跨层 import。
+- L2 / L3 类型在方法内 lazy import：避免循环依赖。
+- 决策日志归档：先复制到 archive 表，再删主表；返回归档条数。
+- 成本估算为占位实现：tokens * 0.00002，真实价格应从 config 取。
 """
 from __future__ import annotations
 
@@ -17,8 +38,10 @@ from typing import Any
 
 from poirot.backend.agents.journal.events import utc_now_iso
 
+# schema 版本号。低于此版本会触发建表 / 升级。
 _SCHEMA_VERSION = 3
 
+# 建表 SQL：9 张表 + 索引。全部 IF NOT EXISTS，可重复执行。
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS specialist_records (
     specialist_name     TEXT PRIMARY KEY,
@@ -143,7 +166,10 @@ CREATE TABLE IF NOT EXISTS specialist_decision_log_archive (
 
 @dataclass(frozen=True)
 class SpecialistMetrics:
-    """specialist 聚合指标（从 specialist_records 派生）。"""
+    """specialist 聚合指标（从 specialist_records 派生）。
+
+    completion_rate / fallback_rate 为派生属性，分母为 0 时返回 0.0。
+    """
 
     specialist_name: str
     total_selections: int
@@ -153,12 +179,14 @@ class SpecialistMetrics:
 
     @property
     def completion_rate(self) -> float:
+        """完成率 = completions / invoked；invoked=0 时返回 0.0。"""
         if self.total_invoked == 0:
             return 0.0
         return self.total_completions / self.total_invoked
 
     @property
     def fallback_rate(self) -> float:
+        """回退率 = fallbacks / invoked；invoked=0 时返回 0.0。"""
         if self.total_invoked == 0:
             return 0.0
         return self.total_fallbacks / self.total_invoked
@@ -166,7 +194,10 @@ class SpecialistMetrics:
 
 @dataclass(frozen=True)
 class SpecialistHealth:
-    """specialist 健康状态（health_check 输出）。"""
+    """specialist 健康状态（health_check 输出）。
+
+    degraded 判定：completion_rate < threshold 且 total_invoked >= min_invoked。
+    """
 
     specialist_name: str
     completion_rate: float
@@ -175,28 +206,31 @@ class SpecialistHealth:
 
 
 class MultiAgentMetricsStore:
-    """SQLite metrics store for multi-agent orchestration.
+    """multiagent 编排的 SQLite 指标存储。
 
     INVARIANT:
-    - WAL 模式 + busy_timeout=30000 + threading.Lock 保护写
-    - PRAGMA user_version 记 schema 版本，首次启动建表
-    - 4 计数器 programmatic 打点（record_selection/invoked/completion/fallback）
-    - 不进 ThreadState（design.md §2 metrics 分离）
+    - WAL 模式 + busy_timeout=30000 + threading.Lock 保护写。
+    - PRAGMA user_version 记 schema 版本，首次启动建表。
+    - 4 计数器 programmatic 打点（selection / invoked / completion / fallback）。
+    - 指标与 ThreadState 分离，不进 ThreadState。
     """
 
     def __init__(self, db_path: str = ".poirot/multiagent.db") -> None:
+        """打开 / 创建数据库。父目录不存在时自动创建，随后初始化 schema。"""
         self._db_path = db_path
         self._lock = threading.Lock()
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
+        """建立连接并设置 WAL + busy_timeout。每次调用返回新连接。"""
         conn = sqlite3.connect(self._db_path, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def _init_schema(self) -> None:
+        """按 schema 版本初始化：版本低于当前值时执行建表 SQL 并更新版本号。"""
         with self._lock:
             conn = self._connect()
             try:
@@ -209,6 +243,7 @@ class MultiAgentMetricsStore:
                 conn.close()
 
     def _upsert_counter(self, specialist_name: str, field: str) -> None:
+        """对 specialist_records 的某计数器做 +1 的 upsert（不存在则插入 1）。"""
         now = utc_now_iso()
         with self._lock:
             conn = self._connect()
@@ -226,15 +261,19 @@ class MultiAgentMetricsStore:
                 conn.close()
 
     def record_selection(self, specialist_name: str) -> None:
+        """打点：specialist 被选中（total_selections +1）。"""
         self._upsert_counter(specialist_name, "total_selections")
 
     def record_invoked(self, specialist_name: str) -> None:
+        """打点：specialist 被实际调用（total_invoked +1）。"""
         self._upsert_counter(specialist_name, "total_invoked")
 
     def record_completion(self, specialist_name: str) -> None:
+        """打点：specialist 成功完成（total_completions +1）。"""
         self._upsert_counter(specialist_name, "total_completions")
 
     def record_fallback(self, specialist_name: str) -> None:
+        """打点：specialist 回退到其他路径（total_fallbacks +1）。"""
         self._upsert_counter(specialist_name, "total_fallbacks")
 
     def record_judgment(
@@ -249,6 +288,7 @@ class MultiAgentMetricsStore:
         failure_category: str | None = None,
         gap_analysis: str = "",
     ) -> None:
+        """写入一条 specialist judgment 明细（含耗时、token、成本、失败分类）。"""
         now = utc_now_iso()
         with self._lock:
             conn = self._connect()
@@ -270,6 +310,7 @@ class MultiAgentMetricsStore:
                 conn.close()
 
     def get_metrics(self, specialist_name: str) -> SpecialistMetrics | None:
+        """查询单个 specialist 的聚合指标；无记录返回 None。"""
         with self._lock:
             conn = self._connect()
             try:
@@ -292,6 +333,7 @@ class MultiAgentMetricsStore:
         )
 
     def get_top_specialists(self, limit: int = 10) -> list[SpecialistMetrics]:
+        """按 total_invoked 降序取前 N 个 specialist 的聚合指标。"""
         with self._lock:
             conn = self._connect()
             try:
@@ -317,7 +359,10 @@ class MultiAgentMetricsStore:
         threshold: float = 0.4,
         min_invoked: int = 5,
     ) -> list[SpecialistHealth]:
-        """Return degraded specialists (completion_rate < threshold AND invoked >= min)."""
+        """返回所有 specialist 的健康状态。
+
+        degraded 判定：completion_rate < threshold 且 total_invoked >= min_invoked。
+        """
         all_metrics = self.get_top_specialists(limit=100)
         return [
             SpecialistHealth(
@@ -329,12 +374,15 @@ class MultiAgentMetricsStore:
             for m in all_metrics
         ]
 
-    # ── MetricsView Protocol implementation (L2 reads L1 via these methods) ──
+    # ── MetricsView 协议实现（供 L2 读取 L1 数据） ──
 
     def get_specialist_metrics(
         self, name: str, *, since: float | None = None
     ) -> dict | None:
-        """Single specialist aggregated snapshot (JOIN specialist_judgments for cost/latency)."""
+        """单个 specialist 的聚合快照（join specialist_judgments 取成本/延迟）。
+
+        取最近 20 条 judgment 算平均延迟与成本；无记录时返回 None。
+        """
         base = self.get_metrics(name)
         if base is None:
             return None
@@ -362,7 +410,7 @@ class MultiAgentMetricsStore:
                 conn.close()
         if rows:
             avg_latency = sum(r[0] for r in rows) / len(rows)
-            # MVP cost estimate: tokens * $0.00002 (placeholder, real price from config)
+            # 成本估算占位实现：tokens * $0.00002（真实价格应从 config 取）
             total_tokens = sum(r[1] + r[2] for r in rows)
             avg_cost = total_tokens * 0.00002 / len(rows)
             sample_size = len(rows)
@@ -383,13 +431,13 @@ class MultiAgentMetricsStore:
         }
 
     def get_global_metrics(self, *, since: float | None = None) -> dict:
-        """Global aggregated snapshot across all specialists."""
+        """全局聚合快照：所有 specialist 的调用、成本、延迟汇总。"""
         all_metrics = self.get_top_specialists(limit=100)
         total_calls = sum(m.total_invoked for m in all_metrics)
         total_selections = sum(m.total_selections for m in all_metrics)
         total_completions = sum(m.total_completions for m in all_metrics)
         total_fallbacks = sum(m.total_fallbacks for m in all_metrics)
-        # avg latency/cost across all judgments
+        # 全局平均延迟 / 总成本
         with self._lock:
             conn = self._connect()
             try:
@@ -411,7 +459,10 @@ class MultiAgentMetricsStore:
         }
 
     def get_failure_categories(self, *, since: float | None = None) -> dict:
-        """Failure category counts (from specialist_judgments.failure_category)."""
+        """按 failure_category 统计失败次数。
+
+        字符串 category 映射回 FailureCategory 枚举；未知值跳过。
+        """
         with self._lock:
             conn = self._connect()
             try:
@@ -423,7 +474,7 @@ class MultiAgentMetricsStore:
                 ).fetchall()
             finally:
                 conn.close()
-        # Map string category to FailureCategory enum (lazy import to avoid circular)
+        # 字符串 category → FailureCategory 枚举（lazy import 避免循环依赖）
         from poirot.backend.agents.multiagent.evolution.types import FailureCategory
         result: dict = {}
         for cat_str, count in rows:
@@ -431,13 +482,13 @@ class MultiAgentMetricsStore:
                 cat = FailureCategory(cat_str)
                 result[cat] = count
             except ValueError:
-                continue  # unknown category string, skip
+                continue  # 未知 category 字符串，跳过
         return result
 
     def get_recent_failures(
         self, *, category, limit: int = 10
     ) -> list:
-        """Recent N failures of a given category."""
+        """取某 failure_category 下最近 N 条失败记录。"""
         cat_str = category.value if hasattr(category, "value") else str(category)
         with self._lock:
             conn = self._connect()
@@ -469,15 +520,14 @@ class MultiAgentMetricsStore:
         return records
 
     def list_specialists(self) -> list[str]:
-        """All specialist names with records."""
+        """列出所有有记录的 specialist 名字。"""
         all_metrics = self.get_top_specialists(limit=100)
         return [m.specialist_name for m in all_metrics]
 
     def save_decision_log(self, record: Any) -> None:
-        """Save decision log record (L3 DecisionLogRecord, duck typing).
+        """保存决策日志记录（duck typing，兼容 L3 DecisionLogRecord）。
 
-        L3-7.1: 跨 run specialist 协作 lessons 累积.
-        failure_category 存 enum .value（字符串，避免 import L3 类型）.
+        failure_category 存 enum .value（字符串），避免 import L3 类型。
         """
         now = utc_now_iso()
         fc_value = record.failure_category.value if record.failure_category else None
@@ -501,9 +551,9 @@ class MultiAgentMetricsStore:
     def get_decision_logs(
         self, specialist_name: str, failure_category: Any | None, limit: int,
     ) -> list[Any]:
-        """Query decision logs (lazy import L3 types to avoid circular dependency).
+        """查询决策日志（lazy import L3 类型避免循环依赖）。
 
-        Returns list[DecisionLogRecord]. failure_category None = no filter.
+        返回 list[DecisionLogRecord]。failure_category 为 None 时不过滤。
         """
         from poirot.backend.agents.multiagent.evolution.types import FailureCategory
         from poirot.backend.agents.multiagent.eval.types import DecisionLogRecord
@@ -544,7 +594,10 @@ class MultiAgentMetricsStore:
         return records
 
     def archive_decision_logs(self, retention_days: int) -> int:
-        """Archive expired decision logs (move to archive table + delete main, L3-7.5)."""
+        """归档过期决策日志（先复制到 archive 表，再删主表）。
+
+        返回归档条数。
+        """
         from datetime import datetime, timedelta, timezone
         cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
         now = utc_now_iso()

@@ -1,13 +1,37 @@
 """SpecialistMcpServer — 暴露 Poirot 8 个沙箱接口给 specialist via MCP（stdio）。
 
-设计（spec.md SpecialistMcpServer Requirement + design.md §5）:
-- 8 个 MCP tool：bash/read_file/write_file/list_dir/str_replace/glob/grep/download_file
-- 直接映射既有 Sandbox 类方法（不重新实现沙箱逻辑，INV#9）
-- 经过 PathTranslator + SecurityGuard（既有安全层）
-- per-specialist-call 生命周期（每次启动 + 完成关闭）
-- sandbox_id 通过 --sandbox-id 命令行参数传递
-- 独立入口：python -m poirot.backend.agents.multiagent.mcp.specialist_mcp_server --sandbox-id {id}
-- 错误转 MCP error response（SandboxError → error text content）
+【整体职责】
+把 Poirot 沙箱能力（8 个操作）暴露为 MCP 工具，供外部 specialist（Claude Code /
+Codex / Pi）通过 stdio 协议调用。每个 specialist 调用启动一个 MCP server，
+完成即关闭（per-specialist-call 生命周期）。直接映射既有 Sandbox 类方法，
+不重新实现沙箱逻辑——经过 PathTranslator + SecurityGuard。
+
+【内容摘要】
+- _tool_definitions()   : 8 个 MCP tool 定义（name + description + inputSchema）。
+- SpecialistMcpServer   : MCP server 主类（get_tool_definitions / call_tool / run）。
+- _str_replace()        : str_replace 复合操作（read → replace → write）。
+- _create_sandbox()     : 根据 args 选 runtime（DockerRuntime / LocalRuntime）。
+- main()                : 独立入口（python -m ... --sandbox-id {id}）。
+
+【职责边界】
+- 只负责：暴露 8 个工具、分发调用、错误转 MCP error response。
+- 不负责：沙箱逻辑实现（Sandbox 类负责）、路径翻译 / 安全校验（translator / guard 负责）、
+  与 specialist 的进程管理（runtime 负责）。
+- 不持有重状态：持有 sandbox 引用；生命周期 per-specialist-call。
+
+【INVARIANT】
+- 8 个工具固定：bash / read_file / write_file / list_dir / str_replace /
+  glob / grep / download_file。
+- 直接映射既有 Sandbox 方法：不重新实现沙箱逻辑。
+- 经过 PathTranslator + SecurityGuard：复用既有安全层。
+- per-specialist-call 生命周期：每次启动 + 完成关闭。
+- sandbox_id 通过 --sandbox-id 命令行参数传递。
+- runtime 选择：
+  - 有 --sandbox-url → DockerRuntime + DockerPathTranslator + DockerPathGuard。
+  - 无 --sandbox-url → LocalRuntime + LocalPathTranslator + LocalSecurityGuard。
+- 错误统一转为 MCP error response（SandboxError / 其他异常都转 error text content）。
+- 未知 tool name → ValueError。
+- str_replace：old_str 不在内容中 → SandboxRuntimeError。
 """
 from __future__ import annotations
 
@@ -136,21 +160,34 @@ class SpecialistMcpServer:
     """
 
     def __init__(self, sandbox: Sandbox) -> None:
+        """初始化。
+
+        Args:
+            sandbox: Sandbox 门面实例（含 runtime / translator / guard）。
+        """
         self._sandbox = sandbox
 
     @property
     def sandbox_id(self) -> str:
+        """暴露 sandbox ID。"""
         return self._sandbox.id
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
-        """返 8 个 MCP tool 定义。"""
+        """返回 8 个 MCP tool 定义。"""
         return _tool_definitions()
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
-        """dispatch tool call to Sandbox method。
+        """分发工具调用到对应 Sandbox 方法。
 
-        抛 SandboxError 时由 MCP handler 转 error response。
-        抛 ValueError 表示未知 tool name。
+        - SandboxError → 由 MCP handler 转 error response。
+        - 未知 tool name → ValueError。
+
+        Args:
+            name: 工具名。
+            arguments: 工具参数。
+
+        Returns:
+            工具执行结果文本。
         """
         if name == "bash":
             return self._sandbox.execute_command(arguments["command"])
@@ -214,7 +251,20 @@ class SpecialistMcpServer:
     def _str_replace(
         self, path: str, old_str: str, new_str: str, replace_all: bool = False
     ) -> str:
-        """str_replace 复合操作：read → replace → write（参考 sandbox/integration/tools.py）。"""
+        """str_replace 复合操作：read → replace → write。
+
+        - old_str 不在内容中 → SandboxRuntimeError。
+        - replace_all=False 时只替换第一个匹配。
+
+        Args:
+            path: 虚拟路径。
+            old_str: 待替换文本。
+            new_str: 替换文本。
+            replace_all: 是否替换全部。
+
+        Returns:
+            替换结果说明文本。
+        """
         content = self._sandbox.read_file(path)
         if old_str not in content:
             raise SandboxRuntimeError(f"old_str not found in {path}")
@@ -227,7 +277,12 @@ class SpecialistMcpServer:
         return f"replaced {count if replace_all else 1} occurrence(s) in {path}"
 
     async def run(self) -> None:
-        """stdio MCP server loop（使用 mcp 包）。"""
+        """stdio MCP server loop（使用 mcp 包）。
+
+        - list_tools：返回 8 个 Tool 定义。
+        - call_tool：调 self.call_tool，异常转 TextContent error。
+        - stdio_server 建立 stdio 通道。
+        """
         from mcp.server import Server
         from mcp.server.stdio import stdio_server
         from mcp.types import TextContent, Tool
@@ -266,12 +321,18 @@ class SpecialistMcpServer:
 
 
 def _create_sandbox(args: argparse.Namespace) -> Sandbox:
-    """根据 args 选 runtime:有 --sandbox-url 用 DockerRuntime 连 lead 容器,否则 fallback Local。
+    """根据 args 选 runtime。
 
-    --sandbox-url 有(块 D3):DockerRuntime + DockerPathTranslator + DockerPathGuard
-        → specialist 连 lead Docker 容器,写入落同一挂载区。
-    --sandbox-url 无:fallback LocalRuntime + LocalPathTranslator + LocalSecurityGuard
-        → LocalSandboxProvider 场景(现状)。
+    - 有 --sandbox-url → DockerRuntime + DockerPathTranslator + DockerPathGuard
+      （specialist 连 lead Docker 容器，写入落同一挂载区）。
+    - 无 --sandbox-url → LocalRuntime + LocalPathTranslator + LocalSecurityGuard
+      （LocalSandboxProvider 场景）。
+
+    Args:
+        args: 命令行参数。
+
+    Returns:
+        构造好的 Sandbox 实例。
     """
     from poirot.backend.agents.sandbox.guards.audit_guard import AuditGuard
     from poirot.backend.agents.sandbox.sandbox import Sandbox
@@ -302,7 +363,13 @@ def _create_sandbox(args: argparse.Namespace) -> Sandbox:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """独立入口:python -m ...specialist_mcp_server --sandbox-id {id} [--sandbox-url URL]"""
+    """独立入口。
+
+    用法：python -m ...specialist_mcp_server --sandbox-id {id} [--sandbox-url URL]
+
+    Args:
+        argv: 命令行参数（None 时用 sys.argv）。
+    """
     parser = argparse.ArgumentParser(description="Poirot Specialist MCP Server")
     parser.add_argument("--sandbox-id", required=True, help="Sandbox ID to bind")
     parser.add_argument(

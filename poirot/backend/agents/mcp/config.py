@@ -1,10 +1,33 @@
 """MCP 配置层 — YAML 加载 + ${ENV} 插值 + .env 开关。
 
-INVARIANT:
-- POIROT_MCP_ENABLED=false（缺省）→ 不加载 MCP，build_mcp_manager 返 None
-- POIROT_MCP_CONFIG_PATH 缺省 .poirot/mcp_servers.yaml，相对项目根
-- YAML 内 ${VAR} 从宿主 env 插值
-- 文件不存在 / 解析失败 → 返空 McpConfig，不抛，logger 降级
+【整体职责】
+负责 MCP 配置的加载、解析与保存：从 YAML 读取 server 定义、对 ${VAR} 做宿主 env
+插值、按 POIROT_MCP_ENABLED 开关决定是否启用，并把配置写回 YAML（敏感值转占位符）。
+
+【内容摘要】
+- _DEFAULT_CONFIG_PATH / _ENV_PATTERN / _CREDENTIAL_VALUE_PATTERNS : 常量与正则。
+- McpServerConfig           : 单个 MCP server 配置（frozen 语义的数据类）。
+- McpConfig                 : MCP 管理模块顶层配置。
+- _interpolate_env / _interpolate_recursive : ${VAR} 插值。
+- _parse_server             : dict → McpServerConfig（字段校验宽松）。
+- load_mcp_config           : 从 YAML 加载 McpConfig。
+- _is_credential_value / _to_env_placeholder / _sanitize_server_dict : 敏感值处理。
+- save_mcp_config           : 写回 YAML（敏感值转 ${VAR} 占位符）。
+
+【职责边界】
+- 只负责：MCP 配置的加载、解析、插值、保存。
+- 不负责：MCP server 的连接与工具加载（loader / registry）、
+  MCP 工具的调用与审计（McpAuditMiddleware）、工具过滤的实际执行（registry）。
+
+【INVARIANT】
+- POIROT_MCP_ENABLED=false（缺省）→ 不加载 MCP，build_mcp_manager 返 None。
+- POIROT_MCP_CONFIG_PATH 缺省 .poirot/mcp_servers.yaml，相对项目根。
+- YAML 内 ${VAR} 从宿主 env 插值。
+- 文件不存在 / 解析失败 → 返空 McpConfig，不抛，logger 降级。
+- transport 非法 → 回退 stdio（logger.warning）。
+- 空值防御：YAML 的 `env:` 空值解析为 None，用 `or {}` 兜底。
+- 保存时敏感值转 ${VAR} 占位符（凭证模式匹配）。
+- 保存失败 logger.error，不抛。
 """
 from __future__ import annotations
 
@@ -38,6 +61,20 @@ class McpServerConfig:
     transport=sse|http → url/headers
     enabled=false → 跳过不连接
     include/exclude → 工具过滤（include 优先）
+
+    Attributes:
+        name: server 名。
+        transport: 传输类型（stdio / sse / http）。
+        command: stdio 模式的命令。
+        args: stdio 模式的参数。
+        env: stdio 模式的环境变量。
+        url: sse / http 模式的 URL。
+        headers: sse / http 模式的请求头。
+        enabled: 是否启用。
+        timeout: 调用超时（秒）。
+        connect_timeout: 连接超时（秒）。
+        include_tools: 工具白名单。
+        exclude_tools: 工具黑名单。
     """
     name: str
     transport: Literal["stdio", "sse", "http"]
@@ -61,6 +98,12 @@ class McpConfig:
     fallback_chains: {tool_name: [server:tool, ...]} — 主→备链，熔断器 open 时 fallback
     core_tools: 启动时必加载工具名（避免全量占上下文）
     tool_metadata: {tool_name: {typical_output_tokens, source}} — 供外化层调阈值
+
+    Attributes:
+        servers: server 名 → 配置。
+        fallback_chains: 工具名 → 备用工具链。
+        core_tools: 启动时必加载的工具名。
+        tool_metadata: 工具元数据（供外化层调阈值）。
     """
     servers: dict[str, McpServerConfig] = field(default_factory=dict)
     fallback_chains: dict[str, list[str]] = field(default_factory=dict)
@@ -115,6 +158,12 @@ def load_mcp_config(config_path: str | None = None) -> McpConfig:
 
     config_path 缺省走 .env POIROT_MCP_CONFIG_PATH，再缺省 .poirot/mcp_servers.yaml。
     文件不存在 / 解析失败 → 空 McpConfig，不抛。
+
+    Args:
+        config_path: 配置路径；None 时走 env 缺省。
+
+    Returns:
+        McpConfig: 加载结果；失败时为空 McpConfig。
     """
     if config_path is None:
         config_path = os.environ.get("POIROT_MCP_CONFIG_PATH", _DEFAULT_CONFIG_PATH)
@@ -199,6 +248,10 @@ def save_mcp_config(config: McpConfig, config_path: str | None = None) -> None:
 
     config_path 缺省走 .env POIROT_MCP_CONFIG_PATH，再缺省 .poirot/mcp_servers.yaml。
     写失败 logger.error，不抛。
+
+    Args:
+        config: 待保存的配置。
+        config_path: 配置路径；None 时走 env 缺省。
     """
     if config_path is None:
         config_path = os.environ.get("POIROT_MCP_CONFIG_PATH", _DEFAULT_CONFIG_PATH)

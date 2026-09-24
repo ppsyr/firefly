@@ -1,3 +1,36 @@
+"""Sandbox 具体类 — 编排 Runtime + Translator + Guard，对外提供统一操作接口。
+
+【整体职责】
+作为 sandbox 层的对外门面，组合 Runtime（执行）+ Translator（路径转换）+ Guard（安全校验）
+三个契约，把「校验 → 路径转换 → 执行 → 结果脱敏」的编排逻辑集中在一处。
+切沙箱（Local / Docker / E2B）只换组件，编排逻辑复用（方案 C 核心）。
+
+【内容摘要】
+- Sandbox              : 编排类主体，对外暴露 execute/read/write/list/glob/grep/download/update。
+- __init__ / id        : 注入三个契约组件，id 构造时确定。
+- get_host_path        : 虚拟路径 → 宿主物理路径（供外部复制/注册 artifact 用）。
+- execute_command      : 命令执行（validate → translate → exec → mask）。
+- read_file            : 读文件（validate → translate → read → mask）。
+- write_file           : 写文件（validate → translate → write，不 mask）。
+- list_dir             : 列目录（validate → translate → list → 逐项 mask）。
+- glob                 : 按 pattern 匹配路径（validate → translate → glob → 逐项 mask）。
+- grep                 : 内容检索（validate → translate → grep → 对 GrepMatch 逐字段 mask）。
+- download_file        : 下载文件字节流（validate → translate → download，不 mask）。
+- update_file          : 上传/覆盖文件字节流（validate → translate → update）。
+- close                : 关闭 runtime。
+
+【职责边界】
+- 只负责：编排顺序（guard.validate → translator.translate → runtime.execute → translator.mask）。
+- 不负责：命令/路径的具体校验规则（guard）、路径转换算法（translator）、执行落地（runtime）。
+- 不持有状态：除注入的组件与不可变 id 外，无自身状态；每次调用走同一编排。
+
+【INVARIANT】
+- 编排顺序固定：validate → translate → execute → mask。
+- mask_output 归 translator（路径翻译的逆操作），guard 只做 validate（Grill #4）。
+- close() 后不得再调用任何操作方法。
+- id 在构造时确定，不可变。
+- get_host_path 不做 guard.validate（调用方负责路径安全）。
+"""
 from __future__ import annotations
 
 from dataclasses import replace

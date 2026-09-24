@@ -1,11 +1,31 @@
-"""L2TriggerMiddleware — L1 graph after_model 末尾轻量检查（D-6.3=C3）。
+"""L2TriggerMiddleware — L1 graph after_model 末尾轻量检查。
 
-设计（42 文档 §7.3 + spec.md L2TriggerMiddleware Requirement）:
-- after_model 纯数值判断（检查 metrics 阈值 + 1h 冷却窗口），不调 LLM
-- 命中阈值时 enqueue EvolutionTask 到 queue（daemon thread 消费）
-- 不修改 ThreadState（返 None，INV-4）
-- < 1ms 延迟，不影响 L1 turn
-- 触发判定委托 TriggerManager（四源 + 节流）
+【整体职责】
+作为 L1 graph 的 after_model 钩子：每次模型调用后，用纯数值判断检查是否
+满足 L2 演化触发条件；命中则 enqueue EvolutionTask 到共享队列，由 daemon
+线程消费。不修改 ThreadState，延迟 < 1ms。
+
+【内容摘要】
+- L2TriggerMiddleware : middleware 主类（after_model / aafter_model）。
+
+【职责边界】
+- 只负责：after_model 时委托 TriggerManager 判定、命中则 enqueue。
+- 不负责：触发判定逻辑（TriggerManager 负责）、任务执行（worker 负责）、
+  ThreadState 修改（返 None，不改）。
+- 不持有重状态：只持有 trigger_manager / metrics_view / profile 引用。
+
+【INVARIANT】
+- after_model 不修改 ThreadState：始终返回 None。
+- 纯数值判断：不调 LLM（委托 TriggerManager.should_trigger）。
+- 延迟 < 1ms：不影响 L1 turn 性能。
+- 触发判定完全委托 TriggerManager（四源 + 1h 冷却）。
+- 异步版委托同步版：L2 触发是纯数值，无阻塞 IO，不需真正异步。
+- EvolutionTask.task_id 从 state.metadata 的 snapshot_id / thread_id 提取；
+  都没有则用 l2_<时间戳> 兜底。
+- trigger_source 从 TriggerManager.last_trigger_source 取；
+  None 时用 TriggerSource.PERIODIC 兜底。
+- trigger_detail 从 TriggerManager.last_trigger_detail 取。
+- profile 由构造注入，默认 "default"。
 """
 from __future__ import annotations
 
@@ -21,12 +41,12 @@ from poirot.backend.agents.state.types import ThreadState
 
 
 class L2TriggerMiddleware(AgentMiddleware):
-    """L1 graph after_model 末尾轻量检查（D-6.3=C3）。
+    """L1 graph after_model 末尾轻量检查。
 
-    after_model 不修改 ThreadState（返 None，INV-4）。
-    _should_trigger 纯数值判断（冷却窗口 + 阈值），不调 LLM（INV-4）。
-    命中时 enqueue EvolutionTask 到 queue（daemon thread 消费）。
-    < 1ms 延迟，不影响 L1 turn。
+    - after_model 不修改 ThreadState（始终返 None）。
+    - 判定委托 TriggerManager（纯数值，不调 LLM）。
+    - 命中时 enqueue EvolutionTask 到 queue（daemon thread 消费）。
+    - 延迟 < 1ms，不影响 L1 turn。
     """
 
     state_schema = ThreadState  # type: ignore[assignment]
@@ -37,6 +57,13 @@ class L2TriggerMiddleware(AgentMiddleware):
         metrics_view: MetricsView,
         profile: str = "default",
     ) -> None:
+        """初始化。
+
+        Args:
+            trigger_manager: 触发管理器（委托判定）。
+            metrics_view: L2 MetricsView Protocol（读 L1 指标）。
+            profile: 演化 profile（per-profile 冷却 key），默认 "default"。
+        """
         self._trigger_manager = trigger_manager
         self._metrics_view = metrics_view
         self._profile = profile
@@ -45,8 +72,17 @@ class L2TriggerMiddleware(AgentMiddleware):
     def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         """L1 graph after_model 末尾轻量检查。
 
-        不修改 ThreadState（返 None，INV-4）。
-        命中阈值时 enqueue EvolutionTask 到 queue。
+        流程：
+        1. _should_trigger(state) 委托 TriggerManager 判定。
+        2. 命中 → _enqueue_evolution_task(快照 ID)。
+        3. 始终返回 None（不修改 ThreadState）。
+
+        Args:
+            state: ThreadState（只读）。
+            runtime: LangGraph runtime（未使用）。
+
+        Returns:
+            始终 None。
         """
         if not self._should_trigger(state):
             return None
@@ -59,16 +95,30 @@ class L2TriggerMiddleware(AgentMiddleware):
         return self.after_model(state, runtime)
 
     def _should_trigger(self, state: Any) -> bool:
-        """纯数值判断：检查 metrics 阈值 + 1h 冷却窗口（不调 LLM，INV-4）。
+        """纯数值判断：委托 TriggerManager.should_trigger（四源 + 1h 冷却，不调 LLM）。
 
-        委托 TriggerManager.should_trigger（四源 + 节流）。
+        Args:
+            state: ThreadState（本方法未使用，预留）。
+
+        Returns:
+            是否应触发。
         """
         return self._trigger_manager.should_trigger(
             self._metrics_view, self._profile
         )
 
     def _extract_snapshot_id(self, state: Any) -> str:
-        """从 ThreadState 提取 snapshot_id（用于 EvolutionTask.task_id）。"""
+        """从 ThreadState 提取 snapshot_id（用作 EvolutionTask.task_id）。
+
+        查找顺序：state.metadata.snapshot_id > state.metadata.thread_id。
+        都找不到返回空串。
+
+        Args:
+            state: ThreadState。
+
+        Returns:
+            快照 ID 或空串。
+        """
         if isinstance(state, dict):
             metadata = state.get("metadata") or {}
             if isinstance(metadata, dict):
@@ -78,8 +128,15 @@ class L2TriggerMiddleware(AgentMiddleware):
         return ""
 
     def _enqueue_evolution_task(self, snapshot_id: str) -> None:
-        """enqueue EvolutionTask 到 queue（daemon thread 消费）。 决定 per-profile 串行。
-        trigger_source 由 TriggerManager.should_trigger 返回的 last_trigger 决定。
+        """enqueue EvolutionTask 到 queue（daemon thread 消费）。
+
+        - task_id: snapshot_id，空则用 l2_<时间戳> 兜底。
+        - trigger_source: TriggerManager.last_trigger_source，None 时用 PERIODIC 兜底。
+        - trigger_detail: TriggerManager.last_trigger_detail。
+        - per-profile 串行由 daemon 单线程消费保证。
+
+        Args:
+            snapshot_id: 从 state 提取的快照 ID。
         """
         trigger_source = self._trigger_manager.last_trigger_source or TriggerSource.PERIODIC
         task = EvolutionTask(

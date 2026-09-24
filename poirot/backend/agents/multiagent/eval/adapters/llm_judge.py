@@ -1,13 +1,33 @@
-"""L3 LLMJudgeAdapter — LLM 4 维加权评分 eval.
+"""L3 LLMJudgeAdapter — LLM 四维加权评分评估器。
 
-设计（43 文档 §4.3.2 + §11.2 L3-3.1 + spec.md LLMJudgeAdapter Requirement）:
-- WEIGHTS 复用 skill TaskQualityJudge 权重值（0.50/0.35/0.05/0.10，不实现 skill Protocol——skill 是 async，L3 是 sync）
-- judge_fn(artifact, task) → float [0,1]：bootstrap 注入（内部跑 specialist + LLM 4 维评分 + 加权汇总）
-- 复用 L2 _wilson_ci（import from evolution/promotion_gate）
-- task 异常 skip（fail-closed，不降级——降级由 Bridge 层选 programmatic adapter）
-- 全 task 失败返 success=False
-- llm_judge_model 默认 None（继承 lead，R2.5 同 L2 EvolutionMutator）
-- health_check: judge_fn 非 None 时 True
+【整体职责】
+实现 EvalAdapter 契约：用 LLM 对 candidate / baseline 在任务样本上打分，
+四维加权汇总为 [0,1] 分数，再算 Wilson 95% 置信区间，返回 EvalResult。
+评分函数 judge_fn 由 bootstrap 注入。
+
+【内容摘要】
+- JudgeFn                     : 评分函数类型别名（artifact + task → float [0,1]）。
+- LLMJudgeAdapter             : 评估器主类，实现 evaluate + health_check。
+- WEIGHTS                     : 四维权重常量（task_completion / response_quality /
+                                efficiency / tool_usage）。
+
+【职责边界】
+- 只负责：遍历 task_sample 调 judge_fn、聚合分数、算 Wilson CI、返回 EvalResult。
+- 不负责：judge_fn 的实现（bootstrap 注入）、评估方法选择（Bridge 负责）、
+  结果持久化（db 负责）。
+- 不持有运行时状态：judge_fn / model / z 由构造注入。
+
+【INVARIANT】
+- 实现 EvalAdapter Protocol（evaluate + health_check）——无需显式继承。
+- WEIGHTS 与 skill TaskQualityJudge 一致（0.50 / 0.35 / 0.05 / 0.10），
+  但不实现 skill Protocol——skill 是 async，L3 是 sync。
+- judge_fn 为 None → evaluate 返回 success=False + failure_reason="no judge_fn configured"。
+- 单任务异常 → 跳过（continue）；全 task 失败 → success=False + "all_tasks_failed"。
+- 分数裁剪到 [0.0, 1.0]（max/min 双向 clamp）。
+- 置信区间用 Wilson CI（_wilson_ci），z_score 默认 1.96（95%）。
+- llm_judge_model 默认 None：继承 lead 模型（与 L2 EvolutionMutator 同款）。
+- health_check：judge_fn 非 None 即可用。
+- 不复用 skill 的 TaskQualityJudge：skill 是 async，L3 是 sync。
 """
 from __future__ import annotations
 
@@ -21,18 +41,20 @@ from poirot.backend.agents.multiagent.evolution.promotion_gate import (
     _wilson_ci,
 )
 
+# 评分函数类型：接收 artifact 与 task，返回 [0,1] 分数。
 JudgeFn = Callable[[EvolutionArtifact, EvalTask], float]
 
 
 class LLMJudgeAdapter:
-    """LLM-judge eval——4 维加权评分 + Wilson 95% CI.
+    """LLM-judge 评估器——四维加权评分 + Wilson 95% CI。
 
-    实现 EvalAdapter Protocol（evaluate + health_check）.
-    WEIGHTS 复用 skill TaskQualityJudge 权重值（D-L3-13: 0.50*completion + 0.35*quality + 0.05*efficiency + 0.10*tool）.
-    不实现 skill TaskQualityJudge Protocol（skill 是 async，L3 是 sync，与 L1 D10 一致）.
-    judge_fn 由 bootstrap 注入（MVP None，数据驱动触发后才装配）.
+    实现 EvalAdapter Protocol（evaluate + health_check）。
+    WEIGHTS 与 skill TaskQualityJudge 一致，但不实现 skill Protocol
+    （skill 是 async，L3 是 sync）。
+    judge_fn 由 bootstrap 注入（MVP 可为 None，数据驱动触发后才装配）。
     """
 
+    # 四维权重：任务完成 / 响应质量 / 效率 / 工具使用。
     WEIGHTS = {
         "task_completion": 0.50,
         "response_quality": 0.35,
@@ -46,11 +68,27 @@ class LLMJudgeAdapter:
         llm_judge_model: str | None = None,
         z_score: float = 1.96,
     ) -> None:
+        """初始化。
+
+        Args:
+            judge_fn: 评分函数；为 None 时 evaluate 直接返回失败。
+            llm_judge_model: LLM 评判所用模型名；None 表示继承 lead 模型。
+            z_score: Wilson CI 的 z 值，默认 1.96（95% 置信度）。
+        """
         self._judge_fn = judge_fn
         self._llm_judge_model = llm_judge_model
         self._z = z_score
 
     def evaluate(self, ctx: EvalContext) -> EvalResult:
+        """对 task_sample 逐个评分 candidate / baseline，返回聚合 EvalResult。
+
+        流程：
+        1. judge_fn 为 None → 返回失败（no judge_fn configured）。
+        2. 遍历 task_sample，对 candidate / baseline 各调一次 judge_fn，分数 clamp 到 [0,1]。
+        3. 单任务异常 → 跳过；全部失败 → 返回失败（all_tasks_failed）。
+        4. 计算平均分 + Wilson CI。
+        5. 返回 EvalResult（success=True）。
+        """
         if self._judge_fn is None:
             return EvalResult(
                 candidate_score=0.0, baseline_score=0.0,
@@ -94,4 +132,5 @@ class LLMJudgeAdapter:
         )
 
     def health_check(self) -> bool:
+        """健康检查：judge_fn 已配置即可用。"""
         return self._judge_fn is not None
