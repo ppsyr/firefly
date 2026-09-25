@@ -65,7 +65,7 @@ def _tool_text(result: Any) -> str:
         result: 工具调用结果。
 
     Returns:
-        压平后的字符串。
+        str: 压平后的字符串。
     """
     if isinstance(result, ToolMessage):
         content = result.content
@@ -93,6 +93,12 @@ class OrchestrationMiddleware(AgentMiddleware):
     - specialist 失败：转 error ToolMessage（保证 pairing 完整性）
 
     非 delegate_to_* 工具直接透传。
+
+    Attributes:
+        state_schema: 状态 schema（ThreadState）。
+        _metrics: multiagent 指标存储。
+        _l2_trigger_middleware: L2 触发中间件（预留，未使用）。
+        _budget_guard: 预算守卫（预留，未使用）。
     """
 
     state_schema = ThreadState  # type: ignore[assignment]
@@ -132,7 +138,7 @@ class OrchestrationMiddleware(AgentMiddleware):
             result: specialist 工具返回结果。
 
         Returns:
-            是否成功。
+            bool: 是否成功。
         """
         text = _tool_text(result)
         try:
@@ -156,8 +162,8 @@ class OrchestrationMiddleware(AgentMiddleware):
             result: specialist 工具返回结果。
 
         Returns:
-            {"active_specialists": [specialist_name],
-             "specialist_artifacts": [ArtifactRef, ...]}
+            dict[str, Any]: {"active_specialists": [specialist_name],
+                "specialist_artifacts": [ArtifactRef, ...]}。
         """
         artifacts: list[ArtifactRef] = []
         text = _tool_text(result)
@@ -216,7 +222,7 @@ class OrchestrationMiddleware(AgentMiddleware):
             result: specialist 工具返回结果。
 
         Returns:
-            orchestration 更新 dict。
+            dict[str, Any]: orchestration 更新 dict。
         """
         success = self._is_success(result)
         if self._metrics:
@@ -250,7 +256,7 @@ class OrchestrationMiddleware(AgentMiddleware):
             specialist_name: 本次调用的 specialist 名。
 
         Returns:
-            带 error ToolMessage 与 orchestration 的 Command。
+            Command: 带 error ToolMessage 与 orchestration 的 Command。
         """
         call_id = request.tool_call.get("id", "")
         error_msg = ToolMessage(
@@ -290,8 +296,8 @@ class OrchestrationMiddleware(AgentMiddleware):
             handler: 下游处理函数。
 
         Returns:
-            delegate_to_* 时返回 Command（带 messages / orchestration）；
-            其他工具返回 handler 结果。
+            Any: delegate_to_* 时返回 Command（带 messages / orchestration）；
+                其他工具返回 handler 结果。
         """
         tool_name = request.tool_call.get("name", "")
         if not self._is_delegate_tool(tool_name):
@@ -337,8 +343,8 @@ class OrchestrationMiddleware(AgentMiddleware):
             handler: 下游异步处理函数。
 
         Returns:
-            delegate_to_* 时返回 Command（带 messages / orchestration）；
-            其他工具返回 handler 结果。
+            Any: delegate_to_* 时返回 Command（带 messages / orchestration）；
+                其他工具返回 handler 结果。
         """
         tool_name = request.tool_call.get("name", "")
         if not self._is_delegate_tool(tool_name):

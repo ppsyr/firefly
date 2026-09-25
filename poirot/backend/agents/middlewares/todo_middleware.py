@@ -1,5 +1,23 @@
 """TodoMiddleware — 扩展 TodoListMiddleware，增加上下文丢失检测与 Nag 提醒。
 
+【整体职责】
+在继承 TodoListMiddleware（write_todos 工具 + system prompt 注入）的基础上，
+增加三层保护：上下文丢失检测、完成度强制、Nag 双阈值提醒。
+
+【内容摘要】
+- 常量：_STEPS_SINCE_WRITE_THRESHOLD / _STEPS_SINCE_REMINDER_THRESHOLD /
+  _NAG_MIN_TODOS / _MAX_COMPLETION_REMINDERS。
+- 辅助函数：_todos_in_messages / _count_write_todos / _reminder_in_messages /
+  _format_todos / _format_completion_reminder / _infer_current_step_id /
+  _has_tool_call_intent / _has_persistent_failures / _err_field。
+- TodoMiddleware：扩展中间件（before_agent / before_model / after_model /
+  wrap_model_call / after_agent 五个钩子 + 多张状态表）。
+
+【职责边界】
+- 只负责：上下文丢失检测、完成度强制、Nag 提醒、current_step_id 派生。
+- 不负责：write_todos 工具的实现与 system prompt 注入（基类）、
+  停滞检测（StallDetection）、jump 预算的通用管理（_jump_budget 模块）。
+
 【三层保护】
 1. before_model：上下文丢失检测
    —— write_todos 的调用被上下文截断后，历史里看不到 todo，
@@ -16,8 +34,18 @@
 
 【继承关系】
 继承 TodoListMiddleware，复用基类的 write_todos 工具注册与 system prompt 注入。
-"""
 
+【INVARIANT】
+- enforce_completion 开关：False → default 模式不强制完成度（软引导仍保留）。
+- 完成度强制最多 _MAX_COMPLETION_REMINDERS 次（防死循环）。
+- 与 Reflection 共享 jump 预算（_jump_budget，合计 ≤3）。
+- 工具持续失败（attempt ≥ 3）时放行退出（产带缺口报告）。
+- 只拦截「干净的最终答案」（无工具调用意图）。
+- 完成度提醒用队列延迟到 wrap_model_call 注入（避免破坏配对）。
+- Nag 双阈值（AND）触发；触发后只重置 steps_since_reminder。
+- 按 (thread_id, run_id) 分组的状态表；before_agent / after_agent 清理。
+- 同步 / 异步行为一致（异步委托同步）。
+"""
 from __future__ import annotations
 
 import threading
@@ -51,7 +79,7 @@ def _todos_in_messages(messages: list[Any]) -> bool:
         messages: 消息列表。
 
     Returns:
-        是否存在 write_todos 调用。
+        bool: 是否存在 write_todos 调用。
     """
     for msg in messages:
         if isinstance(msg, AIMessage) and msg.tool_calls:
@@ -70,7 +98,7 @@ def _count_write_todos(messages: list[Any]) -> int:
         messages: 消息列表。
 
     Returns:
-        write_todos 调用次数。
+        int: write_todos 调用次数。
     """
     count = 0
     for msg in messages:
@@ -90,7 +118,7 @@ def _reminder_in_messages(messages: list[Any]) -> bool:
         messages: 消息列表。
 
     Returns:
-        是否已存在 todo_reminder。
+        bool: 是否已存在 todo_reminder。
     """
     for msg in messages:
         if isinstance(msg, HumanMessage) and getattr(msg, "name", None) == "todo_reminder":
@@ -113,7 +141,7 @@ def _format_completion_reminder(todos: list[Todo]) -> str:
         todos: 全部 todos。
 
     Returns:
-        渲染后的提醒文本。
+        str: 渲染后的提醒文本。
     """
     incomplete = [t for t in todos if t.get("status") != "completed"]
     lines = "\n".join(f"- [{t.get('status', 'pending')}] {t.get('content', '')}" for t in incomplete)
@@ -134,7 +162,7 @@ def _infer_current_step_id(last_ai: AIMessage | None) -> str | None:
         last_ai: 最新的 AIMessage，可为 None。
 
     Returns:
-        形如 "todo-{index}" 的步骤 id；无则 None。
+        str | None: 形如 "todo-{index}" 的步骤 id；无则 None。
     """
     if not last_ai or not getattr(last_ai, "tool_calls", None):
         return None
@@ -163,7 +191,7 @@ def _has_tool_call_intent(message: AIMessage) -> bool:
         message: AIMessage。
 
     Returns:
-        是否有工具调用意图。
+        bool: 是否有工具调用意图。
     """
     if message.tool_calls:
         return True
@@ -188,7 +216,7 @@ def _has_persistent_failures(state: Any) -> bool:
         state: 当前 state（需为 dict）。
 
     Returns:
-        是否存在持续失败的工具。
+        bool: 是否存在持续失败的工具。
     """
     if not isinstance(state, dict):
         return False
@@ -216,10 +244,15 @@ class TodoMiddleware(TodoListMiddleware):
 
     内部按 (thread_id, run_id) 或 thread_id 维护多张表：
     - _pending_completion_reminders：待注入的完成度提醒；
-    - _completion_reminder_counts：  完成度强制已用次数；
-    - _steps_since_write：           距上次 write_todos 的步数；
-    - _steps_since_reminder：        距上次 Nag 提醒的步数；
-    - _last_write_count：            上次记录的 write_todos 总次数。
+    - _completion_reminder_counts：完成度强制已用次数；
+    - _steps_since_write：距上次 write_todos 的步数；
+    - _steps_since_reminder：距上次 Nag 提醒的步数；
+    - _last_write_count：上次记录的 write_todos 总次数。
+
+    Attributes:
+        state_schema: 状态 schema（ThreadState）。
+        _enforce_completion: 是否启用完成度强制。
+        _lock: 保护状态表的锁。
     """
 
     state_schema = ThreadState  # type: ignore[assignment]
@@ -285,11 +318,12 @@ class TodoMiddleware(TodoListMiddleware):
         5. 都不触发 → None。
 
         Args:
-            state:   当前 ThreadState，读取 todos / messages。
+            state: 当前 ThreadState，读取 todos / messages。
             runtime: LangGraph 运行时，读取 thread_id / run_id。
 
         Returns:
-            含注入 HumanMessage 的 state patch；无注入时返回 None。
+            dict[str, Any] | None: 含注入 HumanMessage 的 state patch；
+                无注入时返回 None。
         """
         todos: list[Todo] = state.get("todos") or []  # type: ignore[assignment]
         messages = state.get("messages") or []
@@ -412,11 +446,11 @@ class TodoMiddleware(TodoListMiddleware):
         hook_config(can_jump_to=["model"]) 允许这个 hook 跳到 model 节点。
 
         Args:
-            state:   当前 ThreadState，读取 messages / todos / errors。
+            state: 当前 ThreadState，读取 messages / todos / errors。
             runtime: LangGraph 运行时，读取 thread_id / run_id。
 
         Returns:
-            {"jump_to": "model", "current_step_id": ...} 或 None。
+            dict[str, Any] | None: {"jump_to": "model", "current_step_id": ...} 或 None。
         """
         # 1. Preserve base class logic (parallel write_todos detection).
         base_result = super().after_model(state, runtime)
@@ -491,7 +525,7 @@ class TodoMiddleware(TodoListMiddleware):
             handler: 下游处理函数。
 
         Returns:
-            handler 返回的模型调用结果。
+            ModelResponse: handler 返回的模型调用结果。
         """
         reminders = self._drain_completion_reminders(request.runtime)
         if not reminders:
@@ -519,7 +553,7 @@ class TodoMiddleware(TodoListMiddleware):
             handler: 下游异步处理函数。
 
         Returns:
-            下游返回的模型调用结果。
+            ModelResponse: 下游返回的模型调用结果。
         """
         reminders = self._drain_completion_reminders(request.runtime)
         if not reminders:
@@ -543,11 +577,11 @@ class TodoMiddleware(TodoListMiddleware):
         """同步 before_agent：清理其他 run 的陈旧状态 + 重置 Nag 计数。
 
         Args:
-            state:   当前 ThreadState（未使用）。
+            state: 当前 ThreadState（未使用）。
             runtime: LangGraph 运行时，读取 thread_id / run_id。
 
         Returns:
-            始终 None。
+            dict[str, Any] | None: 始终 None。
         """
         self._clear_other_runs(runtime)
         self._reset_nag_counters(runtime)
@@ -565,18 +599,18 @@ class TodoMiddleware(TodoListMiddleware):
         """同步 after_agent：清空当前 run 的完成度状态 + 清空 jump 预算。
 
         Args:
-            state:   当前 ThreadState（未使用）。
+            state: 当前 ThreadState（未使用）。
             runtime: LangGraph 运行时，读取 thread_id / run_id。
 
         Returns:
-            始终 None。
+            dict[str, Any] | None: 始终 None。
         """
         self._clear_run_state(runtime)
         _jump_budget.clear(runtime)
         return None
 
     @override
-    async def after_agent(self, state: ThreadState, runtime: Runtime) -> dict[str, Any] | None:
+    async def aafter_agent(self, state: ThreadState, runtime: Runtime) -> dict[str, Any] | None:
         """异步 after_agent：与同步版一致。"""
         self._clear_run_state(runtime)
         _jump_budget.clear(runtime)

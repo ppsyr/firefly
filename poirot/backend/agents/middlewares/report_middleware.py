@@ -5,6 +5,21 @@
 就单独调一次 LLM，基于 observations + sources + errors 合成一份结构化
 Markdown 报告，写回 state["final_report"]。
 
+【内容摘要】
+- get_reporter_system   : 加载 reporter 系统 prompt。
+- _format_observations  : observations 格式化为可读文本。
+- _format_sources       : sources 格式化为可读文本。
+- _format_errors        : errors 汇总为可读文本（只展示 failure）。
+- _field                : 统一字段访问（dict / 对象）。
+- _build_reporter_messages : 构造 reporter 调用的 messages。
+- ReportMiddleware      : 中间件主体（after_agent 条件合成）。
+- _synthesize / _asynthesize : 同步 / 异步合成报告。
+
+【职责边界】
+- 只负责：ReAct 循环结束后基于 observations 独立合成 final_report。
+- 不负责：observations / sources / errors 的收集（Evidence / ToolCall 中间件）、
+  报告的展示（CLI / TUI）、报告 artifact 的保存（LeaderAgent.run / reporting）。
+
 【为什么不复用最后一条 AIMessage】
 不再赌「最后一条 AIMessage 就是最终答案」（deer-flow 模式），
 而是独立发起一次报告合成调用，由专门的 reporter prompt 生成报告。
@@ -14,8 +29,15 @@ Markdown 报告，写回 state["final_report"]。
 
 【MVP 说明】
 MVP 阶段复用 researcher 模型来当 reporter（D5）。
-"""
 
+【INVARIANT】
+- 只在 auto_synthesize 为真（expert 模式）时合成。
+- 只在 observations 非空时合成。
+- 合成在 interrupt_protection() 内进行（防中断破坏原子性）。
+- 合成 LLM 调用带 tag="internal_llm"（防输出泄漏到 CLI）。
+- final_report 写回 state["final_report"]（merge_final_report last-write-wins）。
+- 同步 / 异步行为一致（异步仅 invoke 改 ainvoke）。
+"""
 from __future__ import annotations
 
 from typing import Any, override
@@ -40,7 +62,7 @@ def _format_observations(observations: list[Any]) -> str:
     处理流程：
     1. 空列表 → "（无观察记录）"。
     2. 逐条输出：
-       "[{observation_id}] (step={step_id}, sources={source_refs})\n{content}"。
+       "[{observation_id}] (step={step_id}, sources={source_refs})\\n{content}"。
        - observation_id 缺省 "?"；
        - step_id 缺省 "-"；
        - content 缺省 ""；
@@ -51,7 +73,7 @@ def _format_observations(observations: list[Any]) -> str:
         observations: Observation 列表。
 
     Returns:
-        格式化文本。
+        str: 格式化文本。
     """
     if not observations:
         return "（无观察记录）"
@@ -80,7 +102,7 @@ def _format_sources(sources: list[Any]) -> str:
         sources: Source 列表。
 
     Returns:
-        格式化文本。
+        str: 格式化文本。
     """
     if not sources:
         return "（无来源）"
@@ -111,7 +133,7 @@ def _format_errors(errors: list[Any]) -> str:
         errors: AgentError 列表。
 
     Returns:
-        格式化文本；无失败时返回空串。
+        str: 格式化文本；无失败时返回空串。
     """
     failures = [e for e in errors if _field(e, "kind") != "success"]
     if not failures:
@@ -155,7 +177,7 @@ def _build_reporter_messages(state: dict[str, Any]) -> list[Any]:
         state: 当前 state（dict）。
 
     Returns:
-        reporter 调用的消息列表。
+        list[Any]: reporter 调用的消息列表。
     """
     question = state.get("research_question") or state.get("user_input") or "Research report"
     observations = state.get("observations") or []
@@ -179,6 +201,11 @@ class ReportMiddleware(AgentMiddleware):
     """after_agent 阶段独立合成 final_report。MVP 复用 researcher 模型（D5）。
 
     只在 observations 非空且 auto_synthesize 为真时才合成。
+
+    Attributes:
+        state_schema: 状态 schema（ThreadState）。
+        _model: 用于合成报告的 LLM。
+        _auto_synthesize: 是否自动合成。
     """
 
     state_schema = ThreadState  # type: ignore[assignment]
@@ -187,9 +214,9 @@ class ReportMiddleware(AgentMiddleware):
         """初始化。
 
         Args:
-            model:            用于合成报告的 LLM（MVP 复用 researcher 模型）。
-            auto_synthesize:  是否自动合成。
-                True  → after_agent 自动合成；
+            model: 用于合成报告的 LLM（MVP 复用 researcher 模型）。
+            auto_synthesize: 是否自动合成。
+                True → after_agent 自动合成；
                 False → default 模式，报告靠 /report 命令触发。
         """
         self._model = model
@@ -208,7 +235,7 @@ class ReportMiddleware(AgentMiddleware):
             state: 当前 state（dict）。
 
         Returns:
-            报告正文文本。
+            str: 报告正文文本。
         """
         from poirot.backend.agents.observability.interrupt_protection import (
             interrupt_protection,
@@ -225,7 +252,7 @@ class ReportMiddleware(AgentMiddleware):
             state: 当前 state（dict）。
 
         Returns:
-            报告正文文本。
+            str: 报告正文文本。
         """
         from poirot.backend.agents.observability.interrupt_protection import (
             interrupt_protection,
@@ -246,11 +273,12 @@ class ReportMiddleware(AgentMiddleware):
         4. 返回 {"final_report": report}。
 
         Args:
-            state:   当前 ThreadState。
+            state: 当前 ThreadState。
             runtime: LangGraph 运行时（本 hook 未使用）。
 
         Returns:
-            含 final_report 的 state patch；无 observations 时返回 None。
+            dict[str, Any] | None: 含 final_report 的 state patch；
+                无 observations 时返回 None。
         """
         # default 模式（auto_synthesize=False）：不自动合成，报告靠 /report 命令触发。
         if not self._auto_synthesize:
@@ -272,11 +300,12 @@ class ReportMiddleware(AgentMiddleware):
         4. 返回 {"final_report": report}。
 
         Args:
-            state:   当前 ThreadState。
+            state: 当前 ThreadState。
             runtime: LangGraph 运行时（本 hook 未使用）。
 
         Returns:
-            含 final_report 的 state patch；无 observations 时返回 None。
+            dict[str, Any] | None: 含 final_report 的 state patch；
+                无 observations 时返回 None。
         """
         if not self._auto_synthesize:
             return None

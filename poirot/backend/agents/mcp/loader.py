@@ -1,11 +1,36 @@
 """MCP 连接生命周期 — eager 并行加载 + 按需 refresh + 安全层应用。
 
-INVARIANT:
-- load_startup: asyncio.gather 并行连接所有 enabled server，单 server 失败不阻塞
-- per server: EnvFilter.check_env → MultiServerMCPClient → get_tools → DescriptionScanner → ToolRegistry.register
-- refresh: 仅重连 unhealthy server，增量更新 registry
-- shutdown: 清理所有连接
-- guards 按顺序应用：EnvFilter → DescriptionScanner
+【整体职责】
+管理 MCP server 的连接生命周期：启动时并行连接所有 enabled server、发现并注册工具
+（经安全守卫过滤），运行时按需 refresh 重连，退出时清理连接。
+
+【内容摘要】
+- _SDK_TRANSPORT_MAP  : config transport → SDK transport 映射。
+- _build_connection   : McpServerConfig → SDK connection dict。
+- McpLoader.__init__  : 持有 config / registry / guards / clients。
+- _get_env_guard / _get_description_guard : 按类型取 guard。
+- _connect_server     : 连接单个 server，发现并注册工具。
+- _register_tools     : 注册工具（include/exclude 过滤 + 描述扫描）。
+- load_startup        : 并行连接所有 enabled server（单 server 失败不阻塞）。
+- refresh             : 重连 server，增量更新 registry。
+- shutdown            : 清理所有连接。
+- sanitizer           : 暴露给 audit middleware 用。
+
+【职责边界】
+- 只负责：连接建立、工具发现与注册、连接清理、守卫应用。
+- 不负责：配置加载（mcp/config）、工具条目定义（mcp/registry）、
+  守卫实现（mcp/guards）、运行时熔断与审计（McpAuditMiddleware）。
+
+【INVARIANT】
+- load_startup: asyncio.gather 并行连接所有 enabled server，单 server 失败不阻塞。
+- per server: EnvFilter.check_env → MultiServerMCPClient → get_tools →
+  DescriptionScanner → ToolRegistry.register。
+- refresh: 仅重连 unhealthy server，增量更新 registry。
+- shutdown: 清理所有连接。
+- guards 按顺序应用：EnvFilter → DescriptionScanner。
+- 连接超时：asyncio.wait_for 按 server.connect_timeout 限制。
+- 注册幂等：registry.register 同名先入者保留。
+- 失败不崩：单 server 连接失败仅 logger.error + mark_unhealthy，其余继续。
 """
 from __future__ import annotations
 
@@ -32,7 +57,15 @@ _SDK_TRANSPORT_MAP = {"stdio": "stdio", "sse": "sse", "http": "streamable_http"}
 
 
 def _build_connection(server: McpServerConfig, filtered_env: dict[str, str]) -> dict[str, Any]:
-    """McpServerConfig → SDK connection dict（适配 transport 字段名）。"""
+    """McpServerConfig → SDK connection dict（适配 transport 字段名）。
+
+    Args:
+        server: server 配置。
+        filtered_env: 经 EnvFilter 过滤后的环境变量。
+
+    Returns:
+        dict[str, Any]: SDK 可消费的 connection 字典。
+    """
     transport = _SDK_TRANSPORT_MAP.get(server.transport, "stdio")
     conn: dict[str, Any] = {"transport": transport}
     if transport == "stdio":
@@ -50,6 +83,14 @@ class McpLoader:
 
     持有 config + registry + guards 列表。
     load_startup 并行连接，refresh 重连失败 server，shutdown 清理。
+
+    Attributes:
+        _config: MCP 配置。
+        _registry: 工具注册表。
+        _guards: 安全守卫列表（EnvFilter / DescriptionScanner）。
+        _sanitizer: 凭证清洗器。
+        _clients: server 名 → SDK 客户端。
+        _lock: refresh 串行锁。
     """
 
     def __init__(
@@ -58,6 +99,13 @@ class McpLoader:
         registry: ToolRegistry,
         guards: list[SecurityGuard] | None = None,
     ) -> None:
+        """初始化。
+
+        Args:
+            config: MCP 配置。
+            registry: 工具注册表。
+            guards: 安全守卫列表；为 None 时用默认 [EnvFilter(), DescriptionScanner()]。
+        """
         self._config = config
         self._registry = registry
         self._guards = guards or [
@@ -83,7 +131,17 @@ class McpLoader:
         return None
 
     async def _connect_server(self, server: McpServerConfig) -> list[BaseTool]:
-        """连接单个 server，发现并注册工具。失败 raise，由 load_startup 捕获。"""
+        """连接单个 server，发现并注册工具。失败 raise，由 load_startup 捕获。
+
+        Args:
+            server: server 配置。
+
+        Returns:
+            list[BaseTool]: 已注册的工具列表。
+
+        Raises:
+            RuntimeError: 连接超时。
+        """
         env_guard = self._get_env_guard()
         filtered_env = env_guard.check_env(server.env) if env_guard else dict(server.env)
         connection = _build_connection(server, filtered_env)
@@ -100,7 +158,15 @@ class McpLoader:
         return registered
 
     def _register_tools(self, server: McpServerConfig, tools: list[BaseTool]) -> list[BaseTool]:
-        """注册工具到 registry，应用 include/exclude 过滤 + 描述扫描。"""
+        """注册工具到 registry，应用 include/exclude 过滤 + 描述扫描。
+
+        Args:
+            server: server 配置。
+            tools: 从 server 发现的工具列表。
+
+        Returns:
+            list[BaseTool]: 实际注册成功的工具列表。
+        """
         desc_guard = self._get_description_guard()
         include_set = set(server.include_tools) if server.include_tools else None
         exclude_set = set(server.exclude_tools)
@@ -135,6 +201,9 @@ class McpLoader:
         """并行连接所有 enabled server，单 server 失败不阻塞。
 
         per server 失败 → logger.error + mark_unhealthy，其余继续。
+
+        Returns:
+            list[BaseTool]: 全部已注册工具。
         """
         enabled_servers = [s for s in self._config.servers.values() if s.enabled]
         if not enabled_servers:

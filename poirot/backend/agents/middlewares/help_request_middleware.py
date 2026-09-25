@@ -7,14 +7,33 @@
 3. 返回 Command(goto=END) 暂停 graph，把控制权交回用户；
 4. 向 journal 写一条 help.requested 事件。
 
+【内容摘要】
+- _HELP_TYPE_ICONS    : help_type → 展示图标映射。
+- _format_help_message: 把 ask_help 参数格式化成给用户看的求助文本。
+- HelpRequestMiddleware.wrap_tool_call  : 同步拦截（ask_help 暂停，其余透传）。
+- HelpRequestMiddleware.awrap_tool_call : 异步拦截（逻辑同同步版）。
+- HelpRequestMiddleware._handle_help    : 格式化 + 写 journal + 返回 Command。
+
+【职责边界】
+- 只负责：拦截 ask_help、格式化求助消息、写 journal、暂停 graph。
+- 不负责：ask_help 的实际工具实现（不执行）、求助的触发来源
+  （ask_help 工具由 LLM 决定调用）、HITL 的后续处理（由上层用户响应）。
+
 【模式来源】
-借鉴 deer-flow ClarificationMiddleware 的「拦截工具调用 → 暂停 graph」
-模式。
+借鉴 deer-flow ClarificationMiddleware 的「拦截工具调用 → 暂停 graph」模式。
 
 【触发条件】
 只看 tool_call["name"] == "ask_help"；其他工具一律透传给下游 handler。
-"""
 
+【INVARIANT】
+- 只拦截 ask_help 一个工具；其他工具直接透传 handler。
+- 不调用 handler（ask_help 的实际实现不执行）。
+- 返回 Command(goto=END) 暂停 graph，把控制权交回用户。
+- 同步 / 异步路径共用 _handle_help 实现（逻辑一致）。
+- 写 journal "help.requested"（含 run_id / help_type / question）。
+- journal 为 None 时静默跳过（容忍运行环境缺件）。
+- help_type 缺省 "missing_info"，图标未命中用 "❓"。
+"""
 from __future__ import annotations
 
 from typing import Any, override
@@ -53,7 +72,7 @@ def _format_help_message(args: dict[str, Any]) -> str:
               context / options。
 
     Returns:
-        格式化后的求助文本。
+        str: 格式化后的求助文本。
     """
     question = args.get("question", "")
     help_type = args.get("help_type", "missing_info")
@@ -89,7 +108,7 @@ class HelpRequestMiddleware(AgentMiddleware):
             handler: 下游处理函数。
 
         Returns:
-            ask_help 时返回 Command(goto=END)；其他工具返回 handler 结果。
+            Any: ask_help 时返回 Command(goto=END)；其他工具返回 handler 结果。
         """
         tool_call = getattr(request, "tool_call", None) or {}
         if tool_call.get("name") != "ask_help":
@@ -110,7 +129,7 @@ class HelpRequestMiddleware(AgentMiddleware):
             handler: 下游异步处理函数。
 
         Returns:
-            ask_help 时返回 Command(goto=END)；其他工具返回 handler 结果。
+            Any: ask_help 时返回 Command(goto=END)；其他工具返回 handler 结果。
         """
         tool_call = getattr(request, "tool_call", None) or {}
         if tool_call.get("name") != "ask_help":
@@ -135,11 +154,11 @@ class HelpRequestMiddleware(AgentMiddleware):
         注意：本方法不调用 handler，即 ask_help 的实际工具实现不会被执行。
 
         Args:
-            request:   工具调用请求，用于取 runtime。
+            request: 工具调用请求，用于取 runtime。
             tool_call: 已确认 name == "ask_help" 的工具调用结构。
 
         Returns:
-            带 messages 更新且 goto=END 的 Command。
+            Command: 带 messages 更新且 goto=END 的 Command。
         """
         args = tool_call.get("args", {})
         tool_call_id = tool_call.get("id", "")

@@ -11,6 +11,20 @@
 4. 硬预算：per-run 工具调用总数达到 hard_budget 时，短路禁用所有工具，
    强制模型基于现有证据收尾。
 
+【内容摘要】
+- 常量：_RETRY_BUDGET / _HARD_BUDGET / _SUMMARY_THRESHOLDS / _REASON_MAP。
+- 正则：_BLOCKED_RE / _EMPTY_RE。
+- 辅助函数：_make_id / _now_iso / _tool_text / _classify_exception /
+  _classify_business_failure / _reason_for / _is_failure / _latest_attempt /
+  _total_calls / _field。
+- ToolCallMiddleware：账本 + 预算 + 重试（含 before_agent / before_model /
+  wrap_tool_call / awrap_tool_call + 内部辅助）。
+
+【职责边界】
+- 只负责：工具调用账本、失败分类、重试预算、硬预算、失败摘要延迟注入。
+- 不负责：工具的执行（handler）、熔断器（MCP 专属）、审计日志（McpAudit）、
+  evidence 抽取（EvidenceMiddleware）。
+
 【数据来源】
 per-tool 连续失败次数、全局调用数，都从 state.errors 派生（不另存计数器）。
 per-run 计数用 before_agent 记录的 baseline 做切片，避免跨 run 累积。
@@ -26,8 +40,16 @@ per-run 计数用 before_agent 记录的 baseline 做切片，避免跨 run 累�
 failure_summary / budget_exhausted 提示不在 wrap_tool_call 里直接注入
 HumanMessage（那会插在并行 tool_calls 的多条 ToolMessage 之间，破坏配对），
 而是先入队，等 before_model（此时 ToolMessage 已全部就位）再 drain 注入。
-"""
 
+【INVARIANT】
+- 成败都记账本：success / failure 各写一条 AgentError 到 state.errors。
+- per-tool 连续失败用 attempt 字段派生（成功归 0）。
+- per-run 计数用 baseline 切片（before_agent 记录）。
+- 异常或 result=None 时合成 ToolMessage 补 tool_call_id（配对完整性）。
+- 失败摘要入队延迟注入（避免破坏并行 tool_calls 配对）。
+- 重试 / 硬预算短路时返回 Command（不调 handler）。
+- 每个 hook 同步 / 异步版本行为一致（异步委托同步）。
+"""
 from __future__ import annotations
 
 import re
@@ -89,7 +111,7 @@ def _tool_text(result: Any) -> str:
         result: 工具调用结果。
 
     Returns:
-        压平后的字符串。
+        str: 压平后的字符串。
     """
     if isinstance(result, ToolMessage):
         content = result.content
@@ -121,7 +143,7 @@ def _classify_exception(exc: Exception) -> str:
         exc: 捕获到的异常。
 
     Returns:
-        错误类型字符串。
+        str: 错误类型字符串。
     """
     if isinstance(exc, (TimeoutError, ConnectionError)):
         return "network"
@@ -154,7 +176,7 @@ def _classify_business_failure(text: str) -> str | None:
         text: 工具结果的文本内容。
 
     Returns:
-        错误类型或 None。
+        str | None: 错误类型或 None。
     """
     if _BLOCKED_RE.search(text):
         return "blocked"
@@ -185,7 +207,7 @@ def _is_failure(result: Any) -> tuple[str, str] | None:
         result: 工具调用结果。
 
     Returns:
-        (error_type, reason) 或 None。
+        tuple[str, str] | None: (error_type, reason) 或 None。
     """
     if isinstance(result, ToolMessage) and getattr(result, "status", None) == "error":
         # 内层已标 error（如 Evidence 捕获异常）—— 从 content 推断分类
@@ -211,11 +233,11 @@ def _latest_attempt(errors: list, tool_name: str) -> int:
     （取不到字段时按 0）。找不到该 tool 的条目返回 0。
 
     Args:
-        errors:    AgentError 列表。
+        errors: AgentError 列表。
         tool_name: 工具名。
 
     Returns:
-        该工具的当前连续失败次数。
+        int: 该工具的当前连续失败次数。
     """
     for err in reversed(errors):
         if _field(err, "tool_name") == tool_name:
@@ -241,6 +263,14 @@ class ToolCallMiddleware(AgentMiddleware):
     failure_summary + budget_exhausted 提示用队列延迟到 before_model 注入，
     避免在 wrap_tool_call 注入 HumanMessage 插在并行 tool_calls 的 ToolMessage 之间
     破坏 API pairing（AIMessage(tool_calls) 后必须紧跟 ToolMessage）。
+
+    Attributes:
+        state_schema: 状态 schema（ThreadState）。
+        _retry_budget: per-tool 连续失败上限。
+        _hard_budget: per-run 工具调用总数上限。
+        _lock: 保护队列与基线的锁。
+        _pending_summaries: 待注入摘要队列（按 (thread_id, run_id) 分组）。
+        _run_baselines: per-run 计数基线（errors 长度）。
     """
 
     state_schema = ThreadState  # type: ignore[assignment]
@@ -250,7 +280,7 @@ class ToolCallMiddleware(AgentMiddleware):
 
         Args:
             retry_budget: per-tool 连续失败上限，达到即禁该工具。
-            hard_budget:  per-run 工具调用总数上限，达到即禁所有工具。
+            hard_budget: per-run 工具调用总数上限，达到即禁所有工具。
         """
         self._retry_budget = retry_budget
         self._hard_budget = hard_budget
@@ -316,12 +346,23 @@ class ToolCallMiddleware(AgentMiddleware):
            与 run_baselines（避免旧 run 残留污染）。
 
         Args:
-            state:   当前 state，读取 errors。
+            state: 当前 state，读取 errors。
             runtime: LangGraph 运行时，读取 thread_id / run_id。
 
         Returns:
-            始终 None（只做基线记录与清理，不改 state）。
+            dict[str, Any] | None: 始终 None（只做基线记录与清理，不改 state）。
         """
+        # 记录 errors 基线（per-run 工具调用计数基准）
+        errors = state.get("errors") if isinstance(state, dict) else None
+        self._set_baseline(runtime, len(errors or []))
+        # 清理其他 run 的陈旧队列 + 基线
+        tid = str(_get_runtime_value(runtime, "thread_id", None) or "default")
+        rid = str(_get_runtime_value(runtime, "run_id", None) or "default")
+        with self._lock:
+            stale = [k for k in list(self._pending_summaries) if k[0] == tid and k[1] != rid]
+            for k in stale:
+                self._pending_summaries.pop(k, None)
+                self._run_baselines.pop(k, None)
         return None
 
     def _build_failure_summary(self, errors: list, tool_name: str) -> str:
@@ -333,11 +374,11 @@ class ToolCallMiddleware(AgentMiddleware):
         - 尾行：行动建议（换搜索词/换工具/换方法，或基于现有证据收尾）。
 
         Args:
-            errors:    当前 errors 列表（含刚追加的这条）。
+            errors: 当前 errors 列表（含刚追加的这条）。
             tool_name: 工具名。
 
         Returns:
-            多行摘要文本。
+            str: 多行摘要文本。
         """
         fails = [e for e in errors if _field(e, "tool_name") == tool_name and _field(e, "kind") == "failure"]
         lines = [f"工具 {tool_name} 已连续失败 {len(fails)} 次："]
@@ -373,9 +414,9 @@ class ToolCallMiddleware(AgentMiddleware):
 
         Args:
             request: 工具调用请求（含 tool_call / state / runtime）。
-            result:  handler 的返回值（异常路径传 None）。
+            result: handler 的返回值（异常路径传 None）。
             runtime: LangGraph 运行时。
-            exc:     捕获到的异常；无异常传 None。
+            exc: 捕获到的异常；无异常传 None。
 
         Returns:
             Command（带 errors 与 messages 更新）。
@@ -469,11 +510,12 @@ class ToolCallMiddleware(AgentMiddleware):
         HumanMessage 注入在 ToolMessage 之后不破坏 AIMessage(tool_calls)→ToolMessage pairing。
 
         Args:
-            state:   当前 state（本 hook 未直接使用）。
+            state: 当前 state（本 hook 未直接使用）。
             runtime: LangGraph 运行时，用于取队列。
 
         Returns:
-            含注入 HumanMessage 的 state patch；队列为空时返回 None。
+            dict[str, Any] | None: 含注入 HumanMessage 的 state patch；
+                队列为空时返回 None。
         """
         summaries = self._drain_summaries(runtime)
         if not summaries:
@@ -490,21 +532,6 @@ class ToolCallMiddleware(AgentMiddleware):
     async def abefore_model(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
         """异步 before_model：直接转调同步版，保证行为一致。"""
         return self.before_model(state, runtime)
-
-    @override
-    def before_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
-        # 记录 errors 基线（per-run 工具调用计数基准）
-        errors = state.get("errors") if isinstance(state, dict) else None
-        self._set_baseline(runtime, len(errors or []))
-        # 清理其他 run 的陈旧队列 + 基线
-        tid = str(_get_runtime_value(runtime, "thread_id", None) or "default")
-        rid = str(_get_runtime_value(runtime, "run_id", None) or "default")
-        with self._lock:
-            stale = [k for k in list(self._pending_summaries) if k[0] == tid and k[1] != rid]
-            for k in stale:
-                self._pending_summaries.pop(k, None)
-                self._run_baselines.pop(k, None)
-        return None
 
     @override
     def wrap_tool_call(
@@ -598,7 +625,7 @@ class ToolCallMiddleware(AgentMiddleware):
 
         # F8.5：硬预算短路——per-run
         if run_count >= self._hard_budget:
-            self._emit(request.runtime, "tool.budget_exhausted", {"count": run_count, "max": self._hard_budget})
+            self._emit(request.tool.runtime, "tool.budget_exhausted", {"count": run_count, "max": self._hard_budget})
             failure_msg = ToolMessage(
                 content=f"⚠️ 本轮工具调用已达预算上限（{self._hard_budget}），所有工具已禁用，请立即基于现有证据输出最终报告。",
                 tool_call_id=request.tool_call.get("id", ""),

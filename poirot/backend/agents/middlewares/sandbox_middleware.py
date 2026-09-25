@@ -4,6 +4,21 @@
 管理 sandbox 的「按需获取（lazy acquire）→ 跨轮复用 → 结束释放」生命周期，
 并把 present_files 的虚拟路径落成真实产出物 + 注册到 ArtifactServer。
 
+【内容摘要】
+- _VIRTUAL_PREFIX                : present_files 允许的虚拟路径前缀。
+- SandboxMiddleware.__init__      : 接收 provider / artifact_server / sandbox_root。
+- SandboxMiddleware.abefore_model : 从 state["sandbox"] 恢复 ContextVar。
+- SandboxMiddleware._emit_sandbox_acquired : 推 sandbox_update custom 事件。
+- SandboxMiddleware.awrap_tool_call : sandbox 工具按需 acquire + present_files 落产出物。
+- SandboxMiddleware._register_artifacts : 解析 / 复制 / 注册 present_files 产出物。
+- SandboxMiddleware.aafter_agent  : 释放本次 run 的 sandbox。
+
+【职责边界】
+- 只负责：sandbox 生命周期（acquire / release）、ContextVar 恢复、present_files
+  产出物落盘与注册、sandbox_update 事件推送。
+- 不负责：sandbox 的实际创建与销毁（provider）、工具执行（handler）、
+  路径翻译与安全校验（sandbox 子系统）、工具治理（ToolCallMiddleware）。
+
 【INVARIANT（必须保持的不变量）】
 - lazy_init 硬编码 True：没有 before_agent hook；sandbox 只有在
   sandbox 工具真正被调用时才 acquire。
@@ -17,8 +32,11 @@
 - aafter_agent release：release 不销毁（LocalSandboxProvider 为 no-op）。
 - Sandbox 中间件在中间件列表外层；ToolCall 在内层 catch SandboxError（Grill #9）。
 - 非 sandbox 工具（web_search 等）不触发 acquire。
+- ContextVar 已设则不覆盖（lead 同进程多轮场景）。
+- acquire 必须有 thread_id（缺失抛 SandboxRuntimeError）。
+- 产出物落点固定：.poirot/outputs/（用户总知道去哪找）。
+- 事件推送失败不影响主流程（仅记 debug）。
 """
-
 from __future__ import annotations
 
 import logging
@@ -59,6 +77,11 @@ class SandboxMiddleware(AgentMiddleware):
     - aafter_agent release：release 不销毁（LocalSandboxProvider no-op）。
     - Sandbox 在中间件列表外层；ToolCall 在内层 catch SandboxError（Grill #9）。
     - 非 sandbox 工具（web_search 等）不触发 acquire。
+
+    Attributes:
+        _provider: sandbox 提供者。
+        _artifact_server: 产物 HTTP 下载服务（可选）。
+        _sandbox_root: host 侧 sandbox 根目录（可选）。
     """
 
     def __init__(
@@ -70,9 +93,9 @@ class SandboxMiddleware(AgentMiddleware):
         """初始化。
 
         Args:
-            provider:       sandbox 提供者（acquire / release / get）。
+            provider: sandbox 提供者（acquire / release / get）。
             artifact_server: 产出物 HTTP 下载服务，可为 None（不注册）。
-            sandbox_root:   host 侧 sandbox 根目录，可为 None（走 sandbox translator）。
+            sandbox_root: host 侧 sandbox 根目录，可为 None（走 sandbox translator）。
         """
         self._provider = provider
         self._artifact_server = artifact_server
@@ -97,11 +120,11 @@ class SandboxMiddleware(AgentMiddleware):
           → 复用父 Sandbox。
 
         Args:
-            state:   当前 state，读取 sandbox.sandbox_id。
+            state: 当前 state，读取 sandbox.sandbox_id。
             runtime: LangGraph 运行时（本 hook 未使用）。
 
         Returns:
-            始终 None（只恢复 ContextVar，不改 state）。
+            dict[str, Any] | None: 始终 None（只恢复 ContextVar，不改 state）。
         """
         if get_sandbox_id() is not None:
             return None  # ContextVar 已设（lead 同进程多轮），不覆盖
@@ -162,8 +185,8 @@ class SandboxMiddleware(AgentMiddleware):
             handler: 下游异步处理函数。
 
         Returns:
-            工具调用结果，可能是原 result、追加下载链接的 ToolMessage，
-            或首次 acquire 时的 Command。
+            Any: 工具调用结果，可能是原 result、追加下载链接的 ToolMessage，
+                或首次 acquire 时的 Command。
         """
         tool_name = request.tool_call.get("name", "")
 
@@ -218,7 +241,7 @@ class SandboxMiddleware(AgentMiddleware):
         处理流程：
         1. 从 request.tool_call["args"] 取 paths：
            - dict → args["paths"]；
-           - str  → 视为无 paths；
+           - str → 视为无 paths；
            - list → 直接用；
            - 其他 → 空。
         2. 取 sandbox 对象（用于解析 host 路径）；确保 .poirot/outputs/ 存在。
@@ -237,11 +260,11 @@ class SandboxMiddleware(AgentMiddleware):
         4. 返回 urls。
 
         Args:
-            request:    工具调用请求，读取 args.paths。
+            request: 工具调用请求，读取 args.paths。
             sandbox_id: 当前 sandbox id。
 
         Returns:
-            已注册的下载 URL 列表（可能为空）。
+            list[str]: 已注册的下载 URL 列表（可能为空）。
         """
         import shutil
         from pathlib import Path
@@ -316,11 +339,11 @@ class SandboxMiddleware(AgentMiddleware):
         远端 provider 可据此真正回收资源。
 
         Args:
-            state:   当前 state，读取 sandbox.sandbox_id。
+            state: 当前 state，读取 sandbox.sandbox_id。
             runtime: LangGraph 运行时（本 hook 未使用）。
 
         Returns:
-            始终 None（只做释放，不改 state）。
+            None: 始终 None（只做释放，不改 state）。
         """
         sandbox_state = state.get("sandbox")
         if sandbox_state and sandbox_state.get("sandbox_id"):

@@ -1,7 +1,23 @@
 """MemoryMiddleware — before_model 召回注入 + after_model 清除（Phase 1）。
 
-【依据】
-承接 `design_docs/53-memory-l4-middleware-bootstrap.md` §4 Step 1 + 00 §9.1。
+【整体职责】
+在每次模型调用前，从长期记忆召回与当前 query 相关的内容，以 per-call
+HumanMessage 注入上下文（保护 prompt caching），并写 recalled_memories 索引；
+在模型调用后清除 turn_id（traceability 生命周期）。
+
+【内容摘要】
+- _CHARS_PER_TOKEN           : token 估算常量（1 token ≈ 4 字符）。
+- MemoryMiddleware.__init__   : 接收 provider 与召回/抽取开关、token 预算。
+- MemoryMiddleware.abefore_model : 召回 + 注入 + set_turn_id 注入。
+- MemoryMiddleware.aafter_model  : 清除 turn_id + 可选抽取（默认关）。
+- MemoryMiddleware._extract_query : 从最后一条 HumanMessage 提 query。
+- MemoryMiddleware._format_recall : 格式化召回结果 + token 预算裁剪。
+- MemoryMiddleware._build_turn_id : 构造 turn_id（thread_id + 轮次）。
+
+【职责边界】
+- 只负责：召回、注入、token 裁剪、set_turn_id 生命周期、写 recalled_memories 索引。
+- 不负责：记忆的存储与检索实现（memory 子系统）、记忆沉淀（MemoryConsolidation
+  Middleware + worker）、强化写回（HybridRetriever 内部）、prompt 拼装（TaggedContext）。
 
 【挂载位置】
 Sandbox 之后，HelpRequest / ToolCall 之前。
@@ -26,8 +42,9 @@ agents/middlewares/memory_recall_middleware.py，与既有 18 个 middleware
 - 不进 system prompt cache：用 per-call HumanMessage(hide_from_ui=True)（00 D10）。
 - set_turn_id 注入 / 清除：before_model 注入，after_model 清除。
 - recalled_memories 只存索引（id + score + strength），不存全量内容。
+- 1A 强化写回在 HybridRetriever.retrieve 内部完成，caller 不负责。
+- 无召回时清除 turn_id 后返回 None（避免 turn_id 悬挂）。
 """
-
 from __future__ import annotations
 
 import logging
@@ -53,6 +70,13 @@ class MemoryMiddleware(AgentMiddleware):
 
     挂载位置：Sandbox 后，HelpRequest / ToolCall 前。
     注入方式：per-call HumanMessage（保护 prompt caching）。
+
+    Attributes:
+        state_schema: 状态 schema（ThreadState）。
+        _provider: 记忆提供者。
+        _enable_recall: 召回开关。
+        _enable_extract: 抽取开关（默认关）。
+        _token_budget: 召回注入 token 预算。
     """
 
     state_schema = ThreadState  # type: ignore[assignment]
@@ -69,9 +93,9 @@ class MemoryMiddleware(AgentMiddleware):
 
         Args:
             memory_provider: MemoryProvider（L3 DefaultMemoryProvider）。
-            enable_recall:   before_model 召回开关（default 模式可选关）。
-            enable_extract:  after_model 实时抽取开关（默认关，走 Phase 2 cron L5）。
-            token_budget:    召回注入 token 预算上限。
+            enable_recall: before_model 召回开关（default 模式可选关）。
+            enable_extract: after_model 实时抽取开关（默认关，走 Phase 2 cron L5）。
+            token_budget: 召回注入 token 预算上限。
         """
         self._provider = memory_provider
         self._enable_recall = enable_recall
@@ -101,11 +125,12 @@ class MemoryMiddleware(AgentMiddleware):
         说明：1A 强化写回在 HybridRetriever.retrieve 内部完成，caller 不负责。
 
         Args:
-            state:   当前 ThreadState，读取 messages。
+            state: 当前 ThreadState，读取 messages。
             runtime: LangGraph 运行时，用于 _build_turn_id 取 thread_id。
 
         Returns:
-            含 messages 与 recalled_memories 的 state patch；无召回时返回 None。
+            dict[str, Any] | None: 含 messages 与 recalled_memories 的 state patch；
+                无召回时返回 None。
         """
         if not self._enable_recall:
             return None
@@ -156,11 +181,11 @@ class MemoryMiddleware(AgentMiddleware):
            Layer 4 仅保留 hook，不实现抽取逻辑，故仍返回 None。
 
         Args:
-            state:   当前 ThreadState（本 hook 未使用）。
+            state: 当前 ThreadState（本 hook 未使用）。
             runtime: LangGraph 运行时（本 hook 未使用）。
 
         Returns:
-            始终 None（只做清除，不改 state）。
+            dict[str, Any] | None: 始终 None（只做清除，不改 state）。
         """
         # 清除 turn_id（traceability C，无论 before_model 是否注入都清除）
         set_turn_id(None)
@@ -187,7 +212,7 @@ class MemoryMiddleware(AgentMiddleware):
             state: 当前 ThreadState，读取 messages。
 
         Returns:
-            提取到的 query 文本；无则空串。
+            str: 提取到的 query 文本；无则空串。
         """
         messages = state.get("messages", []) or []
         # 从后往前找最后一条 HumanMessage
@@ -216,11 +241,11 @@ class MemoryMiddleware(AgentMiddleware):
         4. 用 "\\n" 连接返回。
 
         Args:
-            results:      RetrievalResult 列表。
+            results: RetrievalResult 列表。
             token_budget: 注入 token 预算上限。
 
         Returns:
-            格式化后的召回文本。
+            str: 格式化后的召回文本。
         """
         max_chars = token_budget * _CHARS_PER_TOKEN
         lines: list[str] = ["[Recalled Memories]"]
@@ -244,11 +269,11 @@ class MemoryMiddleware(AgentMiddleware):
         取 runtime config 抛异常时退回 state["thread_id"]。
 
         Args:
-            state:   当前 ThreadState，读取 messages / thread_id。
+            state: 当前 ThreadState，读取 messages / thread_id。
             runtime: LangGraph 运行时，读取 config.configurable.thread_id。
 
         Returns:
-            形如 "{thread_id}:turn:{len(messages)}" 的 turn 标识。
+            str: 形如 "{thread_id}:turn:{len(messages)}" 的 turn 标识。
         """
         messages = state.get("messages", []) or []
         # thread_id 优先从 runtime config 取

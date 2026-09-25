@@ -4,6 +4,20 @@
 在 agent 反复失败、陷入死胡同时检测到「卡死（stall）」，并暂停 graph
 向用户求助；如果求助次数用尽，则强制收尾。
 
+【内容摘要】
+- StallDetectionMiddleware.__init__ : 初始化三张按 run_id 维护的表。
+- _get_tracker / _help_count / _increment_help : tracker 与求助计数辅助。
+- _check_and_flag_stuck : 记录工具失败，判定卡死则置 pending_stuck 标记。
+- _check_stuck_and_pause : 检查卡死并决定暂停 / 强制收尾（补悬空 ToolMessage）。
+- _force_finalize : 求助次数用尽后的强制收尾。
+- after_model / aafter_model : 记录 todo 状态 + pending_stuck 时暂停。
+- wrap_tool_call / awrap_tool_call : 记录工具失败 / 成功衰减（不在此暂停）。
+
+【职责边界】
+- 只负责：卡死检测、暂停求助、强制收尾、悬空 tool_call 补齐。
+- 不负责：具体停滞判定算法（StallTracker）、工具执行（handler）、
+  求助的后续处理（用户响应）。
+
 【两个 hook 的分工】
 - wrap_tool_call：记录工具失败（含异常路径），必要时置 pending_stuck 标记。
   **不在这里暂停**——因为并行 tool_calls 时暂停会打断 ToolMessage 配对，
@@ -18,8 +32,17 @@ ToolMessage。DanglingToolCallMiddleware 会在 resume 时兜底修补剩余缺�
 
 【求助次数上限】
 max_help_requests 用尽后，不再暂停求助，而是走 _force_finalize 强制收尾。
-"""
 
+【INVARIANT】
+- 暂停只在 after_model（不在 wrap_tool_call）——避免破坏并行 tool_calls 配对。
+- 暂停前补齐悬空 tool_call（占位 ToolMessage），保证 checkpoint 历史合法。
+- 中断保护上下文（is_interrupt_protected）内不暂停。
+- 求助次数达上限 → 强制收尾（不再求助）。
+- 成功工具调用 → tracker.record_tool_success()（衰减失败信号）。
+- hook_config(can_jump_to=["end"]) 允许 after_model 跳到 end 节点。
+- 三张表按 run_id 分组：_trackers / _help_counts / _pending_stuck。
+- 同步 / 异步行为一致（异步委托同步）。
+"""
 from __future__ import annotations
 
 from typing import Any, override
@@ -42,9 +65,16 @@ class StallDetectionMiddleware(AgentMiddleware):
     """当 StallTracker 检测到死胡同时，暂停 graph。
 
     内部按 run_id 维护三张表：
-    - _trackers：        run_id → StallTracker（记录失败 / todo 状态）；
-    - _help_counts：     run_id → 已求助次数；
-    - _pending_stuck：   run_id → 是否已标记「待暂停」。
+    - _trackers：run_id → StallTracker（记录失败 / todo 状态）；
+    - _help_counts：run_id → 已求助次数；
+    - _pending_stuck：run_id → 是否已标记「待暂停」。
+
+    Attributes:
+        state_schema: 状态 schema（ThreadState）。
+        _trackers: run_id → StallTracker。
+        _help_counts: run_id → 已求助次数。
+        _pending_stuck: run_id → 是否待暂停。
+        _max_help: 最大求助次数。
     """
 
     state_schema = ThreadState  # type: ignore[assignment]
@@ -89,10 +119,10 @@ class StallDetectionMiddleware(AgentMiddleware):
            留给 after_model 统一处理暂停。
 
         Args:
-            runtime:   LangGraph 运行时（取 run_id）。
+            runtime: LangGraph 运行时（取 run_id）。
             tool_name: 失败的工具名。
             tool_input: 工具入参。
-            error:     错误信息文本。
+            error: 错误信息文本。
         """
         tracker = self._get_tracker(runtime)
         tracker.record_tool_failure(tool_name, tool_input, error)
@@ -131,11 +161,12 @@ class StallDetectionMiddleware(AgentMiddleware):
         所以在跳 END 前把配对补齐，保证 checkpoint 里的历史合法。
 
         Args:
-            state:   当前 ThreadState，读取 messages。
+            state: 当前 ThreadState，读取 messages。
             runtime: LangGraph 运行时，取 run_id / journal。
 
         Returns:
-            Command(goto=END, update={"messages": [...]})；不暂停时返回 None。
+            Command | None: Command(goto=END, update={"messages": [...]})；
+                不暂停时返回 None。
         """
         tracker = self._get_tracker(runtime)
         if not tracker.stuck:
@@ -205,12 +236,12 @@ class StallDetectionMiddleware(AgentMiddleware):
         4. 返回 Command(goto=END, update={"messages": extra_patches + [HumanMessage]})。
 
         Args:
-            state:   当前 ThreadState，读取 messages。
+            state: 当前 ThreadState，读取 messages。
             runtime: LangGraph 运行时，取 run_id / journal。
             tracker: 当前 run 的 StallTracker（形参保留，当前未直接使用）。
 
         Returns:
-            Command(goto=END, update={"messages": [...]})。
+            Command: Command(goto=END, update={"messages": [...]})。
         """
         from langchain_core.messages import AIMessage as _AIMessage
 
@@ -260,11 +291,12 @@ class StallDetectionMiddleware(AgentMiddleware):
         hook_config(can_jump_to=["end"]) 允许这个 hook 跳到 end 节点。
 
         Args:
-            state:   当前 ThreadState，读取 todos。
+            state: 当前 ThreadState，读取 todos。
             runtime: LangGraph 运行时，取 run_id。
 
         Returns:
-            含 messages 与 jump_to="end" 的 state patch；无需暂停时返回 None。
+            dict[str, Any] | None: 含 messages 与 jump_to="end" 的 state patch；
+                无需暂停时返回 None。
         """
         tracker = self._get_tracker(runtime)
         todos = state.get("todos") or []
@@ -311,7 +343,7 @@ class StallDetectionMiddleware(AgentMiddleware):
             handler: 下游处理函数。
 
         Returns:
-            handler 返回的结果（异常时向上抛）。
+            Any: handler 返回的结果（异常时向上抛）。
         """
         tool_call = getattr(request, "tool_call", None) or {}
         tool_name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
@@ -354,7 +386,7 @@ class StallDetectionMiddleware(AgentMiddleware):
             handler: 下游异步处理函数。
 
         Returns:
-            handler 返回的结果（异常时向上抛）。
+            Any: handler 返回的结果（异常时向上抛）。
         """
         tool_call = getattr(request, "tool_call", None) or {}
         tool_name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""

@@ -1,4 +1,4 @@
-"""EvidenceMiddleware — 拦截证据类工具调用，沉淀 Source / Observation / AgentError 进 ThreadState。
+"""EvidenceMiddleware — 拦截证据类工具调用，沉淀 Source / Observation 进 ThreadState。
 
 【整体职责】
 只在 wrap_tool_call 层拦截一批「证据类工具」的调用，把工具返回的结果
@@ -7,6 +7,21 @@
 - Source：从文本里启发式抽取出的 URL。
 同时把工具原始结果继续作为 ToolMessage 写回 messages（模型可见），
 实现「双写」：messages 给模型看，observations / sources 给旁路存档用。
+
+【内容摘要】
+- _EVIDENCE_TOOLS     : 证据类工具白名单。
+- _OBS_CONTENT_MAX / _URL_RE : 常量与 URL 正则。
+- _make_id / _now_iso / _tool_text : 辅助函数。
+- _extract_sources    : 从 ToolMessage 文本抽取 URL → Source 列表（去重）。
+- _make_observation   : 把工具结果裁剪成 Observation。
+- _resolve_step_id    : 取当前步骤 id（含从 todos 派生兜底）。
+- EvidenceMiddleware.wrap_tool_call  : 同步拦截（白名单过滤 → 抽取 → 双写）。
+- EvidenceMiddleware.awrap_tool_call : 异步拦截（逻辑同同步版）。
+
+【职责边界】
+- 只负责：证据抽取（成功时）、双写 messages / observations / sources。
+- 不负责：失败分类与账本（ToolCallMiddleware）、工具执行（handler）、
+  工具治理与预算（ToolCallMiddleware）、其他 state 字段维护。
 
 【设计要点】
 - 激活 observations / sources / errors 这几个原本闲置的 state 字段。
@@ -18,8 +33,19 @@
 【为什么只在这里做抽取】
 证据抽取依赖工具结果文本，属横切逻辑；把它放在中间件里做，
 业务工具实现本身不需要感知 observation / source 结构。
-"""
 
+【INVARIANT】
+- 只处理 _EVIDENCE_TOOLS 白名单内的工具；其余 passthrough。
+- 只在 result 是 ToolMessage 时抽取；Command 等其他类型原样返回。
+- 双写：messages 保留原 ToolMessage（模型可见 + 配对完整），
+  observations / sources 旁路存档。
+- 抽取在 interrupt_protection() 内进行（防中断破坏原子性）。
+- 本中间件不分类失败 / 不记账本（归 ToolCallMiddleware）。
+- 步骤 id 兜底：current_step_id 缺失时从 todos 派生（首个 in_progress 或 todo-0）。
+- URL 去重（按 url 集合），末尾标点剥离。
+- Observation 正文截断到 _OBS_CONTENT_MAX。
+- 同步 / 异步行为一致（仅 handler 调用方式不同）。
+"""
 from __future__ import annotations
 
 import re
@@ -72,7 +98,7 @@ def _tool_text(tool_msg: ToolMessage) -> str:
         tool_msg: 待归一化的 ToolMessage。
 
     Returns:
-        归一化后的纯文本。
+        str: 归一化后的纯文本。
     """
     content = tool_msg.content
     if isinstance(content, str):
@@ -99,10 +125,10 @@ def _extract_sources(tool_name: str, tool_msg: ToolMessage) -> list[Source]:
 
     Args:
         tool_name: 工具名（本函数当前未直接使用，保留形参便于后续扩展）。
-        tool_msg:  工具返回的 ToolMessage。
+        tool_msg: 工具返回的 ToolMessage。
 
     Returns:
-        去重后的 Source 列表。
+        list[Source]: 去重后的 Source 列表。
     """
     text = _tool_text(tool_msg)
     seen: set[str] = set()
@@ -142,12 +168,12 @@ def _make_observation(
 
     Args:
         tool_name: 工具名（本函数当前未直接使用，保留形参便于后续扩展）。
-        tool_msg:  工具返回的 ToolMessage。
-        sources:   本次抽取到的 Source 列表。
-        step_id:   关联的步骤 id，可为 None。
+        tool_msg: 工具返回的 ToolMessage。
+        sources: 本次抽取到的 Source 列表。
+        step_id: 关联的步骤 id，可为 None。
 
     Returns:
-        构造好的 Observation。
+        Observation: 构造好的 Observation。
     """
     text = _tool_text(tool_msg)
     content = text[:_OBS_CONTENT_MAX]
@@ -179,7 +205,7 @@ def _resolve_step_id(state: Any) -> str | None:
         state: 当前 state。
 
     Returns:
-        步骤 id；无法确定时返回 None。
+        str | None: 步骤 id；无法确定时返回 None。
     """
     if not isinstance(state, dict):
         return None
@@ -198,10 +224,13 @@ def _resolve_step_id(state: Any) -> str | None:
 
 
 class EvidenceMiddleware(AgentMiddleware):
-    """拦截证据类工具调用，把结果结构化沉淀进 observations / sources / errors。
+    """拦截证据类工具调用，把结果结构化沉淀进 observations / sources。
 
     非证据工具直接 passthrough。证据工具返回 Command(update=...) 双写：
     messages 保留 ToolMessage（模型可见），observations / sources 旁路存档。
+
+    Attributes:
+        state_schema: 状态 schema（ThreadState）。
     """
 
     state_schema = ThreadState  # type: ignore[assignment]
@@ -222,7 +251,7 @@ class EvidenceMiddleware(AgentMiddleware):
         4. 在 interrupt_protection() 上下文内做抽取：
            - sources = _extract_sources(...)；
            - step_id = _resolve_step_id(state)；
-           - obs     = _make_observation(...)。
+           - obs = _make_observation(...)。
         5. 返回 Command(update={observations, sources, messages})，
            其中 messages 里保留原始 ToolMessage 以保证模型可见 + 配对完整。
 
@@ -234,8 +263,9 @@ class EvidenceMiddleware(AgentMiddleware):
             handler: 下游处理函数。
 
         Returns:
-            证据工具 → Command（含 observations / sources / messages）；
-            非证据工具或非 ToolMessage 结果 → handler 原样返回。
+            ToolMessage | Command[Any]: 证据工具 → Command（含 observations /
+                sources / messages）；非证据工具或非 ToolMessage 结果 →
+                handler 原样返回。
         """
         tool_name = request.tool_call.get("name", "")
         if tool_name not in _EVIDENCE_TOOLS:
@@ -280,8 +310,9 @@ class EvidenceMiddleware(AgentMiddleware):
             handler: 下游异步处理函数。
 
         Returns:
-            证据工具 → Command（含 observations / sources / messages）；
-            非证据工具或非 ToolMessage 结果 → handler 原样返回。
+            ToolMessage | Command[Any]: 证据工具 → Command（含 observations /
+                sources / messages）；非证据工具或非 ToolMessage 结果 →
+                handler 原样返回。
         """
         tool_name = request.tool_call.get("name", "")
         if tool_name not in _EVIDENCE_TOOLS:

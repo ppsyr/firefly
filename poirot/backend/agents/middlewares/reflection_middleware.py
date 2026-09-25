@@ -7,6 +7,19 @@
 - 把 guidance 作为隐藏 HumanMessage 注入；
 - 返回 jump_to="model"，让模型回去补研究。
 
+【内容摘要】
+- ReflectionAction(TypedDict) : 策略返回的动作契约。
+- ReflectionStrategy(Protocol) : 策略协议。
+- _make_reflection_id / _step_id / _field : 辅助函数。
+- LightReflectionStrategy     : default 模式轻量策略（恒 pass）。
+- SufficiencyStrategy         : L1 充分性守门（规则 + LLM 两种评估）。
+- ReflectionMiddleware        : 外壳（触发时机 + jump 预算 + 事件打点）。
+
+【职责边界】
+- 只负责：触发时机管理、jump 预算消费、事件打点、判定结果落 state。
+- 不负责：具体充分性判断逻辑（委托给 ReflectionStrategy）、
+  Todo 完成度强制（TodoMiddleware）、jump 预算的通用管理（_jump_budget）。
+
 【架构：外壳 + 可替换 Strategy】
 - ReflectionMiddleware 是外壳：管触发时机、jump 预算、事件打点；
 - 判断逻辑委托给 ReflectionStrategy（默认 SufficiencyStrategy）。
@@ -18,8 +31,17 @@
 
 【与 TodoMiddleware 共享 jump 预算】
 两个中间件的 jump 合计 ≤ 3（_jump_budget），防止无限跳转。
-"""
 
+【INVARIANT】
+- 只在最后一条 AIMessage 无工具调用意图时触发（不拦「还在干活」的模型）。
+- verdict == "pass" 时不 jump、不写 state。
+- jump 预算耗尽 → 发 reflection.budget_exhausted 事件 + 放行。
+- 触发 jump 时发 reflection.fired 事件（含 verdict / gap_steps / remaining_budget）。
+- personal 类问题直接 pass + 提示（避免 reflection 死循环）。
+- 工具持续失败时放宽（不强制补研究）。
+- 未完成 todo 交给 Todo Layer 2；Reflection 只在 todo 全完成时判实质充分。
+- 同步 / 异步行为一致（异步委托同步）。
+"""
 from __future__ import annotations
 
 import uuid
@@ -42,11 +64,11 @@ class ReflectionAction(TypedDict):
     L1 只用 pass / continue；revise_plan / backtrack / rollback_to 为 L2/L3 预留。
 
     字段：
-        verdict:          "pass" | "continue" | "revise_plan" | "backtrack"。
+        verdict: "pass" | "continue" | "revise_plan" | "backtrack"。
         reflection_items: 本次反思产出的 ReflectionItem 列表。
-        plan:             revise_plan / backtrack 时的新 plan，否则 None。
-        guidance:         注回模型的提示文本。
-        rollback_to:      backtrack 回退到的决策节点 id（L3 未来）。
+        plan: revise_plan / backtrack 时的新 plan，否则 None。
+        guidance: 注回模型的提示文本。
+        rollback_to: backtrack 回退到的决策节点 id（L3 未来）。
     """
 
     verdict: str  # "pass" | "continue" | "revise_plan" | "backtrack"
@@ -101,6 +123,10 @@ class SufficiencyStrategy:
       的规则判断（MVP 过渡）。
     - 未完成 todo 交给 Todo Layer 2；Reflection 只在 todo 全完成时才判实质充分。
     - 非研究类问题（personal）直接 pass + 提示，避免 reflection 死循环。
+
+    Attributes:
+        _RESEARCH_KEYWORDS: 研究类问题的关键词集合（用于问题分类）。
+        _llm: 可选的 LLM（用于评估证据充分性）。
     """
 
     # 研究类问题的关键词集合（用于问题分类）
@@ -138,7 +164,7 @@ class SufficiencyStrategy:
             state: 当前 state。
 
         Returns:
-            "research" / "personal" / "mixed"。
+            str: "research" / "personal" / "mixed"。
         """
         question = (state.get("research_question") or state.get("user_input") or "").lower()
         has_research_kw = any(kw in question for kw in self._RESEARCH_KEYWORDS)
@@ -162,7 +188,7 @@ class SufficiencyStrategy:
            否则 → _rule_based_check 做规则判断。
 
         Args:
-            state:   当前 state。
+            state: 当前 state。
             runtime: LangGraph 运行时（本策略未使用）。
 
         Returns:
@@ -211,7 +237,7 @@ class SufficiencyStrategy:
            guidance（提示补充搜索），返回 verdict="continue"。
 
         Args:
-            todos:        全部 todos。
+            todos: 全部 todos。
             observations: 全部 observations。
 
         Returns:
@@ -248,8 +274,8 @@ class SufficiencyStrategy:
         用途：简单问题不因浅覆盖误判，复杂问题证据不足时判 continue。
 
         Args:
-            state:        当前 state（取 question）。
-            todos:        全部 todos。
+            state: 当前 state（取 question）。
+            todos: 全部 todos。
             observations: 全部 observations。
 
         Returns:
@@ -298,6 +324,10 @@ class ReflectionMiddleware(AgentMiddleware):
 
     触发条件：最后一条 AIMessage 无工具调用意图（模型想退）。
     判定为 continue → 写 reflection_items + 注入 guidance + jump_to="model"。
+
+    Attributes:
+        state_schema: 状态 schema（ThreadState）。
+        _strategy: 反思策略。
     """
 
     state_schema = ThreadState  # type: ignore[assignment]
@@ -307,7 +337,7 @@ class ReflectionMiddleware(AgentMiddleware):
 
         Args:
             strategy: 自定义策略；为 None 时使用 SufficiencyStrategy(llm=llm)。
-            llm:      透传给默认策略，用于证据充分性评估。
+            llm: 透传给默认策略，用于证据充分性评估。
         """
         self._strategy = strategy or SufficiencyStrategy(llm=llm)
 
@@ -339,11 +369,11 @@ class ReflectionMiddleware(AgentMiddleware):
         8. 返回 {"jump_to": "model", **update}。
 
         Args:
-            state:   当前 ThreadState。
+            state: 当前 ThreadState。
             runtime: LangGraph 运行时。
 
         Returns:
-            {"jump_to": "model", ...} 或 None。
+            dict[str, Any] | None: {"jump_to": "model", ...} 或 None。
         """
         messages = state.get("messages") or []
         last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)

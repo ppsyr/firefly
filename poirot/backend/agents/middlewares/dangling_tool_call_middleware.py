@@ -1,20 +1,39 @@
 """DanglingToolCallMiddleware — 在 resume 时修补悬空的工具调用。
 
+【整体职责】
+在每次进入 model 之前（before_model）扫描消息历史，为每个 dangling 的
+tool_call 补一条「占位用的错误 ToolMessage」，让 tool pairing 重新变得完整，
+避免严格后端因历史不完整返回 400。
+
+【内容摘要】
+- _MAX_RECOVERY_DETAIL_LEN : 恢复详情长度上限（常量）。
+- DanglingToolCallMiddleware._extract_tool_calls : 从 AIMessage 提取 tool_calls（兼容两形态）。
+- DanglingToolCallMiddleware.before_model  : 扫描历史 → 补占位 ToolMessage。
+- DanglingToolCallMiddleware.abefore_model : 委托同步版（行为一致）。
+
+【职责边界】
+- 只负责：为悬空 tool_call 补占位 ToolMessage。
+- 不负责：工具的实际执行（工具由 ToolNode 执行）、tool_calls 的产生
+  （由 LLM 决定）、其他历史修复。
+
 【背景问题】
 当 graph 因为 help request 或用户中断（interrupt）而恢复（resume）时，
 历史里最后一条 AIMessage 可能带有一批 tool_calls，但并没有对应的
 ToolMessage。这些「有 call 没有 result」的调用就是 dangling calls。
 消息历史不完整会让严格后端直接返回 LLM 400 错误。
 
-【整体职责】
-在每次进入 model 之前（before_model）扫描消息历史，
-为每个 dangling 的 tool_call 补一条「占位用的错误 ToolMessage」，
-让 tool pairing 重新变得完整。
-
 【模式来源】
 借鉴 deer-flow DanglingToolCallMiddleware 模式。
-"""
 
+【INVARIANT】
+- 只处理「AIMessage 里声明了 tool_call，但消息历史中没有对应 ToolMessage」
+  的情况；已配对的调用不动。
+- 只补占位结果，不重放工具、不改其他 state 字段。
+- 兼容两种 tool_calls 存储形态：标准字段 msg.tool_calls / additional_kwargs["tool_calls"]。
+- 无 dangling call 时返回 None（不写 state）。
+- 同一 tool_call_id 只补一次（用 answered_ids 集合去重）。
+- abefore_model 直接委托同步版，保证行为一致。
+"""
 from __future__ import annotations
 
 import json
@@ -34,6 +53,9 @@ class DanglingToolCallMiddleware(AgentMiddleware):
 
     只处理「AIMessage 里声明了 tool_call，但消息历史中没有对应
     ToolMessage」的情况；已配对的调用不动。
+
+    Attributes:
+        state_schema: 状态 schema（ThreadState）。
     """
 
     state_schema = ThreadState  # type: ignore[assignment]
@@ -57,7 +79,7 @@ class DanglingToolCallMiddleware(AgentMiddleware):
             msg: 待解析的 AIMessage。
 
         Returns:
-            归一化后的 tool_call 列表，每项含 id / name / args。
+            list[dict[str, Any]]: 归一化后的 tool_call 列表，每项含 id / name / args。
         """
         calls = list(getattr(msg, "tool_calls", None) or [])
         raw = (getattr(msg, "additional_kwargs", None) or {}).get("tool_calls") or []
@@ -99,11 +121,12 @@ class DanglingToolCallMiddleware(AgentMiddleware):
         注意：本 hook 只补「占位结果」，不重放工具、不改其他 state 字段。
 
         Args:
-            state:   当前 ThreadState，读取 messages。
+            state: 当前 ThreadState，读取 messages。
             runtime: LangGraph 运行时（本 hook 未使用）。
 
         Returns:
-            含补丁 messages 的 state patch；无 dangling call 时返回 None。
+            dict[str, Any] | None: 含补丁 messages 的 state patch；
+                无 dangling call 时返回 None。
         """
         messages = state.get("messages") or []
         if not messages:
@@ -138,10 +161,10 @@ class DanglingToolCallMiddleware(AgentMiddleware):
         """异步 before_model：直接转调同步版，保证行为一致。
 
         Args:
-            state:   当前 ThreadState。
+            state: 当前 ThreadState。
             runtime: LangGraph 运行时。
 
         Returns:
-            与 before_model 相同的 state patch（或 None）。
+            dict[str, Any] | None: 与 before_model 相同的 state patch（或 None）。
         """
         return self.before_model(state, runtime)
