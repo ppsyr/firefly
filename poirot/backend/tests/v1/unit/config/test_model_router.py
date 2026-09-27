@@ -124,3 +124,54 @@ def test_router_builds_fallback_chain_per_role() -> None:
 def test_router_chain_names() -> None:
     router = ModelRouter(providers=[_pc("openai"), _pc("deepseek")])
     assert router.chain_names("researcher") == ["openai", "deepseek"]
+
+
+def test_router_build_from_starts_at_provider_and_overrides_model(monkeypatch) -> None:
+    built = []
+
+    def fake_build_chat_model(config):
+        built.append(config)
+        return FakeListChatModel(responses=[config.provider])
+
+    monkeypatch.setattr(
+        "poirot.backend.agents.config.model_router.build_chat_model",
+        fake_build_chat_model,
+    )
+    router = ModelRouter(providers=[_pc("openai"), _pc("qwen"), _pc("deepseek")])
+
+    result = router.build_from("qwen", "qwen-max")
+
+    assert isinstance(result, FallbackChatModel)
+    assert result.provider_names == ["qwen", "deepseek"]
+    assert [config.model for config in built] == ["qwen-max", "deepseek-m"]
+
+
+def test_router_build_from_rejects_provider_outside_role_route() -> None:
+    router = ModelRouter(providers=[_pc("openai"), _pc("deepseek")])
+
+    with pytest.raises(ProviderConfigError, match="请添加供应商"):
+        router.build_from("openai", role="reporter")
+
+
+def test_router_build_from_rejects_unavailable_provider() -> None:
+    router = ModelRouter(providers=[_pc("deepseek")])
+
+    with pytest.raises(ProviderConfigError, match="请配置 apikey"):
+        router.build_from("qwen")
+
+
+def test_router_build_from_rejects_empty_api_key() -> None:
+    provider = _pc("qwen")
+    provider = ProviderConfig(
+        provider=provider.provider,
+        model=provider.model,
+        api_key="",
+        base_url=provider.base_url,
+        priority=provider.priority,
+        default=provider.default,
+        enabled=provider.enabled,
+    )
+    router = ModelRouter(providers=[provider])
+
+    with pytest.raises(ProviderConfigError, match="请配置 apikey"):
+        router.build_from("qwen")

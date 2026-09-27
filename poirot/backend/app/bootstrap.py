@@ -292,7 +292,8 @@ class AppRuntime:
         skill_manager / sandbox_provider（checkpointer state 跨切换连续）。
 
         等价于 CLI --provider X --model Y 重启，但不丢 thread。
-        单 provider 模式（不走 FallbackChatModel 路由链），reporter = researcher。
+        从指定 provider 开始走 researcher 的 FallbackChatModel 路由链；reporter
+        仍使用 reporter 自己的默认 FallbackChatModel 路由。
 
         provider 必须是 MODEL_PROVIDERS 里 enabled 的项；model=None 用 provider 默认 model。
 
@@ -301,7 +302,7 @@ class AppRuntime:
         from poirot.backend.agents.config.model_router import ModelRouter
 
         router = ModelRouter()
-        new_model = router.build_single(provider, model)  # 校验 provider + api_key，失败抛 ProviderConfigError
+        new_model = router.build_from(provider, model, role="researcher")
         new_reporter = router.build_model("reporter")
         new_registry = CapabilityRegistry(
             models={"researcher": new_model, "reporter": new_reporter},
@@ -489,7 +490,7 @@ def bootstrap_runtime(
     装配顺序：
     1. 加载 config + 锚定相对路径。
     2. 建 thread journal。
-    3. 构造 LLM（单 provider 或路由）。
+    3. 构造 LLM（默认完整路由，或从指定 provider 开始的降级链）。
     4. 加载 builtin 工具。
     5. 加载 MCP 工具（npx 可用时）。
     6. 装配 sandbox（config.sandbox.use 非空时）。
@@ -525,19 +526,19 @@ def bootstrap_runtime(
         "provider": provider or "default",
     })
 
-    # ── LLM 构造：角色化智能路由（deepseek 兜底），或 CLI --provider 强制单 provider ──
+    # ── LLM 构造：角色化智能路由（deepseek 兜底），或从 CLI provider 开始 ──
     from poirot.backend.agents.config.model_router import ModelRouter
 
     router = ModelRouter()
     if provider:
-        researcher_model = router.build_single(provider, model)
+        researcher_model = router.build_from(provider, model, role="researcher")
         reporter_model = router.build_model("reporter")
         thread_journal.append("llm.constructed", {
-            "mode": "single",                               # 保持不变（researcher 是单 provider）
+            "mode": "from_provider",
             "provider": provider,
             "model": model or "default",
-            "researcher_chain": [provider],                 # ← 新增：researcher 单 provider，链就是它自己
-            "reporter_chain": router.chain_names("reporter"),  # ← 新增：reporter 仍走路由链
+            "researcher_chain": researcher_model.provider_names,
+            "reporter_chain": router.chain_names("reporter"),
         })
         researcher_model_name = model or provider
     else:
