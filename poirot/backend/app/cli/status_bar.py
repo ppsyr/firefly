@@ -30,18 +30,9 @@ from prompt_toolkit.formatted_text import HTML
 
 
 def build_bottom_toolbar(cli_state: dict[str, Any]) -> HTML:
-    """渲染常驻状态栏：``mode · model | {tokens}K ({fraction}%) | /help``。
-
-    Args:
-        cli_state: 主循环持有的状态 dict，需含 ``mode``/``model``/``current_tokens``/
-            ``current_fraction`` 四个 key（缺省时回退到安全默认值）。
-            可选 ``_running`` / ``_current_activity`` 用于运行中活动指示。
-
-    Returns:
-        HTML: prompt_toolkit HTML 对象，供 ``bottom_toolbar`` callable 返回。
-    """
     mode = cli_state.get("mode", "default")
-    model = cli_state.get("model", "?")
+    model = cli_state.get("model")          # ← 用它格式化
+    provider = cli_state.get("model_provider")  # ← 链首 provider 名
     tokens = cli_state.get("current_tokens", 0)
     fraction = cli_state.get("current_fraction", 0.0)
     running = cli_state.get("_running", False)
@@ -53,7 +44,7 @@ def build_bottom_toolbar(cli_state: dict[str, Any]) -> HTML:
     activity_part = f" ● {activity} " if running and activity else ""
     return HTML(
         f'<style fg="#aaaaaa" bg="#2b2b2b">'
-        f" {mode} · {model} "
+        f" {mode} · {provider} / {model} "
         f"</style>"
         f'<style fg="#aaaaaa" bg="#2b2b2b">'
         f"| {tokens_k:.1f}K ({pct:.1f}%) |{activity_part}/help"

@@ -165,9 +165,9 @@ def _find_provider(candidates: list[ProviderConfig], provider: str) -> ProviderC
 
 # 角色路由链：按顺序偏好，链尾恒含 deepseek（兜底）。
 MODEL_ROUTES: dict[str, list[str]] = {
-    "researcher": ["openai", "qwen", "anthropic", "gemini", "deepseek"],
-    "reporter": ["qwen", "deepseek"],
-    "reflection": ["deepseek"],
+    "researcher": ["openai", "openrouter", "qwen", "anthropic", "gemini", "deepseek"],
+    "reporter": ["deepseek_reporter", "openrouter_reporter", "openai_reporter"],
+    "reflection": ["deepseek_reflection", "openrouter_reflection", "openai_reflection"],
 }
 
 

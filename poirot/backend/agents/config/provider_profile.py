@@ -81,14 +81,43 @@ PROVIDER_PROFILES: list[ProviderProfile] = [
         default_model="deepseek-v4-flash", default_window=200_000,
         priority=10, is_default=True,
     ),
+    ProviderProfile(
+        name="deepseek_reporter", kind="deepseek",
+        env_key="DEEPSEEK_API_KEY", env_base_url="DEEPSEEK_BASE_URL", env_model="DEEPSEEK_REPORTER_MODEL",
+        default_base_url="https://api.deepseek.com",
+        default_model="deepseek-v4.1-flash", default_window=200_000,
+        priority=10, is_default=True,
+    ),
+    ProviderProfile(
+        name="deepseek_reflection", kind="deepseek",
+        env_key="DEEPSEEK_API_KEY", env_base_url="DEEPSEEK_BASE_URL", env_model="DEEPSEEK_REFLECTION_MODEL",
+        default_base_url="https://api.deepseek.com",
+        default_model="deepseek-v4.1-flash", default_window=200_000,
+        priority=10, is_default=True,
+    ),
     # OpenAI — 官方 API
     ProviderProfile(
         name="openai", kind="openai_compat",
         env_key="OPENAI_API_KEY", env_base_url="OPENAI_BASE_URL", env_model="OPENAI_MODEL",
         default_base_url=None,
-        default_model="gpt-4.1-mini", default_window=128_000,
+        default_model="gpt-5.6-sol", default_window=128_000,
         priority=20, is_default=False,
     ),
+    ProviderProfile(
+        name="openai_reporter", kind="openai_compat",
+        env_key="OPENAI_API_KEY", env_base_url="OPENAI_BASE_URL", env_model="OPENAI_REPORTER_MODEL",
+        default_base_url=None,
+        default_model="gpt-5.6-sol", default_window=128_000,
+        priority=20, is_default=False,
+    ),
+    ProviderProfile(
+        name="openai_reflection", kind="openai_compat",
+        env_key="OPENAI_API_KEY", env_base_url="OPENAI_BASE_URL", env_model="OPENAI_REFLECTION_MODEL",
+        default_base_url=None,
+        default_model="gpt-5.6-sol", default_window=128_000,
+        priority=20, is_default=False,
+    ),
+
     # Qwen — 阿里通义，OpenAI 兼容
     ProviderProfile(
         name="qwen", kind="openai_compat",
@@ -125,6 +154,20 @@ PROVIDER_PROFILES: list[ProviderProfile] = [
     ProviderProfile(
         name="openrouter", kind="openai_compat",
         env_key="OPENROUTER_API_KEY", env_base_url="OPENROUTER_BASE_URL", env_model="OPENROUTER_MODEL",
+        default_base_url="https://openrouter.ai/api/v1",
+        default_model="anthropic/claude-sonnet-4", default_window=200_000,
+        priority=70, is_default=False,
+    ),
+    ProviderProfile(
+        name="openrouter_reporter", kind="openai_compat",
+        env_key="OPENROUTER_API_KEY", env_base_url="OPENROUTER_BASE_URL", env_model="OPENROUTER_REPORTER_MODEL",
+        default_base_url="https://openrouter.ai/api/v1",
+        default_model="anthropic/claude-sonnet-4", default_window=200_000,
+        priority=70, is_default=False,
+    ),
+    ProviderProfile(
+        name="openrouter_reflection", kind="openai_compat",
+        env_key="OPENROUTER_API_KEY", env_base_url="OPENROUTER_BASE_URL", env_model="OPENROUTER_REFLECTION_MODEL",
         default_base_url="https://openrouter.ai/api/v1",
         default_model="anthropic/claude-sonnet-4", default_window=200_000,
         priority=70, is_default=False,

@@ -66,7 +66,7 @@ from poirot.backend.agents.memory.bootstrap import (
     start_memory_worker,
 )
 from poirot.backend.agents.memory.config import set_memory_config
-from poirot.backend.agents.config.provider_config import ProviderConfig, select_provider_config
+from poirot.backend.agents.config.provider_config import ProviderConfig, get_provider_config, select_provider_config
 from poirot.backend.agents.config.schema import AppConfig
 from poirot.backend.agents.journal.events import utc_now_iso
 from poirot.backend.agents.journal.run_journal import RunJournal
@@ -302,7 +302,7 @@ class AppRuntime:
 
         router = ModelRouter()
         new_model = router.build_single(provider, model)  # 校验 provider + api_key，失败抛 ProviderConfigError
-        new_reporter = new_model
+        new_reporter = router.build_model("reporter")
         new_registry = CapabilityRegistry(
             models={"researcher": new_model, "reporter": new_reporter},
             tools=self.capability_registry.tools,
@@ -531,22 +531,29 @@ def bootstrap_runtime(
     router = ModelRouter()
     if provider:
         researcher_model = router.build_single(provider, model)
-        reporter_model = researcher_model
+        reporter_model = router.build_model("reporter")
         thread_journal.append("llm.constructed", {
-            "mode": "single",
+            "mode": "single",                               # 保持不变（researcher 是单 provider）
             "provider": provider,
             "model": model or "default",
+            "researcher_chain": [provider],                 # ← 新增：researcher 单 provider，链就是它自己
+            "reporter_chain": router.chain_names("reporter"),  # ← 新增：reporter 仍走路由链
         })
         researcher_model_name = model or provider
     else:
         researcher_model = router.build_model("researcher")
         reporter_model = router.build_model("reporter")
+        researcher_chain_names = router.chain_names("researcher");
+        reporter_chain_names = router.chain_names("reporter");
+        
         thread_journal.append("llm.constructed", {
             "mode": "routed",
-            "researcher_chain": router.chain_names("researcher"),
-            "reporter_chain": router.chain_names("reporter"),
+            "provider": get_provider_config(researcher_chain_names[0]).provider or "default",
+            "model": get_provider_config(researcher_chain_names[0]).model or "default",
+            "researcher_chain": researcher_chain_names,
+            "reporter_chain": reporter_chain_names,
         })
-        researcher_model_name = "routed:" + ",".join(router.chain_names("researcher"))
+        researcher_model_name = "routed:" + ",".join(researcher_chain_names)
 
     # ── MCP 工具加载：通过 McpManager 门面，配置化 + 熔断器 + fallback ──
     tools: dict[str, Any] = {}

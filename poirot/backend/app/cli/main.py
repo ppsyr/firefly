@@ -184,6 +184,55 @@ def _build_stream_config(runtime: AppRuntime, run_context: Any) -> dict:
         "recursion_limit": rc.max_loop_steps * rc.graph_node_multiplier,
     }
 
+def _resolve_provider_and_model(model_obj: Any) -> tuple[str, str]:
+    """从 ChatModel 对象解析 (provider, model_name)。
+
+    - FallbackChatModel：链首 provider + 链首 model 名；
+    - 单 ChatModel：provider 回退 "?"，model 从对象取；
+    - None → ("?", "?")。
+
+    Returns:
+        (provider, model_name)：两个字符串。
+    """
+    if model_obj is None:
+        return ("?", "?")
+
+    # FallbackChatModel：有 models + provider_names
+    models_list = getattr(model_obj, "models", []) or []
+    provider_names = getattr(model_obj, "provider_names", []) or []
+
+    if models_list:
+        first_cm = models_list[0]
+        provider = provider_names[0] if provider_names else "?"
+        # 取 model 名
+        model_name = "?"
+        params = getattr(first_cm, "_identifying_params", None)
+        if callable(params):
+            params = params()
+        if isinstance(params, dict):
+            model_name = params.get("model") or params.get("model_name") or "?"
+        if model_name == "?":
+            model_name = (
+                getattr(first_cm, "model_name", None)
+                or getattr(first_cm, "model", None)
+                or "?"
+            )
+        return (provider, model_name)
+
+    # 单 ChatModel
+    model_name = "?"
+    params = getattr(model_obj, "_identifying_params", None)
+    if callable(params):
+        params = params()
+    if isinstance(params, dict):
+        model_name = params.get("model") or params.get("model_name") or "?"
+    if model_name == "?":
+        model_name = (
+            getattr(model_obj, "model_name", None)
+            or getattr(model_obj, "model", None)
+            or "?"
+        )
+    return ("?", model_name)
 
 async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str | None) -> int:
     """传统 CLI 主循环：prompt_toolkit 输入 + rich 渲染 + 流式研究。
@@ -199,12 +248,17 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
     console = Console()
     # cli_state：主循环共享状态——mode/model 供 bottom_toolbar 显示，current_tokens/fraction/window
     # 由 renderer 收到 budget_update 事件时回填（见 stream_handler._update_budget）
+
+
+    _p, _m = _resolve_provider_and_model(runtime.capability_registry.get_model("researcher"))
+
     cli_state: dict[str, Any] = {
         "pending_expert_mode": None,
         "pending_mcp_reload": None,
         "skill_override": [],
         "mode": "expert" if runtime.config.runtime.expert_mode else "default",
-        "model": _resolve_actual_model_name(runtime.capability_registry),
+        "model": _m,           # ← 字符串（如 "gpt-4.1-mini"）
+        "model_provider": _p,     # ← 字符串（如 "openai"）
         "current_tokens": 0,
         "current_fraction": 0.0,
         "current_window": 0,
@@ -322,7 +376,9 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
                 cli_state["pending_expert_mode"] = None
                 # 同步 bottom_toolbar 显示的 mode/model
                 cli_state["mode"] = "expert" if pending else "default"
-                cli_state["model"] = _resolve_actual_model_name(runtime.capability_registry)
+                _p, _m = _resolve_provider_and_model(runtime.capability_registry.get_model("researcher"))
+                cli_state["model_provider"] = provider or _p     # ← 看这里
+                cli_state["model"] = model or _m
                 _print_status()
                 label = "expert" if pending else "default"
                 console.print(f"[green]Switched to {label} mode[/green]\n")
@@ -346,7 +402,9 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
                 provider, model = pending_model
                 try:
                     runtime = runtime.switch_model(provider=provider, model=model)
-                    cli_state["model"] = _resolve_actual_model_name(runtime.capability_registry)
+                    _p, _m = _resolve_provider_and_model(runtime.capability_registry.get_model("researcher"))
+                    cli_state["model_provider"] = provider or _p     # ← 看这里
+                    cli_state["model"] = model or _m
                     _print_status()
                     console.print(f"[green]Switched to {provider}/{model or 'default'}[/green]\n")
                 except Exception as exc:
@@ -378,7 +436,9 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
             # 注入 round 起始时间 + 模型名，供 _render_done 输出耗时尾行
             import time as _time
             renderer.state["round_t0"] = _time.monotonic()
-            renderer.state["model"] = _resolve_actual_model_name(runtime.capability_registry)
+            _p, _m = _resolve_provider_and_model(runtime.capability_registry.get_model("researcher"))
+            renderer.state["model"] = provider or _p     # ← 看这里
+            renderer.state["model_provider"] = model or _m
 
             async for event in client.stream(prompt):
                 renderer.render(event)
