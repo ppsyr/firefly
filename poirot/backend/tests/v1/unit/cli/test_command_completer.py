@@ -92,3 +92,31 @@ def test_file_completion_ends_confirmed_reference_with_space(tmp_path: Path):
     assert len(completions) == 1
     assert completions[0].text == "@main.py "
     assert completions[0].display == [("", "@main.py")]
+
+
+def test_thread_completion_is_live_and_supports_bare_and_quoted_forms():
+    c = SlashCommandCompleter(
+        get_registry(),
+        thread_provider=lambda fragment, quoted: (
+            [("abc123", "Planning [abc123]", '@"Planning session" ')]
+            if quoted and fragment == "Plan"
+            else [("abc123", "Planning [abc123]", "@abc123 ")]
+            if not quoted and fragment in ("", "abc")
+            else []
+        ),
+    )
+    bare = list(c.get_completions(Document("@abc"), None))
+    title = list(c.get_completions(Document('@"Plan'), None))
+    assert bare and bare[0].text == "@abc123 " and bare[0].start_position == -4
+    assert title and title[0].text == '@"Planning session" '
+
+
+def test_thread_title_completion_is_live_for_bare_unicode_title():
+    c = SlashCommandCompleter(
+        get_registry(),
+        thread_provider=lambda fragment, quoted: [
+            ("abc123", "方案讨论 [abc123]", "@abc123 ")
+        ] if not quoted and "方案" in fragment else [],
+    )
+    result = list(c.get_completions(Document("请参考 @方案"), None))
+    assert result and result[0].text == "@abc123 "

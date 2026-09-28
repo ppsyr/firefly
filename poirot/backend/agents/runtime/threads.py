@@ -64,6 +64,9 @@ class ThreadStore:
         self._legacy_root = self.storage_root / "threads"
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
+        # New interactive runtimes reserve an ID before the first user turn,
+        # but keep that metadata in memory until the turn is actually sent.
+        self._pending: dict[str, ThreadMetadata] = {}
         self.projects = ProjectStore(self.storage_root)
 
     def _path(self, thread_id: str) -> Path:
@@ -82,8 +85,9 @@ class ThreadStore:
 
     def session_dir(self, thread_id: str) -> Path:
         with self._lock:
-            self.require(thread_id)
-            return self._path(thread_id).parent
+            item = self.require(thread_id)
+            path = self._path(thread_id)
+            return path.parent if path.exists() else self._new_path(item).parent
 
     def _read(self, path: Path) -> ThreadMetadata:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -115,6 +119,9 @@ class ThreadStore:
 
     def get(self, thread_id: str) -> ThreadMetadata | None:
         with self._lock:
+            pending = self._pending.get(thread_id)
+            if pending is not None:
+                return pending
             path = self._path(thread_id)
             if not path.exists():
                 return None
@@ -143,6 +150,7 @@ class ThreadStore:
                 os.fsync(file.fileno())
             os.replace(temp, path)
             (self._legacy_root / f"{item.thread_id}.json").unlink(missing_ok=True)
+            self._pending.pop(item.thread_id, None)
             self._sync_project(item.project)
         finally:
             if temp is not None:
@@ -153,10 +161,17 @@ class ThreadStore:
             self.projects.sync_thread_index(project)
             self.projects.touch(project)
 
-    def create(self, thread_id: str | None = None, *, project: str | None = None, cwd: str | Path | None = None) -> ThreadMetadata:
+    def create(
+        self,
+        thread_id: str | None = None,
+        *,
+        project: str | None = None,
+        cwd: str | Path | None = None,
+        persist: bool = True,
+    ) -> ThreadMetadata:
         with self._lock:
             thread_id = validate_thread_id(thread_id or str(uuid4()))
-            if self._path(thread_id).exists():
+            if self.get(thread_id) is not None:
                 raise FileExistsError(f"Thread already exists: {thread_id}")
             now = _now()
             if (project is None) != (cwd is None):
@@ -168,8 +183,24 @@ class ThreadStore:
                     raise ValueError("Thread project and cwd do not match a registered project")
                 cwd = canonical
             item = ThreadMetadata(thread_id, f"{_prefix(now)} 新会话", now, now, project=project, cwd=str(cwd) if cwd else None)
-            self._write(item)
+            if persist:
+                self._write(item)
+            else:
+                self._pending[thread_id] = item
             return item
+
+    def materialize(self, thread_id: str) -> ThreadMetadata:
+        """Persist a reserved interactive thread on its first user turn."""
+        with self._lock:
+            item = self._pending.get(thread_id)
+            if item is None:
+                return self.require(thread_id)
+            self._write(item)
+            return self.require(thread_id)
+
+    def is_pending(self, thread_id: str) -> bool:
+        with self._lock:
+            return thread_id in self._pending
 
     def update(self, thread_id: str, *, first_message: str | None = None, title: str | None = None) -> ThreadMetadata:
         with self._lock:
@@ -179,7 +210,10 @@ class ThreadStore:
             elif first_message is not None and first_message.strip() and not item.title_set:
                 item = replace(item, title=f"{_prefix(item.created_at)} {_clean_title(first_message)[:60]}", title_set=True)
             item = replace(item, updated_at=_now())
-            self._write(item)
+            if thread_id in self._pending:
+                self._pending[thread_id] = item
+            else:
+                self._write(item)
             return item
 
     def list(self) -> list[ThreadMetadata]:
@@ -212,6 +246,9 @@ class ThreadStore:
 
     def delete(self, thread_id: str) -> None:
         with self._lock:
+            if thread_id in self._pending:
+                self._pending.pop(thread_id, None)
+                return
             path = self._path(thread_id)
             if not path.exists():
                 raise KeyError(f"Thread not found: {thread_id}")

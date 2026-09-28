@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 
 MAX_REFERENCE_FILE_BYTES = 100 * 1024
@@ -83,6 +83,7 @@ class PreparedQuestion:
     original: str
     enriched: str
     references: tuple[FileReference, ...] = ()
+    thread_references: tuple[Any, ...] = ()
 
 
 def _relative_display(path: Path, root: Path) -> str:

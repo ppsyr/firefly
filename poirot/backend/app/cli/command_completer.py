@@ -55,6 +55,7 @@ class SlashCommandCompleter(Completer):
         registry: CommandRegistry,
         skill_provider: Callable[[], list[str]] | None = None,
         file_provider: Callable[[str], list[tuple[Path, str]]] | None = None,
+        thread_provider: Callable[[str, bool], list[tuple[str, str, str]]] | None = None,
     ) -> None:
         """初始化。
 
@@ -65,6 +66,7 @@ class SlashCommandCompleter(Completer):
         self._registry = registry
         self._skill_provider = skill_provider
         self._file_provider = file_provider
+        self._thread_provider = thread_provider
 
     def get_completions(self, document: Document, complete_event):  # type: ignore[no-untyped-def]
         """产出补全候选。
@@ -138,6 +140,32 @@ class SlashCommandCompleter(Completer):
                             display=n,
                             display_meta="skill",
                         )
+
+        # Same-directory thread references are completed while the user is
+        # still typing. Quoted titles use ``@"title"`` and are inserted as a
+        # complete token so the user can continue typing after the trailing
+        # space. The normal Enter handling accepts the highlighted completion.
+        if self._thread_provider is not None:
+            title_match = re.search(r'(?<![\w@])@"([^"\r\n]*)$', document.text_before_cursor)
+            # Keep the token broad enough for Unicode and ordinary one-word
+            # titles. The provider filters paths and enforces same-directory
+            # eligibility, so this does not turn every @mention into a hit.
+            thread_match = re.search(r"(?<![\w@])@([^\s@()<>]*)$", document.text_before_cursor)
+            if title_match or thread_match:
+                quoted = title_match is not None
+                fragment = (title_match or thread_match).group(1) or ""
+                token_start = (title_match or thread_match).start()
+                try:
+                    candidates = self._thread_provider(fragment, quoted) or []
+                except Exception:
+                    candidates = []
+                for thread_id, label, insert in candidates:
+                    yield Completion(
+                        text=insert,
+                        start_position=token_start - len(document.text_before_cursor),
+                        display=label,
+                        display_meta="thread",
+                    )
 
         # File references are completed while the user is still typing.  The
         # provider performs the thread-scoped path check; this class only

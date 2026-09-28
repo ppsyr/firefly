@@ -5,7 +5,7 @@
 ### 已完成功能
 
 - **跨进程恢复会话**：LangGraph 的完整 thread checkpoint 已持久化到用户目录。退出并重新启动后，可选择原会话继续对话；不同会话的消息和状态相互隔离。
-- **会话元数据与标题**：新会话立即保存 ID、标题、创建时间和更新时间。首次用户消息自动生成标题，不调用 LLM；用户可手动重命名，后续对话不会覆盖手动标题。
+- **会话元数据与标题**：新会话先保留内存中的 thread ID；用户首次发送消息后才保存 ID、标题、创建时间和更新时间。首次用户消息自动生成标题，不调用 LLM；用户可手动重命名，后续对话不会覆盖手动标题。
 - **会话管理**：实现 `/thread`、`info`、`list`、`new`、`switch <id>`、`rename <title>` 和 `delete <id>`，并提供子命令补全。删除当前会话前须先切换或新建会话。
 - **CLI 选择器**：`/thread list` 在下栏显示最近会话，支持方向键滚动、回车恢复和 Esc 取消；非交互终端会列出完整 ID，供 `switch` 使用。TUI 继续使用同一套 runtime 和持久化状态。
 - **按会话归档**：元数据、checkpoint、会话事件和每次运行的日志放在同一个按创建日期分层的会话目录。恢复或重命名不会移动目录。
@@ -32,9 +32,9 @@
 
 ### 实现方式
 
-- `ThreadStore` 按 `thread_id` 定位会话目录，创建时写入 `metadata.json`，列出时按 `updated_at` 降序排序。元数据写入使用同目录临时文件、`fsync` 和原子替换；无效元数据会发出警告，不会被自动删除。
+- `ThreadStore` 按 `thread_id` 定位会话目录；交互中新 thread 首次发送前只保留 pending 元数据，发送时才写入 `metadata.json`，列出时按 `updated_at` 降序排序。元数据写入使用同目录临时文件、`fsync` 和原子替换；无效元数据会发出警告，不会被自动删除。
 - `SessionCheckpointer` 按会话把同步与异步的 LangGraph checkpoint 调用路由到对应目录的 `checkpoints.db`。底层 `SQLiteCheckpointer` 使用 `AsyncSqliteSaver`；连接由应用运行时持有并在关闭时释放。
-- 切换会话前先校验元数据并读取目标 checkpoint，读取失败时保持当前 runtime；切换成功后沿用目标会话目录。新会话立即创建元数据，首次用户消息更新标题；手动重命名由 `title_set` 保护。
+- 切换会话前先校验元数据并读取目标 checkpoint，读取失败时保持当前 runtime；切换成功后沿用目标会话目录。新会话在首次用户消息时物化元数据并更新标题；手动重命名由 `title_set` 保护。
 - 删除时先清除目标会话的 checkpoints 和 pending writes，再删除元数据。当前会话不能删除；会话目录中的日志、报告、产物以及长期记忆不随删除操作清理。
 
 ### 旧数据迁移
@@ -54,7 +54,7 @@
 ### 已完成功能
 
 - 启动时可用 `--dir` 指定项目目录、用 `--project_name` 指定项目名；不传 `--dir` 时使用启动目录。目录会规范化为绝对路径，符号链接指向同一目录时复用项目，并校验目录和项目名冲突。
-- 新 thread 的元数据立即写入 `project` 和 `cwd`。`/thread new` 使用当前项目；旧的未绑定 thread 仍能通过全局 `/thread` 恢复，不会被自动绑定。
+- 新 thread 首次发送消息时才写入 `project` 和 `cwd`。`/thread new` 使用当前项目；旧的未绑定 thread 仍能通过全局 `/thread` 恢复，不会被自动绑定。
 - `/project list` 可选择项目，切换后创建该项目的新空 thread；`/project_thread list` 只列出并恢复当前项目的 thread。CLI 和 TUI 都支持上下键、回车、Esc，以及超过 10 项时继续滚动；非交互 CLI 直接打印列表。
 - 项目元数据、项目 thread 索引和每次运行的 `project`、`cwd` 均已持久化。`--dir` 不改变进程当前目录或 sandbox 行为。
 
@@ -105,3 +105,40 @@
 
 - 最近一次全量测试结果为 **2751 通过、4 跳过、13 失败**。13 个失败来自既有配置默认值、模型环境、npm、Windows `msvcrt`、旧 state 字段以及环境中的 `python` 命令断言，未计入本功能通过结论。
 - 已执行 Python 编译检查和 `git diff --check`；本次没有启动真实 Docker 容器，也没有重新执行手工 CLI/TUI 流程，因此 Docker 实际运行和人工交互仍未在本次验证中确认。
+
+## 4. 同目录会话引用 `@thread-id`
+
+### 已完成功能
+
+- **引用语法**：支持 `@thread-<id>`、`@<thread-id>`、已保存的单词标题，以及带引号的多词标题 `@"会话标题"`。标题不会为本功能重新生成摘要或标题。
+- **实时候选搜索**：CLI 和 TUI 在用户输入 `@`、thread ID 前缀或标题片段时同步展示同目录候选；标题搜索支持普通文本、中文和大小写不敏感的标题子串匹配。
+- **交互选择**：候选列表支持上下键移动和回车确认；只有一个候选时也必须回车确认。确认后插入完整 thread ID 或带引号标题并保留尾部空格，用户可以继续输入本轮问题；TUI 会保留已选择 thread 的确认标识。Esc 或未确认不会由下拉流程自动注入会话历史。
+- **同目录隔离**：只允许引用当前 thread 之外、规范化真实 `cwd` 相同的会话。不同项目名但指向同一真实目录可以引用；同名项目但目录不同、相似前缀目录、符号链接越界以及缺少 `cwd` 的旧 thread 均被拒绝。
+- **历史引用**：从目标 thread 最新已提交 checkpoint 读取消息，不切换当前 runtime，也不修改目标 thread。只保留按原顺序排列的 User/Assistant 文本消息，过滤 system、tool、工具调用参数和结果以及非文本内容。
+- **上下文预算**：默认最多保留最近 10 轮、4,000 token；超出时优先保留最近对话，并在引用材料中标注历史已截断。引用内容只进入当前轮 enriched prompt，不会在后续轮次自动重复注入，也不参与当前 thread 标题生成。
+- **失败与歧义处理**：未找到、标题重名、短 ID 多命中、标题与文件名冲突、目标已删除、checkpoint 损坏或历史不可读时不会注入内容，并给出明确提示；交互选择取消时保持原问题不变。
+- **新会话延迟建立**：`/thread new`、项目切换和启动时预留的 thread 只保留内存状态，不写入 session metadata 或恢复索引。用户首次发送聊天信息时才物化 metadata、session 目录和项目索引，空会话不会出现在恢复列表。
+
+### 实现方式
+
+- `agents/runtime/thread_quote.py` 负责引用解析、实时候选、真实目录比较、ID/标题消歧、checkpoint 读取、消息角色过滤和 10 轮/4,000 token 截断；读取历史直接使用当前 `SessionCheckpointer`，不调用 `switch_thread`。
+- `app/bootstrap.py` 在 `prepare_question` / `aprepare_question` 中先解析同目录 thread 引用，再与现有 `@文件` 预处理合并。原始用户问题保留给标题和运行记录，引用材料只追加到本轮 enriched prompt。
+- `app/cli/command_completer.py` 和 `app/cli/main.py` 使用 `prompt_toolkit` 的实时补全和回车接受逻辑；`app/tui/app.py` 使用 Textual 输入变化事件、后台候选刷新、上下键移动和回车确认。文件候选与 thread 候选共用 `@` 输入入口，并继续执行各自的边界检查。
+- `runtime/threads.py` 为新交互 thread 增加 pending 状态。`ThreadStore.materialize()` 在第一次发送前将 metadata 原子写入正式 session 目录并同步项目索引；切换或退出未发送的 pending thread 会丢弃内存预留，不留下恢复条目。
+
+### 验证
+
+- 同目录 thread 引用、消息过滤、标题/短 ID 消歧、历史预算截断、无绑定目录和损坏历史测试已覆盖；CLI 补全测试覆盖 ID、单词标题、中文标题、带引号多词标题以及单候选回车确认。
+- 受影响测试命令：
+
+  ```bash
+  .venv/bin/pytest -q \
+    poirot/backend/tests/v1/unit/runtime/test_thread_quote.py \
+    poirot/backend/tests/v1/unit/cli/test_command_completer.py \
+    poirot/backend/tests/v1/unit/runtime/test_file_access.py \
+    poirot/backend/tests/v1/integration/test_thread_persistence.py \
+    poirot/backend/tests/v1/integration/test_project_binding.py
+  ```
+
+- 最近一次上述受影响测试结果为 **53 项通过**；Python `compileall` 和针对本次修改文件的 `git diff --check` 通过。全量测试结果为 **2757 通过、4 跳过、13 失败**；失败项来自既有配置默认值、模型环境、npm、Windows `msvcrt`、旧 state 字段及环境中的 `python` 命令断言，与本功能无关。
+- 尚未在本次验证中重新执行真实 CLI/TUI 的人工交互流程，也未启动 Docker 容器；自动化测试覆盖了共用消息处理链路和选择器逻辑。

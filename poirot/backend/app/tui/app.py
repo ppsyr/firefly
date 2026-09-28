@@ -36,6 +36,10 @@ from poirot.backend.app.tui.mcp_panel import McpPanel
 from poirot.backend.app.tui.side_panel import SidePanel
 from poirot.backend.app.tui.status_bar import StatusBar
 from poirot.backend.agents.runtime.file_access import ThreadFileAccess, reference_fragment_at_cursor
+from poirot.backend.agents.runtime.thread_quote import (
+    thread_candidates,
+    thread_reference_fragment_at_cursor,
+)
 
 # 宽屏阈值：>= 此列数时展开右侧会话信息面板（仅全屏/极宽终端触发）。
 _WIDE_THRESHOLD = 160
@@ -121,7 +125,8 @@ class WelcomeView(Container):
     WelcomeView > InputRow > #welcome-input:focus {{
         border: tall {theme.BORDER_FOCUS};
     }}
-    #welcome-file-suggestions, #conv-file-suggestions {{
+    #welcome-file-suggestions, #conv-file-suggestions,
+    #welcome-thread-suggestions, #conv-thread-suggestions {{
         height: auto;
         max-height: 10;
         width: 100%;
@@ -187,6 +192,14 @@ class ConversationInput(TextArea):
             self.path = path
             super().__init__()
 
+    class ThreadSuggestionSelected(Message):
+        """A live same-directory thread candidate was accepted."""
+
+        def __init__(self, input: "ConversationInput", thread_id: str) -> None:
+            self.input = input
+            self.thread_id = thread_id
+            super().__init__()
+
     DEFAULT_CSS = f"""
     ConversationInput {{
         height: 1;
@@ -215,6 +228,11 @@ class ConversationInput(TextArea):
 
     async def _on_key(self, event: events.Key) -> None:
         app = getattr(self, "app", None)
+        if event.key in ("up", "down") and app is not None and app.has_thread_suggestions(self):
+            event.stop()
+            event.prevent_default()
+            app.move_thread_suggestion(-1 if event.key == "up" else 1)
+            return
         if event.key in ("up", "down") and app is not None and app.has_file_suggestions(self):
             event.stop()
             event.prevent_default()
@@ -226,6 +244,9 @@ class ConversationInput(TextArea):
         if event.key == "enter":
             event.stop()
             event.prevent_default()
+            if app is not None and app.has_thread_suggestions(self):
+                app.accept_thread_suggestion(self)
+                return
             if app is not None and app.has_file_suggestions(self):
                 app.accept_file_suggestion(self)
                 return
@@ -447,6 +468,10 @@ class PoirotTUI(App):
         self._file_suggestion_generation = 0
         self._file_suggestion_access: ThreadFileAccess | None = None
         self._file_suggestion_access_key: tuple[str, str | None] | None = None
+        self._thread_suggestions = []
+        self._thread_suggestion_input: ConversationInput | None = None
+        self._thread_suggestion_index = 0
+        self._thread_selected: dict[str, str] = {}
         self.cli_state: dict[str, Any] = {
             "pending_expert_mode": None,
             "pending_report": None,
@@ -520,6 +545,7 @@ class PoirotTUI(App):
             Static(subtitle, id="subtitle"),
             InputRow(
                 ConversationInput(placeholder="Ask anything...  (输入 / 查看命令)", id="welcome-input"),
+                Static("", id="welcome-thread-suggestions"),
                 Static("", id="welcome-file-suggestions"),
                 DraftSummary(self.draft, id="welcome-summary"),
             ),
@@ -535,6 +561,7 @@ class PoirotTUI(App):
                         placeholder="Ask anything...  (输入 / 查看命令 · Enter 发送 · Ctrl+Enter 换行)",
                         id="conv-input",
                     ),
+                    Static("", id="conv-thread-suggestions"),
                     Static("", id="conv-file-suggestions"),
                     DraftSummary(self.draft, id="conv-summary"),
                     Static("", id="input-info"),
@@ -682,14 +709,114 @@ class PoirotTUI(App):
         if not isinstance(event.text_area, ConversationInput):
             return
         if event.text_area.text == self.draft.text:
+            self._refresh_thread_suggestions(event.text_area)
             self._refresh_file_suggestions(event.text_area)
             return
         self.draft.text = event.text_area.text
         self._render_draft()
+        self._refresh_thread_suggestions(event.text_area)
         self._refresh_file_suggestions(event.text_area)
+
+    def _refresh_thread_suggestions(self, input_widget: ConversationInput) -> None:
+        """Search same-directory thread IDs/titles on every input change."""
+        fragment_info = thread_reference_fragment_at_cursor(
+            input_widget.text, self._cursor_offset(input_widget)
+        )
+        if fragment_info is None:
+            self._thread_suggestions = []
+            self._thread_suggestion_input = (
+                input_widget if (input_widget.id or "") in self._thread_selected else None
+            )
+            self._render_thread_suggestions()
+            return
+        fragment, _start, quoted = fragment_info
+        try:
+            current = self.runtime.thread_store.require(self.runtime.thread_id)
+            candidates = thread_candidates(
+                fragment,
+                current=current,
+                thread_store=self.runtime.thread_store,
+                quoted_title=quoted,
+            )
+        except Exception:
+            candidates = []
+        self._thread_suggestions = candidates
+        self._thread_suggestion_input = input_widget if candidates else None
+        self._thread_suggestion_index = min(
+            self._thread_suggestion_index, max(0, len(candidates) - 1)
+        )
+        self._render_thread_suggestions()
+
+    def _render_thread_suggestions(self) -> None:
+        active_id = self._thread_suggestion_input.id if self._thread_suggestion_input else None
+        for widget_id in ("#welcome-thread-suggestions", "#conv-thread-suggestions"):
+            try:
+                widget = self.query_one(widget_id, Static)
+                target_id = "welcome-input" if widget_id.endswith("welcome-thread-suggestions") else "conv-input"
+                selected = self._thread_selected.get(target_id)
+                if self._thread_suggestions and active_id == target_id:
+                    rows = ["Threads  ↑/↓ move  Enter select"]
+                    for index, candidate in enumerate(self._thread_suggestions[:10]):
+                        rows.append(f"{'>' if index == self._thread_suggestion_index else ' '} @{candidate.display}")
+                    widget.update("\n".join(rows))
+                    widget.styles.display = "block"
+                elif selected and target_id == active_id:
+                    widget.update(f"✓ {selected}")
+                    widget.styles.display = "block"
+                else:
+                    widget.update("")
+                    widget.styles.display = "none"
+            except Exception:
+                pass
+
+    def has_thread_suggestions(self, input_widget: ConversationInput) -> bool:
+        return self._thread_suggestion_input is input_widget and bool(self._thread_suggestions)
+
+    def move_thread_suggestion(self, delta: int) -> None:
+        if self._thread_suggestions:
+            self._thread_suggestion_index = max(
+                0,
+                min(len(self._thread_suggestions) - 1, self._thread_suggestion_index + delta),
+            )
+            self._render_thread_suggestions()
+
+    def accept_thread_suggestion(self, input_widget: ConversationInput) -> None:
+        if not self.has_thread_suggestions(input_widget):
+            return
+        candidate = self._thread_suggestions[self._thread_suggestion_index]
+        fragment_info = thread_reference_fragment_at_cursor(
+            input_widget.text, self._cursor_offset(input_widget)
+        )
+        if fragment_info is None:
+            return
+        _, start, _quoted = fragment_info
+        cursor = self._cursor_offset(input_widget)
+        selected_text = candidate.insert_text
+        new_text = input_widget.text[:start] + selected_text + input_widget.text[cursor:]
+        input_widget.text = new_text
+        cursor_after_selection = start + len(selected_text)
+        try:
+            line, column = new_text[:cursor_after_selection].count("\n"), len(
+                new_text[:cursor_after_selection].rsplit("\n", 1)[-1]
+            )
+            input_widget.move_cursor((line, column))
+        except Exception:
+            pass
+        self._thread_selected[input_widget.id or ""] = f"{candidate.title} [{candidate.thread_id}]"
+        self._thread_suggestions = []
+        # Keep the input association so the selected thread remains visibly
+        # confirmed while the user continues typing after the token.
+        self._thread_suggestion_input = input_widget
+        self._render_thread_suggestions()
+        input_widget.post_message(ConversationInput.ThreadSuggestionSelected(input_widget, candidate.thread_id))
 
     def _refresh_file_suggestions(self, input_widget: ConversationInput) -> None:
         """Refresh candidates without blocking Textual's input event loop."""
+        if thread_reference_fragment_at_cursor(input_widget.text, self._cursor_offset(input_widget)) is not None:
+            self._file_suggestions = []
+            self._file_suggestion_input = None
+            self._render_file_suggestions()
+            return
         accepted = self._accepted_file_text.get(input_widget.id or "")
         if accepted == input_widget.text:
             self._file_suggestions = []
@@ -803,6 +930,10 @@ class PoirotTUI(App):
         self._file_suggestion_access = None
         self._file_suggestion_access_key = None
         self._render_file_suggestions()
+        self._thread_suggestions = []
+        self._thread_suggestion_input = None
+        self._thread_selected.clear()
+        self._render_thread_suggestions()
 
     def has_file_suggestions(self, input_widget: ConversationInput) -> bool:
         return self._file_suggestion_input is input_widget and bool(self._file_suggestions)
@@ -865,6 +996,7 @@ class PoirotTUI(App):
 
     def clear_draft(self) -> None:
         self.draft.text = ""
+        self._thread_selected.clear()
         for input_id in ("#welcome-input", "#conv-input"):
             input_widget = self.query_one(input_id, ConversationInput)
             if input_widget.text:
@@ -1082,6 +1214,8 @@ class PoirotTUI(App):
 
         ctx = None
         try:
+            # Persist a reserved thread only when the first chat is sent.
+            self.runtime.ensure_thread_persisted()
             async def choose_file(reference, candidates):
                 return await self.push_screen_wait(
                     FilePicker([Path(path) for path in candidates], title=f"Select @{reference}")

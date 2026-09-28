@@ -67,6 +67,7 @@ from poirot.backend.agents.intent import default_intent_tree
 from poirot.backend.agents.leader.agent import _resolve_actual_model_name
 from poirot.backend.agents.prompts import get_prompt_manager
 from poirot.backend.agents.runtime.file_access import ThreadFileAccess
+from poirot.backend.agents.runtime.thread_quote import thread_candidates
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -316,6 +317,17 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
         except Exception:
             return []
 
+    def _thread_candidates(fragment: str, quoted: bool):
+        try:
+            current = runtime.thread_store.require(runtime.thread_id) if runtime.thread_store else None
+            if current is None:
+                return []
+            return [(item.thread_id, item.display, item.insert_text) for item in thread_candidates(
+                fragment, current=current, thread_store=runtime.thread_store, quoted_title=quoted
+            )]
+        except Exception:
+            return []
+
     completion_keys = KeyBindings()
 
     @completion_keys.add("enter", filter=Condition(
@@ -337,7 +349,8 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
 
     session: PromptSession = PromptSession(
         completer=ThreadedCompleter(SlashCommandCompleter(
-            get_registry(), skill_provider=_skill_names_provider, file_provider=_file_candidates
+            get_registry(), skill_provider=_skill_names_provider, file_provider=_file_candidates,
+            thread_provider=_thread_candidates,
         )),
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,
@@ -554,6 +567,9 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
         # 流式研究
         ctx = None
         try:
+            # A freshly opened thread is only materialized when the user
+            # submits the first chat message.
+            runtime.ensure_thread_persisted()
             async def choose_file(reference, candidates):
                 from poirot.backend.app.cli.thread_selector import select_file
                 item = runtime.thread_store.require(runtime.thread_id) if runtime.thread_store else None

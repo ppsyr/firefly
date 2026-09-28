@@ -163,10 +163,22 @@ class AppRuntime:
     active_threads: set[str] = field(default_factory=set)
     project: ProjectMetadata | None = None
     project_store: ProjectStore | None = None
+    thread_persisted: bool = True
+
+    def ensure_thread_persisted(self) -> None:
+        """Commit a newly opened interactive thread before graph execution."""
+        if self.thread_persisted or self.thread_store is None:
+            return
+        item = self.thread_store.materialize(self.thread_id)
+        self.thread_dir = self.thread_store.session_dir(self.thread_id)
+        self.thread_journal = RunJournal(self.thread_id, self.thread_dir / "thread-events.jsonl")
+        self.thread_journal.append("thread.started", {"project": item.project, "cwd": item.cwd})
+        self.thread_persisted = True
 
     def begin_turn(self, question: str) -> None:
         if self.active_threads:
             raise RuntimeError("A conversation is running; wait for it to finish")
+        self.ensure_thread_persisted()
         if self.thread_store is not None:
             self.thread_store.update(self.thread_id, first_message=question)
         self.active_threads.add(self.thread_id)
@@ -177,19 +189,44 @@ class AppRuntime:
             self.thread_store.update(self.thread_id)
 
     def prepare_question(self, question: str, *, choose=None, thread_id: str | None = None):
-        """Resolve one-turn ``@`` references using the current thread cwd."""
+        """Resolve one-turn file and same-directory thread references."""
         from poirot.backend.agents.runtime.file_access import (
             PreparedQuestion,
             ThreadFileAccess,
             extract_references,
             prepare_question,
         )
+        from poirot.backend.agents.runtime.thread_quote import parse_thread_references, quote_threads
 
-        if not extract_references(question):
+        effective_thread_id = thread_id or self.thread_id
+        if not parse_thread_references(question) and not extract_references(question):
             return PreparedQuestion(question, question)
-        item = self.thread_store.require(thread_id or self.thread_id) if self.thread_store else None
-        access = ThreadFileAccess(item.cwd if item else None)
-        return prepare_question(question, access, choose=choose)
+        current = self.thread_store.require(effective_thread_id) if self.thread_store else None
+        access = None
+        if self.thread_store and self.checkpointer:
+            access = ThreadFileAccess(current.cwd if current else None) if parse_thread_references(question) else None
+            thread_result = quote_threads(
+                question,
+                current=current,
+                thread_store=self.thread_store,
+                checkpointer=self.checkpointer,
+                file_name_conflict=lambda value: bool(access.search_filename(value)),
+            )
+        else:
+            thread_result = None
+        parse_question = thread_result.masked_question if thread_result else question
+        if not extract_references(parse_question):
+            suffix = thread_result.enriched_suffix if thread_result else ""
+            enriched = question + ("\n\n" + suffix if suffix else "")
+            return PreparedQuestion(question, enriched, thread_references=thread_result.quotes if thread_result else ())
+        if access is None:
+            access = ThreadFileAccess(current.cwd if current else None)
+        prepared_files = prepare_question(parse_question, access, choose=choose)
+        file_suffix = prepared_files.enriched[len(parse_question):]
+        enriched = question + file_suffix
+        if thread_result and thread_result.enriched_suffix:
+            enriched += "\n\n" + thread_result.enriched_suffix
+        return PreparedQuestion(question, enriched, prepared_files.references, thread_result.quotes if thread_result else ())
 
     async def aprepare_question(self, question: str, *, choose=None, thread_id: str | None = None):
         """Async ``@`` preparation, allowing the UI to select duplicate files."""
@@ -199,12 +236,37 @@ class AppRuntime:
             extract_references,
             prepare_question_async,
         )
+        from poirot.backend.agents.runtime.thread_quote import parse_thread_references, quote_threads
 
-        if not extract_references(question):
+        effective_thread_id = thread_id or self.thread_id
+        if not parse_thread_references(question) and not extract_references(question):
             return PreparedQuestion(question, question)
-        item = self.thread_store.require(thread_id or self.thread_id) if self.thread_store else None
-        access = ThreadFileAccess(item.cwd if item else None)
-        return await prepare_question_async(question, access, choose=choose)
+        current = self.thread_store.require(effective_thread_id) if self.thread_store else None
+        access = None
+        if self.thread_store and self.checkpointer:
+            access = ThreadFileAccess(current.cwd if current else None) if parse_thread_references(question) else None
+            thread_result = quote_threads(
+                question,
+                current=current,
+                thread_store=self.thread_store,
+                checkpointer=self.checkpointer,
+                file_name_conflict=lambda value: bool(access.search_filename(value)),
+            )
+        else:
+            thread_result = None
+        parse_question = thread_result.masked_question if thread_result else question
+        if not extract_references(parse_question):
+            suffix = thread_result.enriched_suffix if thread_result else ""
+            enriched = question + ("\n\n" + suffix if suffix else "")
+            return PreparedQuestion(question, enriched, thread_references=thread_result.quotes if thread_result else ())
+        if access is None:
+            access = ThreadFileAccess(current.cwd if current else None)
+        prepared_files = await prepare_question_async(parse_question, access, choose=choose)
+        file_suffix = prepared_files.enriched[len(parse_question):]
+        enriched = question + file_suffix
+        if thread_result and thread_result.enriched_suffix:
+            enriched += "\n\n" + thread_result.enriched_suffix
+        return PreparedQuestion(question, enriched, prepared_files.references, thread_result.quotes if thread_result else ())
 
     def switch_thread(self, thread_id: str) -> AppRuntime:
         if self.active_threads:
@@ -217,26 +279,35 @@ class AppRuntime:
         # Decode before replacing the active runtime; corrupt checkpoints remain untouched.
         self.checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
         item = self.thread_store.require(thread_id)
+        target_pending = self.thread_store.is_pending(thread_id)
         project = self.project_store.get(item.project) if item.project and self.project_store else self.project
         if item.project and (project is None or project.dir != item.cwd):
             raise ValueError(f"Thread project binding is unavailable: {item.project}")
-        thread_dir = self.thread_store.session_dir(thread_id)
+        if target_pending:
+            thread_dir = Path(self.config.runtime.logs_root) / "pending-threads" / thread_id
+        else:
+            thread_dir = self.thread_store.session_dir(thread_id)
         journal = RunJournal(thread_id, thread_dir / "thread-events.jsonl")
         journal.append("thread.resumed", {"previous_thread_id": self.thread_id})
+        if not self.thread_persisted:
+            self.thread_store.delete(self.thread_id)
         # ContextVar is process-local; never carry the previous thread's
         # sandbox into a newly selected thread.
         from poirot.backend.agents.sandbox.integration.context import set_sandbox_id
         set_sandbox_id(None)
         return replace(self, thread_id=thread_id, thread_dir=thread_dir, thread_journal=journal,
-                       project=project)
+                       project=project, thread_persisted=not target_pending)
 
     def new_thread(self) -> AppRuntime:
         if self.active_threads:
             raise RuntimeError("A conversation is running; wait for it to finish")
         if self.thread_store is None:
             raise RuntimeError("Thread storage is unavailable")
-        item = self.thread_store.create(project=self.project.project_name if self.project else None,
-                                        cwd=self.project.dir if self.project else None)
+        item = self.thread_store.create(
+            project=self.project.project_name if self.project else None,
+            cwd=self.project.dir if self.project else None,
+            persist=False,
+        )
         try:
             return self.switch_thread(item.thread_id)
         except BaseException:
@@ -253,7 +324,7 @@ class AppRuntime:
             raise KeyError(f"Project not found: {project_name}")
         from poirot.backend.agents.runtime.projects import normalize_project_dir
         normalize_project_dir(target.dir)
-        item = self.thread_store.create(project=target.project_name, cwd=target.dir)
+        item = self.thread_store.create(project=target.project_name, cwd=target.dir, persist=False)
         try:
             changed = self.switch_thread(item.thread_id)
             return replace(changed, project=target)
@@ -309,6 +380,8 @@ class AppRuntime:
         if self.thread_store is not None and self.thread_store.get(effective_thread_id) is None:
             self.thread_store.create(effective_thread_id, project=self.project.project_name if self.project else None,
                                      cwd=self.project.dir if self.project else None)
+        if effective_thread_id == self.thread_id:
+            self.ensure_thread_persisted()
         thread = self.thread_store.require(effective_thread_id) if self.thread_store else None
         prepared = self.prepare_question(question, thread_id=effective_thread_id)
         context = self.run_manager.create_run(
@@ -408,6 +481,7 @@ class AppRuntime:
             active_threads=self.active_threads,
             project=self.project,
             project_store=self.project_store,
+            thread_persisted=self.thread_persisted,
         )
 
     def reload_mcp_tools(self) -> AppRuntime:
@@ -453,6 +527,7 @@ class AppRuntime:
             active_threads=self.active_threads,
             project=self.project,
             project_store=self.project_store,
+            thread_persisted=self.thread_persisted,
         )
 
     def switch_model(self, provider: str, model: str | None = None) -> AppRuntime:
@@ -526,6 +601,7 @@ class AppRuntime:
             active_threads=self.active_threads,
             project=self.project,
             project_store=self.project_store,
+            thread_persisted=self.thread_persisted,
         )
 
 
@@ -708,14 +784,27 @@ def bootstrap_runtime(
     project: ProjectMetadata | None = initial_project
     thread_id = validate_thread_id(thread_id) if thread_id else str(uuid4())
     existing_thread = thread_store.get(thread_id)
+    thread_persisted = existing_thread is not None
     if existing_thread is None:
-        thread_store.create(thread_id, project=initial_project.project_name, cwd=initial_project.dir)
+        # Reserve the ID in memory. Metadata/index/checkpoint files are only
+        # created once the user submits the first chat message.
+        thread_store.create(
+            thread_id,
+            project=initial_project.project_name,
+            cwd=initial_project.dir,
+            persist=False,
+        )
+        existing_thread = None
     elif existing_thread.project is not None:
         project = project_store.get(existing_thread.project)
         if project is None or project.dir != existing_thread.cwd:
             raise ValueError(f"Thread project binding is unavailable: {existing_thread.project}")
-    thread_dir = thread_store.session_dir(thread_id)
-    thread_dir.mkdir(parents=True, exist_ok=True)
+    if thread_persisted:
+        thread_dir = thread_store.session_dir(thread_id)
+    else:
+        # Keep startup diagnostics outside the persisted session tree. The
+        # session directory is created only by ensure_thread_persisted().
+        thread_dir = Path(config.runtime.logs_root) / "pending-threads" / thread_id
     thread_journal = RunJournal(
         run_id=thread_id,
         events_path=thread_dir / "thread-events.jsonl",
@@ -940,7 +1029,7 @@ def bootstrap_runtime(
     except BaseException:
         if "checkpointer" in locals():
             checkpointer.close()
-        if existing_thread is None:
+        if not thread_persisted:
             thread_store.delete(thread_id)
         raise
     try:
@@ -962,7 +1051,7 @@ def bootstrap_runtime(
         )
     except BaseException:
         checkpointer.close()
-        if existing_thread is None:
+        if not thread_persisted:
             thread_store.delete(thread_id)
         raise
     thread_journal.append("agent.constructed", {
@@ -989,4 +1078,5 @@ def bootstrap_runtime(
         checkpointer=checkpointer,
         project=project,
         project_store=project_store,
+        thread_persisted=thread_persisted,
     )
