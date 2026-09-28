@@ -310,8 +310,17 @@ Type `/` in TUI or CLI for command completion.
 | `/prompt show <cat/name>` | Show prompt template |
 | `/prompt reload` | Reload prompt templates |
 
-Thread state is stored in `~/.poirot/checkpoints.db` and metadata in
-`~/.poirot/threads/<id>.json`. Set `POIROT_STORAGE_ROOT` to move both together.
+Each thread is stored in the current user's home directory under
+`~/.poirot/sessions/YYYY/MM/DD/thread-HH-MM-SS-<id>/`. The date and time use the
+local creation time; resuming or renaming a thread keeps this directory unchanged.
+Each directory contains `metadata.json`, a complete LangGraph `checkpoints.db`,
+`thread-events.jsonl`, and `runs/` with run logs, reports, and artifacts.
+Set `POIROT_STORAGE_ROOT` to override `~/.poirot`. The default follows the current
+user's home directory on every computer. Existing `threads/<id>.json` metadata
+and the shared `checkpoints.db` are migrated when a thread is read/restored;
+the shared database is retained for other threads. Deleting a thread clears its
+metadata and checkpoints (including legacy checkpoint rows), and retains logs,
+reports, artifacts, and long-term memory.
 The CLI starts a new thread; use `/thread list` to restore an earlier one, then
 continue chatting. `/thread delete` refuses the current thread: switch or run
 `/thread new` first. Selection restores the last committed checkpoint; it does

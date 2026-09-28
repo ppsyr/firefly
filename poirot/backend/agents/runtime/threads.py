@@ -16,6 +16,11 @@ from uuid import uuid4
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
+def storage_root(root: str | Path | None = None) -> Path:
+    value = root if root is not None else os.environ.get("POIROT_STORAGE_ROOT")
+    return (Path(value).expanduser() if value else Path.home() / ".poirot").resolve()
+
+
 def validate_thread_id(thread_id: str) -> str:
     if not isinstance(thread_id, str) or not _ID.fullmatch(thread_id):
         raise ValueError("Invalid thread ID")
@@ -48,20 +53,43 @@ class ThreadMetadata:
 
 
 class ThreadStore:
-    def __init__(self, root: str | Path):
-        self.root = Path(root).expanduser().resolve() / "threads"
+    def __init__(self, root: str | Path | None = None):
+        self.storage_root = storage_root(root)
+        self.root = self.storage_root / "sessions"
+        self._legacy_root = self.storage_root / "threads"
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
 
     def _path(self, thread_id: str) -> Path:
-        return self.root / f"{validate_thread_id(thread_id)}.json"
+        thread_id = validate_thread_id(thread_id)
+        pattern = r"thread-\d{2}-\d{2}-\d{2}-" + re.escape(thread_id)
+        paths = [path for path in self.root.glob(f"*/*/*/thread-*-{thread_id}/metadata.json") if re.fullmatch(pattern, path.parent.name)]
+        if len(paths) > 1:
+            raise ValueError(f"Duplicate session directories for thread: {thread_id}")
+        if paths:
+            return paths[0]
+        return self._legacy_root / f"{thread_id}.json"
+
+    def _new_path(self, item: ThreadMetadata) -> Path:
+        created = datetime.fromisoformat(item.created_at).astimezone()
+        return self.root / created.strftime("%Y/%m/%d") / f"thread-{created:%H-%M-%S}-{item.thread_id}" / "metadata.json"
+
+    def session_dir(self, thread_id: str) -> Path:
+        with self._lock:
+            self.require(thread_id)
+            return self._path(thread_id).parent
 
     def _read(self, path: Path) -> ThreadMetadata:
         data = json.loads(path.read_text(encoding="utf-8"))
         for key in ("thread_id", "title", "created_at", "updated_at"):
             if not isinstance(data.get(key), str) or not data[key]:
                 raise ValueError(f"Invalid metadata field: {key}")
-        if path.stem != validate_thread_id(data["thread_id"]):
+        thread_id = validate_thread_id(data["thread_id"])
+        if path.name == "metadata.json":
+            matches = re.fullmatch(r"thread-\d{2}-\d{2}-\d{2}-" + re.escape(thread_id), path.parent.name)
+        else:
+            matches = path.stem == thread_id
+        if not matches:
             raise ValueError("Thread ID does not match filename")
         for key in ("created_at", "updated_at"):
             if datetime.fromisoformat(data[key]).tzinfo is None:
@@ -73,7 +101,12 @@ class ThreadStore:
     def get(self, thread_id: str) -> ThreadMetadata | None:
         with self._lock:
             path = self._path(thread_id)
-            return self._read(path) if path.exists() else None
+            if not path.exists():
+                return None
+            item = self._read(path)
+            if path.parent == self._legacy_root:
+                self._write(item)
+            return item
 
     def require(self, thread_id: str) -> ThreadMetadata:
         item = self.get(thread_id)
@@ -83,14 +116,18 @@ class ThreadStore:
 
     def _write(self, item: ThreadMetadata) -> None:
         path = self._path(item.thread_id)
+        if path.parent == self._legacy_root:
+            path = self._new_path(item)
+        path.parent.mkdir(parents=True, exist_ok=True)
         temp = None
         try:
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.root, prefix=".thread-", delete=False) as file:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=".thread-", delete=False) as file:
                 temp = Path(file.name)
                 json.dump(asdict(item), file, ensure_ascii=False, indent=2)
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temp, path)
+            (self._legacy_root / f"{item.thread_id}.json").unlink(missing_ok=True)
         finally:
             if temp is not None:
                 temp.unlink(missing_ok=True)
@@ -119,9 +156,14 @@ class ThreadStore:
     def list(self) -> list[ThreadMetadata]:
         with self._lock:
             items = []
-            for path in self.root.glob("*.json"):
+            paths = list(self.root.glob("*/*/*/thread-*/metadata.json")) + list(self._legacy_root.glob("*.json"))
+            seen = set()
+            for path in paths:
                 try:
-                    items.append(self._read(path))
+                    item = self._read(path)
+                    if item.thread_id not in seen:
+                        items.append(self.require(item.thread_id))
+                        seen.add(item.thread_id)
                 except Exception as exc:
                     warnings.warn(f"Invalid thread metadata {path}: {exc}", stacklevel=2)
             return sorted(items, key=lambda item: (datetime.fromisoformat(item.updated_at), item.thread_id), reverse=True)
@@ -132,3 +174,4 @@ class ThreadStore:
             if not path.exists():
                 raise KeyError(f"Thread not found: {thread_id}")
             path.unlink()
+            (self._legacy_root / f"{thread_id}.json").unlink(missing_ok=True)

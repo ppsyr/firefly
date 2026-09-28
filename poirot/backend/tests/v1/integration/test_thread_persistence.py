@@ -7,6 +7,7 @@ import subprocess
 import sys
 import warnings
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +15,7 @@ import pytest
 from langgraph.graph import START, StateGraph
 from typing import TypedDict
 
-from poirot.backend.agents.runtime.checkpointer import SQLiteCheckpointer
+from poirot.backend.agents.runtime.checkpointer import SQLiteCheckpointer, SessionCheckpointer
 from poirot.backend.agents.runtime.threads import ThreadStore, validate_thread_id
 from poirot.backend.app.bootstrap import AppRuntime
 from poirot.backend.agents.config.loader import load_config
@@ -81,11 +82,12 @@ def test_thread_metadata_and_titles(tmp_path):
 def test_corrupt_metadata_is_preserved(tmp_path):
     store = ThreadStore(tmp_path)
     valid = store.create()
-    bad = store.root / "broken.json"
+    bad = store.root / "2026" / "09" / "28" / "thread-00-00-00-broken" / "metadata.json"
+    bad.parent.mkdir(parents=True)
     bad.write_text("{", encoding="utf-8")
     with warnings.catch_warnings(record=True) as records:
         assert store.list() == [valid]
-    assert "broken.json" in str(records[0].message)
+    assert "metadata.json" in str(records[0].message)
     assert bad.read_text(encoding="utf-8") == "{"
 
 
@@ -249,3 +251,84 @@ def test_actual_app_bootstrap_across_processes(tmp_path):
     assert first["title"] == second["title"]
     assert second["humans"] == ["first question", "second question"]
     assert second["answer"] == "deterministic answer"
+    metadata = list((tmp_path / "user" / "sessions").glob("*/*/*/thread-*-fixed-thread/metadata.json"))
+    assert len(metadata) == 1
+    assert (metadata[0].parent / "checkpoints.db").is_file()
+    assert (metadata[0].parent / "thread-events.jsonl").is_file()
+    assert len(list((metadata[0].parent / "runs").glob("*/record.json"))) == 2
+    assert not (tmp_path / "user" / "checkpoints.db").exists()
+
+
+def test_default_sessions_follow_home_and_ignore_cwd(tmp_path, monkeypatch):
+    home = tmp_path / "another-user"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("POIROT_STORAGE_ROOT", raising=False)
+    store = ThreadStore()
+    item = store.create("portable")
+    created = datetime.fromisoformat(item.created_at).astimezone()
+    directory = store.session_dir(item.thread_id)
+    assert directory == home / ".poirot" / "sessions" / created.strftime("%Y/%m/%d") / f"thread-{created:%H-%M-%S}-portable"
+    monkeypatch.chdir(tmp_path)
+    reopened = ThreadStore()
+    assert reopened.require("portable") == item
+    reopened.update("portable", title="renamed")
+    assert reopened.session_dir("portable") == directory
+
+
+def test_session_ids_with_common_suffix_and_updates_across_dates(tmp_path, monkeypatch):
+    store = ThreadStore(tmp_path)
+    monkeypatch.setattr("poirot.backend.agents.runtime.threads._now", lambda: "2026-01-01T10:00:00+00:00")
+    first = store.create("x-foo")
+    second = store.create("foo")
+    directory = store.session_dir("foo")
+    assert store.get("x-foo") == first
+    assert store.get("foo") == second
+    monkeypatch.setattr("poirot.backend.agents.runtime.threads._now", lambda: "2026-02-02T10:00:00+00:00")
+    store.update("foo", title="Later title")
+    assert store.session_dir("foo") == directory
+    assert len(store.list()) == 2
+    store.delete("foo")
+    assert store.require("x-foo") == first
+    assert store.get("foo") is None
+
+
+def test_migrate_legacy_checkpoints_and_pending_writes(tmp_path):
+    root = tmp_path / "user"
+    legacy_metadata = root / "threads" / "legacy.json"
+    legacy_metadata.parent.mkdir(parents=True)
+    data = {"thread_id": "legacy", "title": "Manual title", "created_at": "2025-12-31T23:30:00+00:00", "updated_at": "2026-01-02T00:00:00+00:00", "title_set": True}
+    legacy_metadata.write_text(json.dumps(data), encoding="utf-8")
+    legacy = SQLiteCheckpointer(root / "checkpoints.db")
+    config = {"configurable": {"thread_id": "legacy"}}
+    other_config = {"configurable": {"thread_id": "other"}}
+    graph = _graph(legacy)
+    graph.invoke({"count": 1, "label": "saved"}, config)
+    graph.invoke({"count": 10, "label": "other"}, other_config)
+    checkpoint = legacy.get_tuple(config)
+    legacy.put_writes(checkpoint.config, [("pending", "unfinished")], "pending-task")
+    legacy.close()
+
+    store = ThreadStore(root)
+    migrated = store.require("legacy")
+    assert migrated.title == data["title"]
+    assert migrated.created_at == data["created_at"]
+    assert not legacy_metadata.exists()
+    directory = store.session_dir("legacy")
+    saver = SessionCheckpointer(store)
+    try:
+        restored = saver.get_tuple(config)
+        assert restored.checkpoint == checkpoint.checkpoint
+        assert ("pending-task", "pending", "unfinished") in restored.pending_writes
+        assert _graph(saver).invoke(None, config)["count"] == 2
+        with sqlite3.connect(directory / "checkpoints.db") as conn:
+            assert conn.execute("SELECT DISTINCT thread_id FROM checkpoints").fetchall() == [("legacy",)]
+        saver.delete_thread("legacy")
+        store.delete("legacy")
+    finally:
+        saver.close()
+    assert store.get("legacy") is None
+    with sqlite3.connect(root / "checkpoints.db") as conn:
+        assert conn.execute("SELECT count(*) FROM checkpoints WHERE thread_id='legacy'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM writes WHERE thread_id='legacy'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM checkpoints WHERE thread_id='other'").fetchone()[0] > 0

@@ -1,4 +1,4 @@
-from poirot.backend.agents.runtime.checkpointer import SQLiteCheckpointer
+from poirot.backend.agents.runtime.checkpointer import SessionCheckpointer
 
 from poirot.backend.agents.runtime.checkpointer import (
     get_checkpointer,
@@ -18,8 +18,10 @@ def test_get_checkpointer_returns_sqlite_saver(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("POIROT_STORAGE_ROOT", str(tmp_path))
     reset_checkpointer()
     cp = get_checkpointer()
-    assert isinstance(cp, SQLiteCheckpointer)
-    assert cp.path == tmp_path / "checkpoints.db"
+    assert isinstance(cp, SessionCheckpointer)
+    cp.get_tuple({"configurable": {"thread_id": "test"}})
+    assert (cp.store.session_dir("test") / "checkpoints.db").is_file()
+    assert not (tmp_path / "checkpoints.db").exists()
 
 
 def test_reset_checkpointer_creates_new_instance(tmp_path, monkeypatch) -> None:

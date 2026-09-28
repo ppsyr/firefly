@@ -74,7 +74,7 @@ from poirot.backend.agents.runtime.run_manager import RunManager
 from poirot.backend.agents.agent_tools.available import get_available_tools, select_search_tool
 from poirot.backend.agents.multiagent.bootstrap import MultiAgentSetup, setup_multiagent
 from poirot.backend.agents.multiagent.config import load_multiagent_config
-from poirot.backend.agents.runtime.checkpointer import SQLiteCheckpointer
+from poirot.backend.agents.runtime.checkpointer import SQLiteCheckpointer, SessionCheckpointer
 from poirot.backend.agents.runtime.threads import ThreadStore, validate_thread_id
 
 # 项目根路径（app/bootstrap.py 的上三级）。
@@ -154,7 +154,7 @@ class AppRuntime:
     skill_manager: Any = None
     multiagent_setup: MultiAgentSetup | None = None
     thread_store: ThreadStore | None = None
-    checkpointer: SQLiteCheckpointer | None = None
+    checkpointer: SQLiteCheckpointer | SessionCheckpointer | None = None
     active_threads: set[str] = field(default_factory=set)
 
     def begin_turn(self, question: str) -> None:
@@ -179,8 +179,9 @@ class AppRuntime:
             return self
         # Decode before replacing the active runtime; corrupt checkpoints remain untouched.
         self.checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
-        thread_dir = Path(self.config.runtime.logs_root) / "threads" / thread_id
+        thread_dir = self.thread_store.session_dir(thread_id)
         journal = RunJournal(thread_id, thread_dir / "thread-events.jsonl")
+        journal.append("thread.resumed", {"previous_thread_id": self.thread_id})
         return replace(self, thread_id=thread_id, thread_dir=thread_dir, thread_journal=journal)
 
     def new_thread(self) -> AppRuntime:
@@ -239,7 +240,7 @@ class AppRuntime:
             user_id=user_id,
             run_id=run_id,
             model_name=self.researcher_model_name,
-            thread_dir=Path(self.config.runtime.logs_root) / "threads" / effective_thread_id,
+            thread_dir=self.thread_store.session_dir(effective_thread_id) if self.thread_store else self.thread_dir,
         )
         self.run_manager.mark_running(context.run_id)
         try:
@@ -604,8 +605,9 @@ def bootstrap_runtime(
     thread_store = ThreadStore(config.runtime.storage_root)
     thread_id = validate_thread_id(thread_id) if thread_id else str(uuid4())
     existing_thread = thread_store.get(thread_id)
-    threads_root = logs_root / "threads"
-    thread_dir = threads_root / thread_id
+    if existing_thread is None:
+        thread_store.create(thread_id)
+    thread_dir = thread_store.session_dir(thread_id)
     thread_dir.mkdir(parents=True, exist_ok=True)
     thread_journal = RunJournal(
         run_id=thread_id,
@@ -820,10 +822,8 @@ def bootstrap_runtime(
     )
 
     # ── LeaderAgent 构造：注入工具 + 中间件 ──
-    if existing_thread is None:
-        thread_store.create(thread_id)
     try:
-        checkpointer = SQLiteCheckpointer(Path(config.runtime.storage_root).expanduser() / "checkpoints.db")
+        checkpointer = SessionCheckpointer(thread_store)
         if existing_thread is not None:
             checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
     except BaseException:
