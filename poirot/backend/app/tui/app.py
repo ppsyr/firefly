@@ -710,6 +710,7 @@ class PoirotTUI(App):
     def _handle_command(self, cmd: str) -> None:
         """处理 / 命令。"""
         from rich.console import Console
+        from rich.text import Text
         from io import StringIO
 
         buf = StringIO()
@@ -726,6 +727,37 @@ class PoirotTUI(App):
         should_exit = handle_command(
             cmd, temp_console, _MockRenderer(), self.cli_state, self.runtime,
         )
+
+        if self.cli_state.pop("pending_thread_new", False):
+            try:
+                self.runtime = self.runtime.new_thread()
+                self.cli_state["thread_title"] = self.runtime.thread_store.require(self.runtime.thread_id).title
+                conv.clear()
+                conv.state["tool_results"] = []
+                conv.state["thinking_log"] = []
+                conv.state["full_answer"] = ""
+                conv.write(Text(f"New thread: {self.cli_state['thread_title']} [{self.runtime.thread_id}]"))
+            except Exception as exc:
+                conv.write(Text(f"Thread creation failed: {exc}"))
+        selected = self.cli_state.pop("pending_thread_switch", None)
+        if selected:
+            try:
+                self.runtime = self.runtime.switch_thread(selected)
+                self.cli_state["thread_title"] = self.runtime.thread_store.require(self.runtime.thread_id).title
+                conv.clear()
+                conv.state["tool_results"] = []
+                conv.state["thinking_log"] = []
+                conv.state["full_answer"] = ""
+                conv.write(Text(f"Restored: {self.cli_state['thread_title']} [{self.runtime.thread_id}]"))
+            except Exception as exc:
+                conv.write(Text(f"Thread switch failed: {exc}"))
+        if self.cli_state.pop("pending_thread_list", False):
+            for item in self.runtime.thread_store.list():
+                conv.write(Text(f"{item.title} [{item.thread_id}]"))
+        if cmd.startswith("/thread"):
+            self.query_one("#input-info", Static).update(self._input_info())
+            self.query_one(StatusBar).update_state(self.cli_state)
+            self._refresh_side_panel()
 
         output = buf.getvalue().strip()
         if output:
@@ -767,6 +799,7 @@ class PoirotTUI(App):
     @work(exclusive=True, group="research")
     async def _run_research(self, question: str) -> None:
         """流式研究——PoirotStreamClient → ConversationLog + StatusBar + SidePanel。"""
+        from rich.text import Text
         conv = self.query_one(ConversationLog)
         status = self.query_one(StatusBar)
 
@@ -779,6 +812,7 @@ class PoirotTUI(App):
         self.add_class("running")
         self._run_start_time = time.monotonic()
 
+        ctx = None
         try:
             ctx = self.runtime.run_manager.create_run(
                 thread_id=self.runtime.thread_id,
@@ -788,6 +822,7 @@ class PoirotTUI(App):
                 thread_dir=self.runtime.thread_dir,
             )
             self.runtime.run_manager.mark_running(ctx.run_id)
+            self.runtime.begin_turn(question)
             config = self._build_stream_config(ctx)
             client = PoirotStreamClient(graph=self.runtime.leader_agent.graph, config=config)
 
@@ -816,10 +851,15 @@ class PoirotTUI(App):
             from rich.text import Text
             conv.write(Text(f"✗ {exc}", style=theme.ACCENT_WARN))
             try:
-                self.runtime.run_manager.mark_failed(ctx.run_id, str(exc))
+                if ctx is not None:
+                    self.runtime.run_manager.mark_failed(ctx.run_id, str(exc))
             except Exception:
                 pass
         finally:
+            try:
+                self.runtime.end_turn()
+            except Exception as exc:
+                conv.write(Text(f"Thread metadata update failed: {exc}"))
             self.cli_state["_running"] = False
             self.remove_class("running")
             status.update_state(self.cli_state)

@@ -138,7 +138,7 @@ class LeaderAgent:
     graph: Any
     capability_registry: CapabilityRegistry
 
-    def run(self, question: str, run_context: Any) -> AgentRunResult:
+    def run(self, question: str, run_context: Any, *, thread_title: str | None = None) -> AgentRunResult:
         """驱动一次研究：构造 state + config → ainvoke → 收报告 → 存 artifact。
 
         Args:
@@ -165,6 +165,7 @@ class LeaderAgent:
                 "expert_mode": run_context.config.runtime.expert_mode,
                 "run_id": run_context.run_id,
                 "thread_id": run_context.thread_id,
+                "thread_title": thread_title,
                 "journal": run_context.journal,
                 "output_dir": str(run_context.output_dir),
                 "plan_enabled": run_context.config.runtime.plan_enabled,

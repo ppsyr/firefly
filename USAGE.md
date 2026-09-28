@@ -299,10 +299,24 @@ Type `/` in TUI or CLI for command completion.
 | `/model <provider>` | Switch provider, next round |
 | `/model <provider> <model>` | Switch provider and model |
 | `/tools` | List available tools |
-| `/thread` | Show thread info |
+| `/thread` | Show current thread ID and title |
+| `/thread info` | Show ID, title, creation and update times |
+| `/thread list` | Select a saved thread (arrow keys, Enter, Esc); prints IDs in non-interactive mode |
+| `/thread new` | Create and switch to an empty thread |
+| `/thread switch <id>` | Restore a saved thread by its full ID |
+| `/thread rename <title>` | Set the current thread's title |
+| `/thread delete <id>` | Delete another thread's metadata and checkpoints |
 | `/prompt list` | List prompt templates |
 | `/prompt show <cat/name>` | Show prompt template |
 | `/prompt reload` | Reload prompt templates |
+
+Thread state is stored in `~/.poirot/checkpoints.db` and metadata in
+`~/.poirot/threads/<id>.json`. Set `POIROT_STORAGE_ROOT` to move both together.
+The CLI starts a new thread; use `/thread list` to restore an earlier one, then
+continue chatting. `/thread delete` refuses the current thread: switch or run
+`/thread new` first. Selection restores the last committed checkpoint; it does
+not resume external processes or unfinished tools. Concurrent management of the
+same thread by multiple processes is not supported.
 
 ### Skill
 

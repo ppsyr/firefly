@@ -20,6 +20,7 @@ from typing import Any, override
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langgraph.runtime import Runtime
+from poirot.backend.agents.middlewares.run_journal_middleware import _get_runtime_value
 
 
 class TitleMiddleware(AgentMiddleware):
@@ -44,6 +45,9 @@ class TitleMiddleware(AgentMiddleware):
         Returns:
             含 metadata.title 的 state patch。
         """
+        title = _get_runtime_value(runtime, "thread_title")
+        if title is not None:
+            return {"metadata": {"title": title}}
         source = state.get("research_question") or state.get("user_input") or "Untitled"
         return {"metadata": {"title": str(source)[:60]}}
 

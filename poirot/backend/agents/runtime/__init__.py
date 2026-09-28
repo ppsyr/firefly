@@ -8,7 +8,7 @@
 【内容摘要】
 - run_record     : 运行记录数据契约（RunRecord / RunStatus），定义一次运行的数据形态。
 - run_manager    : 运行管理器（RunManager），创建 run、推进状态、持久化记录的核心调度中心。
-- checkpointer   : LangGraph state 持久化单例（InMemorySaver），作为 create_agent 编译参数。
+- checkpointer   : LangGraph SQLite state 持久化，作为 create_agent 编译参数。
 - run_context    : 运行上下文（RunContext），运行期跨组件共享的容器与路径派生。
 
 【职责边界】

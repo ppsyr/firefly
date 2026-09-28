@@ -32,6 +32,7 @@ from prompt_toolkit.document import Document
 from poirot.backend.app.cli.registry import CommandRegistry
 
 _SKILL_SUBCOMMANDS = ("list", "off", "enable", "disable", "install")
+_THREAD_SUBCOMMANDS = ("info", "list", "new", "switch", "rename", "delete")
 
 
 class SlashCommandCompleter(Completer):
@@ -87,6 +88,13 @@ class SlashCommandCompleter(Completer):
 
         # /skill <arg> 补全：行以 /skill + 空白 开头，cursor 在参数位
         stripped = document.text_before_cursor.lstrip()
+        if stripped.startswith("/thread") and len(stripped) > 7 and stripped[7].isspace():
+            arg = stripped[8:]
+            if not arg.strip() or len(arg.split()) <= 1 and not arg.endswith(" "):
+                for sub in _THREAD_SUBCOMMANDS:
+                    if sub.startswith(word.lower()):
+                        yield Completion(sub, start_position=-len(word), display_meta="thread command")
+            return
         if stripped.startswith("/skill") and len(stripped) > 6 and stripped[6] in (" ", "\t"):
             arg_word = word
             arg_lower = arg_word.lower()

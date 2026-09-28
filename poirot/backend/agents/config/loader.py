@@ -75,6 +75,7 @@ def load_config(
     selected_expert = bool(overrides.get("expert_mode", expert_mode))
 
     raw = deepcopy(DEFAULT_CONFIG)
+    raw["runtime"]["storage_root"] = os.environ.get("POIROT_STORAGE_ROOT", "~/.poirot")
     if selected_expert:
         _deep_merge(raw, EXPERT_PROFILE)
     _apply_cli_overrides(raw, overrides)
@@ -106,6 +107,7 @@ def _apply_cli_overrides(raw: dict[str, Any], overrides: dict[str, Any]) -> None
 
     flat_targets = {
         "logs_root": ("runtime", "logs_root"),
+        "storage_root": ("runtime", "storage_root"),
         "output_root": ("runtime", "output_root"),
         "researcher_model": ("models", "researcher_model"),
         "reporter_model": ("models", "reporter_model"),

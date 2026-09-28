@@ -65,6 +65,7 @@ class RuntimeConfig:
     plan_enabled: bool = True
     reflection_enabled: bool = False
     graph_node_multiplier: int = 200
+    storage_root: str = "~/.poirot"
 
 
 @dataclass(frozen=True)

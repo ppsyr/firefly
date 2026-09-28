@@ -6,9 +6,8 @@ skill）、装配 multiagent、构造 CapabilityRegistry 与 LeaderAgent，产�
 同时提供运行时热切换能力（expert 模式 / MCP 工具 / model），全部保持不可变语义。
 
 【内容摘要】
-- _PROJECT_ROOT / _CST                    : 项目根路径 + 中国时区常量。
+- _PROJECT_ROOT                           : 项目根路径。
 - _resolve_relative_paths()               : 把 config 里相对路径锚定到项目根。
-- _make_thread_id()                       : 生成 thread ID。
 - _build_chat_model()                     : 按 provider 构造 chat model。
 - _check_node_available()                 : 检测 npx 是否可用（MCP 前置条件）。
 - AppRuntime                              : 运行时容器（config + registry + leader + setup）。
@@ -46,13 +45,11 @@ skill）、装配 multiagent、构造 CapabilityRegistry 与 LeaderAgent，产�
 """
 from __future__ import annotations
 
-import random
 import shutil
-import string
 import sys
-from dataclasses import dataclass, replace
-from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass, replace, field
 from pathlib import Path
+from uuid import uuid4
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -77,11 +74,11 @@ from poirot.backend.agents.runtime.run_manager import RunManager
 from poirot.backend.agents.agent_tools.available import get_available_tools, select_search_tool
 from poirot.backend.agents.multiagent.bootstrap import MultiAgentSetup, setup_multiagent
 from poirot.backend.agents.multiagent.config import load_multiagent_config
+from poirot.backend.agents.runtime.checkpointer import SQLiteCheckpointer
+from poirot.backend.agents.runtime.threads import ThreadStore, validate_thread_id
 
 # 项目根路径（app/bootstrap.py 的上三级）。
 _PROJECT_ROOT = Path(__file__).parents[3]
-# 中国时区（thread ID 用）。
-_CST = timezone(timedelta(hours=8))
 
 
 def _resolve_relative_paths(config: AppConfig) -> AppConfig:
@@ -109,13 +106,6 @@ def _resolve_relative_paths(config: AppConfig) -> AppConfig:
         config,
         context_governance=replace(config.context_governance, params=params),
     )
-
-
-def _make_thread_id() -> str:
-    """生成 thread ID：thread-<CST 时间戳>-<4 位随机串>。"""
-    ts = datetime.now(_CST).strftime("%Y%m%dT%H%M%S")
-    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
-    return f"thread-{ts}-{suffix}"
 
 
 def _build_chat_model(config: ProviderConfig) -> BaseChatModel:
@@ -163,6 +153,72 @@ class AppRuntime:
     artifact_server: Any = None
     skill_manager: Any = None
     multiagent_setup: MultiAgentSetup | None = None
+    thread_store: ThreadStore | None = None
+    checkpointer: SQLiteCheckpointer | None = None
+    active_threads: set[str] = field(default_factory=set)
+
+    def begin_turn(self, question: str) -> None:
+        if self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        if self.thread_store is not None:
+            self.thread_store.update(self.thread_id, first_message=question)
+        self.active_threads.add(self.thread_id)
+
+    def end_turn(self) -> None:
+        self.active_threads.discard(self.thread_id)
+        if self.thread_store is not None:
+            self.thread_store.update(self.thread_id)
+
+    def switch_thread(self, thread_id: str) -> AppRuntime:
+        if self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        if self.thread_store is None or self.checkpointer is None:
+            raise RuntimeError("Thread storage is unavailable")
+        self.thread_store.require(thread_id)
+        if thread_id == self.thread_id:
+            return self
+        # Decode before replacing the active runtime; corrupt checkpoints remain untouched.
+        self.checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
+        thread_dir = Path(self.config.runtime.logs_root) / "threads" / thread_id
+        journal = RunJournal(thread_id, thread_dir / "thread-events.jsonl")
+        return replace(self, thread_id=thread_id, thread_dir=thread_dir, thread_journal=journal)
+
+    def new_thread(self) -> AppRuntime:
+        if self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        if self.thread_store is None:
+            raise RuntimeError("Thread storage is unavailable")
+        item = self.thread_store.create()
+        try:
+            return self.switch_thread(item.thread_id)
+        except BaseException:
+            self.thread_store.delete(item.thread_id)
+            raise
+
+    def delete_thread(self, thread_id: str) -> None:
+        if thread_id in self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        if thread_id == self.thread_id:
+            raise ValueError("Cannot delete current thread; use /thread new or switch first")
+        if self.thread_store is None or self.checkpointer is None:
+            raise RuntimeError("Thread storage is unavailable")
+        self.thread_store.require(thread_id)
+        self.checkpointer.delete_thread(thread_id)
+        try:
+            self.thread_store.delete(thread_id)
+        except Exception as exc:
+            raise RuntimeError(f"Delete incomplete; checkpoint cleared but metadata remains: {exc}") from exc
+
+    def rename_thread(self, title: str):
+        if self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        if self.thread_store is None:
+            raise RuntimeError("Thread storage is unavailable")
+        return self.thread_store.update(self.thread_id, title=title)
+
+    def close(self) -> None:
+        if self.checkpointer is not None:
+            self.checkpointer.close()
 
     def run_question(
         self,
@@ -173,21 +229,36 @@ class AppRuntime:
     ) -> AgentRunResult:
         """执行一次提问：建 run context → 调 leader_agent.run → 标记成功/失败。"""
         effective_thread_id = thread_id or self.thread_id
+        validate_thread_id(effective_thread_id)
+        if self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        if self.thread_store is not None and self.thread_store.get(effective_thread_id) is None:
+            self.thread_store.create(effective_thread_id)
         context = self.run_manager.create_run(
             thread_id=effective_thread_id,
             user_id=user_id,
             run_id=run_id,
             model_name=self.researcher_model_name,
-            thread_dir=self.thread_dir,
+            thread_dir=Path(self.config.runtime.logs_root) / "threads" / effective_thread_id,
         )
         self.run_manager.mark_running(context.run_id)
         try:
-            result = self.leader_agent.run(question, context)
+            if self.thread_store is not None:
+                self.thread_store.update(effective_thread_id, first_message=question)
+            self.active_threads.add(effective_thread_id)
+            if self.thread_store is None:
+                result = self.leader_agent.run(question, context)
+            else:
+                result = self.leader_agent.run(question, context, thread_title=self.thread_store.require(effective_thread_id).title)
             self.run_manager.mark_success(context.run_id)
             return result
         except Exception as exc:
             self.run_manager.mark_failed(context.run_id, str(exc))
             raise
+        finally:
+            self.active_threads.discard(effective_thread_id)
+            if self.thread_store is not None:
+                self.thread_store.update(effective_thread_id)
 
     def switch_expert_mode(self, expert_mode: bool) -> AppRuntime:
         """切换 expert 模式，精准重建受影响部分，保留 thread 连续性。
@@ -206,7 +277,11 @@ class AppRuntime:
             logs_root = _PROJECT_ROOT / logs_root
         new_config = replace(
             new_config,
-            runtime=replace(new_config.runtime, logs_root=str(logs_root)),
+            runtime=replace(
+                new_config.runtime,
+                logs_root=self.config.runtime.logs_root,
+                storage_root=self.config.runtime.storage_root,
+            ),
         )
         # 锚定 externalize_dir 等治理层相对路径到项目根
         new_config = _resolve_relative_paths(new_config)
@@ -225,6 +300,7 @@ class AppRuntime:
             memory_provider=getattr(self.capability_registry, "memory_provider", None),
             memory_config=self.config.memory,
             memory_worker=get_memory_worker(),
+            checkpointer=self.checkpointer,
         )
         self.thread_journal.append("mode.switched", {
             "expert_mode": expert_mode,
@@ -243,6 +319,9 @@ class AppRuntime:
             artifact_server=self.artifact_server,
             skill_manager=self.skill_manager,
             multiagent_setup=self.multiagent_setup,
+            thread_store=self.thread_store,
+            checkpointer=self.checkpointer,
+            active_threads=self.active_threads,
         )
 
     def reload_mcp_tools(self) -> AppRuntime:
@@ -267,6 +346,7 @@ class AppRuntime:
             memory_provider=getattr(self.capability_registry, "memory_provider", None),
             memory_config=self.config.memory,
             memory_worker=get_memory_worker(),
+            checkpointer=self.checkpointer,
         )
         self.thread_journal.append("mcp.tools_reloaded", {"thread_id": self.thread_id})
         return AppRuntime(
@@ -282,6 +362,9 @@ class AppRuntime:
             artifact_server=self.artifact_server,
             skill_manager=self.skill_manager,
             multiagent_setup=self.multiagent_setup,
+            thread_store=self.thread_store,
+            checkpointer=self.checkpointer,
+            active_threads=self.active_threads,
         )
 
     def switch_model(self, provider: str, model: str | None = None) -> AppRuntime:
@@ -330,6 +413,7 @@ class AppRuntime:
             memory_provider=getattr(self.capability_registry, "memory_provider", None),
             memory_config=self.config.memory,
             memory_worker=get_memory_worker(),
+            checkpointer=self.checkpointer,
         )
         self.thread_journal.append("model.switched", {
             "provider": provider,
@@ -349,6 +433,9 @@ class AppRuntime:
             artifact_server=self.artifact_server,
             skill_manager=self.skill_manager,
             multiagent_setup=self.multiagent_setup,
+            thread_store=self.thread_store,
+            checkpointer=self.checkpointer,
+            active_threads=self.active_threads,
         )
 
 
@@ -484,6 +571,7 @@ def bootstrap_runtime(
     provider: str | None = None,
     model: str | None = None,
     cli_overrides: dict[str, Any] | None = None,
+    thread_id: str | None = None,
 ) -> AppRuntime:
     """★ 应用启动主入口：装配所有组件，返回 AppRuntime。
 
@@ -513,7 +601,9 @@ def bootstrap_runtime(
     config = _resolve_relative_paths(config)
 
     # ── Thread-level setup：journal 在 MCP/LLM 加载之前创建 ──
-    thread_id = _make_thread_id()
+    thread_store = ThreadStore(config.runtime.storage_root)
+    thread_id = validate_thread_id(thread_id) if thread_id else str(uuid4())
+    existing_thread = thread_store.get(thread_id)
     threads_root = logs_root / "threads"
     thread_dir = threads_root / thread_id
     thread_dir.mkdir(parents=True, exist_ok=True)
@@ -699,6 +789,7 @@ def bootstrap_runtime(
             memory_provider=memory_provider,
             memory_config=config.memory,
             memory_worker=get_memory_worker(),
+            checkpointer=checkpointer,
         )
 
     ma_setup = setup_multiagent(
@@ -729,21 +820,40 @@ def bootstrap_runtime(
     )
 
     # ── LeaderAgent 构造：注入工具 + 中间件 ──
-    leader_agent = make_lead_agent(
-        expert_mode=expert_mode,
-        capability_registry=registry,
-        context_governance=config.context_governance,
-        sandbox_provider=sandbox_provider,
-        artifact_server=artifact_server,
-        mcp_audit_middleware=mcp_audit_middleware,
-        skill_injection_middleware=skill_injection_middleware,
-        skill_metrics_middleware=skill_metrics_middleware,
-        specialist_tools=list(ma_setup.specialist_tools) if ma_setup.specialist_tools else None,
-        orchestration_middleware=ma_setup.orchestration_middleware,
-        memory_provider=memory_provider,
-        memory_config=config.memory,
-        memory_worker=memory_worker,
-    )
+    if existing_thread is None:
+        thread_store.create(thread_id)
+    try:
+        checkpointer = SQLiteCheckpointer(Path(config.runtime.storage_root).expanduser() / "checkpoints.db")
+        if existing_thread is not None:
+            checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
+    except BaseException:
+        if "checkpointer" in locals():
+            checkpointer.close()
+        if existing_thread is None:
+            thread_store.delete(thread_id)
+        raise
+    try:
+        leader_agent = make_lead_agent(
+            expert_mode=expert_mode,
+            capability_registry=registry,
+            context_governance=config.context_governance,
+            sandbox_provider=sandbox_provider,
+            artifact_server=artifact_server,
+            mcp_audit_middleware=mcp_audit_middleware,
+            skill_injection_middleware=skill_injection_middleware,
+            skill_metrics_middleware=skill_metrics_middleware,
+            specialist_tools=list(ma_setup.specialist_tools) if ma_setup.specialist_tools else None,
+            orchestration_middleware=ma_setup.orchestration_middleware,
+            memory_provider=memory_provider,
+            memory_config=config.memory,
+            memory_worker=memory_worker,
+            checkpointer=checkpointer,
+        )
+    except BaseException:
+        checkpointer.close()
+        if existing_thread is None:
+            thread_store.delete(thread_id)
+        raise
     thread_journal.append("agent.constructed", {
         "expert_mode": expert_mode,
         "middleware_count": 6,
@@ -764,4 +874,6 @@ def bootstrap_runtime(
         artifact_server=artifact_server,
         skill_manager=skill_manager,
         multiagent_setup=ma_setup,
+        thread_store=thread_store,
+        checkpointer=checkpointer,
     )

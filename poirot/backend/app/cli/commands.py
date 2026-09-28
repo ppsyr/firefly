@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from datetime import datetime
 
 from rich.console import Console
 
@@ -165,29 +166,60 @@ def _cmd_model(ctx: CommandContext) -> None:
 
 
 def _cmd_thread(ctx: CommandContext) -> None:
-    """显示线程信息：thread_id / thread_dir / 最近 run 列表（读 events.jsonl）。"""
-    ctx.console.print(f"[bold]Thread ID:[/bold] [cyan]{ctx.runtime.thread_id}[/cyan]")
-    ctx.console.print(f"[bold]Thread dir:[/bold] [dim]{ctx.runtime.thread_dir}[/dim]")
+    """Thread metadata and management commands; runtime changes are applied by the UI."""
+    store = getattr(ctx.runtime, "thread_store", None)
+    if store is None:
+        ctx.console.print("[red]Thread storage is unavailable[/red]")
+        return
+    parts = ctx.arg.strip().split(maxsplit=1)
+    action = parts[0] if parts else ""
+    value = parts[1].strip() if len(parts) > 1 else ""
+    usage = "Usage: /thread [info|list|new|switch <id>|rename <title>|delete <id>]"
+    if action not in {"", "info", "list", "new", "switch", "rename", "delete"}:
+        ctx.console.print(f"[red]Unknown thread command: {action}[/red]\n{usage}")
+        return
+    if action in {"", "info", "list", "new"} and value:
+        ctx.console.print(f"[yellow]{usage}[/yellow]")
+        return
+    if action in {"switch", "rename", "delete"} and not value:
+        ctx.console.print(f"[yellow]{usage}[/yellow]")
+        return
     try:
-        import json
-        events_path = ctx.runtime.thread_journal.events_path
-        if events_path.exists():
-            lines = events_path.read_text(encoding="utf-8").strip().split("\n\n")
-            runs = []
-            for block in lines[-10:]:
-                if block.strip():
-                    try:
-                        evt = json.loads(block.split("\n")[0] if "\n" in block else block)
-                        if evt.get("event_type") == "run.started":
-                            runs.append(evt.get("run_id", "?"))
-                    except Exception:
-                        pass
-            if runs:
-                ctx.console.print("[bold]Recent runs:[/bold]")
-                for rid in runs[-5:]:
-                    ctx.console.print(f"  [dim]{rid}[/dim]")
-    except Exception:
-        pass
+        current = store.require(ctx.runtime.thread_id)
+        if action == "":
+            ctx.console.print(f"{current.title} [{current.thread_id}]", markup=False)
+        elif action == "info":
+            created = datetime.fromisoformat(current.created_at).astimezone().isoformat()
+            updated = datetime.fromisoformat(current.updated_at).astimezone().isoformat()
+            for label, data in (("ID", current.thread_id), ("Title", current.title), ("Created", created), ("Updated", updated)):
+                ctx.console.print(f"{label}: {data}", markup=False)
+        elif action == "list":
+            ctx.state["pending_thread_list"] = True
+        elif action == "rename":
+            if ctx.state.get("_running"):
+                raise RuntimeError("A conversation is running; wait for it to finish")
+            item = ctx.runtime.rename_thread(value)
+            ctx.console.print(f"Renamed: {item.title}", style="green", markup=False)
+        elif action == "new":
+            if ctx.state.get("_running"):
+                raise RuntimeError("A conversation is running; wait for it to finish")
+            ctx.state["pending_thread_new"] = True
+        elif action == "switch":
+            if ctx.state.get("_running"):
+                raise RuntimeError("A conversation is running; wait for it to finish")
+            if value.split() != [value]:
+                raise ValueError(usage)
+            store.require(value)
+            ctx.state["pending_thread_switch"] = value
+        elif action == "delete":
+            if value.split() != [value]:
+                raise ValueError(usage)
+            if ctx.state.get("_running") and value == ctx.runtime.thread_id:
+                raise RuntimeError("A conversation is running; wait for it to finish")
+            ctx.runtime.delete_thread(value)
+            ctx.console.print(f"[green]Deleted: {value}[/green]")
+    except Exception as exc:
+        ctx.console.print(f"[red]{exc}[/red]")
 
 
 def _cmd_prompt(ctx: CommandContext) -> None:
@@ -579,7 +611,7 @@ _registry.register(CommandSpec("/expand", "Expand last round tool results and Th
 _registry.register(CommandSpec("/thinking", "Toggle Thought fold row display (on|off)", _cmd_thinking))
 _registry.register(CommandSpec("/tools", "List available tools", _cmd_tools))
 _registry.register(CommandSpec("/model", "Show or switch model (<provider> [model]); applies next round", _cmd_model))
-_registry.register(CommandSpec("/thread", "Show thread info", _cmd_thread))
+_registry.register(CommandSpec("/thread", "Manage threads (info|list|new|switch|rename|delete)", _cmd_thread))
 _registry.register(CommandSpec("/prompt", "Prompt management (list|show <cat/name>|reload)", _cmd_prompt))
 _registry.register(CommandSpec("/skill", "Skill control (list|search|<name>|off|enable|disable|install|evolve|capture|history)", _cmd_skill))
 _registry.register(CommandSpec("/mcp", "MCP control (list|reload)", _cmd_mcp))

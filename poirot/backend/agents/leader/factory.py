@@ -242,6 +242,7 @@ def make_lead_agent(
     memory_provider: Any = None,
     memory_config: Any = None,
     memory_worker: Any = None,
+    checkpointer: Any = None,
 ) -> Any:
     """App-layer factory: expert_flag 参数化装配 graph。
 
@@ -330,7 +331,7 @@ def make_lead_agent(
                 skills_enabled=skill_injection_middleware is not None,
             ),
             state_schema=ThreadState,
-            checkpointer=get_checkpointer(),
+            checkpointer=checkpointer or get_checkpointer(),
         ),
         capability_registry=registry,
     )

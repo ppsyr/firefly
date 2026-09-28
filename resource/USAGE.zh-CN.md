@@ -250,7 +250,19 @@ poirot run "问题" --no-artifact
 | `/model <provider>` | 切换 provider |
 | `/model <provider> <model>` | 切换 provider 并指定模型 |
 | `/tools` | 列出可用工具 |
-| `/thread` | 显示 thread 信息 |
+| `/thread` | 显示当前会话 ID 和标题 |
+| `/thread info` | 显示完整 ID、标题、创建及更新时间 |
+| `/thread list` | 选择历史会话（方向键、回车、Esc）；非交互终端列出完整 ID |
+| `/thread new` | 新建并切换到空会话 |
+| `/thread switch <id>` | 用完整 ID 恢复历史会话 |
+| `/thread rename <title>` | 重命名当前会话 |
+| `/thread delete <id>` | 删除其他会话的元数据和 checkpoint |
+
+会话状态保存在 `~/.poirot/checkpoints.db`，元数据保存在
+`~/.poirot/threads/<id>.json`。设置 `POIROT_STORAGE_ROOT` 可同时移动两者。
+CLI 每次启动会新建会话；用 `/thread list` 选择历史会话后即可继续对话。
+删除当前会话前须先切换或执行 `/thread new`。恢复的是最后已提交的 checkpoint，
+不会恢复外部进程或尚未完成的工具；不支持多个进程同时管理同一会话。
 
 ### Skill 命令
 

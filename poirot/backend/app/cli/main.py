@@ -115,12 +115,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             provider=args.provider,
             model=args.model,
             cli_overrides=overrides,
-        )
-        result = runtime.run_question(
-            question=args.question,
             thread_id=args.thread_id,
-            run_id=args.run_id,
         )
+        try:
+            result = runtime.run_question(
+                question=args.question,
+                thread_id=args.thread_id,
+                run_id=args.run_id,
+            )
+        finally:
+            runtime.close()
         print(result.final_report)
         print(f"run_id: {result.run_id}")
         print(f"events_jsonl: {result.events_path}")
@@ -149,14 +153,15 @@ def run_chat(provider: str | None = None, model: str | None = None, legacy: bool
     # bootstrap 在 asyncio.run 之前（同步阶段），避免 MCP 的 asyncio.run 嵌套
     runtime = bootstrap_runtime(provider=provider, model=model)
 
-    if not legacy:
-        # 默认走 TUI 全屏应用（textual）
-        from poirot.backend.app.tui import PoirotTUI
-        app = PoirotTUI(runtime=runtime, provider=provider, model=model)
-        app.run()
-        return 0
-
-    return asyncio.run(_run_chat_async(runtime, provider, model))
+    try:
+        if not legacy:
+            from poirot.backend.app.tui import PoirotTUI
+            app = PoirotTUI(runtime=runtime, provider=provider, model=model)
+            app.run()
+            return 0
+        return asyncio.run(_run_chat_async(runtime, provider, model))
+    finally:
+        runtime.close()
 
 
 def _build_stream_config(runtime: AppRuntime, run_context: Any) -> dict:
@@ -175,6 +180,7 @@ def _build_stream_config(runtime: AppRuntime, run_context: Any) -> dict:
             "expert_mode": rc.expert_mode,
             "run_id": run_context.run_id,
             "thread_id": run_context.thread_id,
+            "thread_title": runtime.thread_store.require(run_context.thread_id).title if getattr(runtime, "thread_store", None) else None,
             "journal": run_context.journal,
             "output_dir": str(run_context.output_dir),
             "plan_enabled": rc.plan_enabled,
@@ -262,6 +268,7 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
         "current_tokens": 0,
         "current_fraction": 0.0,
         "current_window": 0,
+        "thread_title": runtime.thread_store.require(runtime.thread_id).title if runtime.thread_store else runtime.thread_id,
     }
     # skill_provider：惰性取当前 runtime 的 active skill 名（闭包读最新 runtime，
     # switch/reload 后 runtime 重绑定，闭包见新值）。供 /skill <name> 补全。
@@ -365,9 +372,39 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
         if not prompt:
             continue
         if prompt.startswith("/"):
+            previous_thread = runtime.thread_id
             should_exit = handle_command(prompt, console, renderer, cli_state, runtime)
             if should_exit:
                 return 0
+
+            if cli_state.pop("pending_thread_new", False):
+                try:
+                    runtime = runtime.new_thread()
+                    cli_state["thread_title"] = runtime.thread_store.require(runtime.thread_id).title
+                    console.print(f"New thread: {cli_state['thread_title']} [{runtime.thread_id}]", style="green", markup=False)
+                except Exception as exc:
+                    console.print(f"[red]Thread creation failed: {exc}[/red]")
+            if cli_state.pop("pending_thread_list", False):
+                from poirot.backend.app.cli.thread_selector import select_thread
+                with patch_stdout():
+                    selected = await select_thread(runtime.thread_store.list(), runtime.thread_id, console)
+                if selected:
+                    cli_state["pending_thread_switch"] = selected
+            selected = cli_state.pop("pending_thread_switch", None)
+            if selected:
+                try:
+                    runtime = runtime.switch_thread(selected)
+                    cli_state["thread_title"] = runtime.thread_store.require(runtime.thread_id).title
+                    console.print(f"Restored: {cli_state['thread_title']} [{runtime.thread_id}]", style="green", markup=False)
+                except Exception as exc:
+                    console.print(f"[red]Thread switch failed: {exc}[/red]")
+            elif prompt.startswith("/thread rename "):
+                cli_state["thread_title"] = runtime.thread_store.require(runtime.thread_id).title
+            if previous_thread != runtime.thread_id:
+                renderer = StreamRenderer(console=console, cli_state=cli_state)
+                for key, value in {"skill_override": [], "current_tokens": 0, "current_fraction": 0.0, "current_window": 0}.items():
+                    cli_state[key] = value
+                cli_state.pop("sandbox_id", None)
 
             # /expert /default 切换：下轮重建 agent（复用 thread_id + checkpointer state）
             pending = cli_state.get("pending_expert_mode")
@@ -419,6 +456,7 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
             continue
 
         # 流式研究
+        ctx = None
         try:
             ctx = runtime.run_manager.create_run(
                 thread_id=runtime.thread_id,
@@ -428,6 +466,7 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
                 thread_dir=runtime.thread_dir,
             )
             runtime.run_manager.mark_running(ctx.run_id)
+            runtime.begin_turn(prompt)
             config = _build_stream_config(runtime, ctx)
             # /skill override：cli_state → configurable，SkillInjectionMiddleware 读取
             config["configurable"]["skill_override"] = cli_state.get("skill_override") or []
@@ -447,13 +486,21 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
             console.print(f"\n[dim]run_id: {ctx.run_id} | events: {ctx.events_path}[/dim]\n")
         except (KeyboardInterrupt, asyncio.CancelledError):
             console.print("\n[yellow]⚠ Interrupted[/yellow]\n")
-            runtime.run_manager.mark_failed(ctx.run_id, "interrupted")
+            if ctx is not None:
+                runtime.run_manager.mark_failed(ctx.run_id, "interrupted")
             continue
         except Exception as exc:
             renderer._stop_spinner()
             console.print(f"\n[red]✗ Error: {exc}[/red]\n")
-            runtime.run_manager.mark_failed(ctx.run_id, str(exc))
+            if ctx is not None:
+                runtime.run_manager.mark_failed(ctx.run_id, str(exc))
             continue
+        finally:
+            try:
+                runtime.end_turn()
+                cli_state["thread_title"] = runtime.thread_store.require(runtime.thread_id).title
+            except Exception as exc:
+                console.print(f"[red]Thread metadata update failed: {exc}[/red]")
 
 
 if __name__ == "__main__":

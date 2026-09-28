@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 from typing import Any
+from html import escape
 
 from prompt_toolkit.formatted_text import HTML
 
@@ -37,6 +38,7 @@ def build_bottom_toolbar(cli_state: dict[str, Any]) -> HTML:
     fraction = cli_state.get("current_fraction", 0.0)
     running = cli_state.get("_running", False)
     activity = cli_state.get("_current_activity", "")
+    title = escape(str(cli_state.get("thread_title", ""))[:28])
 
     tokens_k = tokens / 1000.0
     pct = fraction * 100.0
@@ -47,6 +49,6 @@ def build_bottom_toolbar(cli_state: dict[str, Any]) -> HTML:
         f" {mode} · {provider} / {model} "
         f"</style>"
         f'<style fg="#aaaaaa" bg="#2b2b2b">'
-        f"| {tokens_k:.1f}K ({pct:.1f}%) |{activity_part}/help"
+        f"| {title} | {tokens_k:.1f}K ({pct:.1f}%) |{activity_part}/help"
         f"</style>"
     )
