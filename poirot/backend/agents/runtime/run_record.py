@@ -81,6 +81,8 @@ class RunRecord:
     model_name: str | None = None
     error: str | None = None
     total_tokens: int | None = None
+    project: str | None = None
+    cwd: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

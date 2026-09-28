@@ -81,3 +81,47 @@ async def select_thread(items, current_id: str, console, *, input=None, output=N
         output=output,
     )
     return await app.run_async()
+
+
+async def select_project(items, current_name: str | None, console, *, input=None, output=None, interactive=None) -> str | None:
+    """Select a project; non-interactive callers receive a printable list."""
+    if not items:
+        console.print("[dim]No saved projects[/dim]")
+        return None
+    if interactive is None:
+        interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if not interactive:
+        for item in items:
+            mark = "*" if item.project_name == current_name else " "
+            console.print(f"{mark} {item.project_name} — {item.dir}", markup=False)
+        console.print("Use /project list in an interactive terminal to switch")
+        return None
+    selected = 0
+    visible = max(1, min(10, len(items), shutil.get_terminal_size().lines - 3))
+
+    def render():
+        top = max(0, min(selected - visible + 1, len(items) - visible))
+        lines = [("class:hint", "Select project: ↑/↓ move, Enter switch, Esc cancel\n")]
+        for index in range(top, top + visible):
+            item = items[index]
+            marker = "*" if item.project_name == current_name else " "
+            style = "reverse" if index == selected else ""
+            lines.append((style, f"{'>' if index == selected else ' '} {marker} {item.project_name} — {item.dir}\n"))
+        return FormattedText(lines)
+
+    keys = KeyBindings()
+    @keys.add("up")
+    def up(event):
+        nonlocal selected
+        selected = max(0, selected - 1); event.app.invalidate()
+    @keys.add("down")
+    def down(event):
+        nonlocal selected
+        selected = min(len(items) - 1, selected + 1); event.app.invalidate()
+    @keys.add("enter")
+    def choose(event): event.app.exit(result=items[selected].project_name)
+    @keys.add("escape")
+    @keys.add("c-c")
+    def cancel(event): event.app.exit(result=None)
+    app = Application(layout=Layout(Window(FormattedTextControl(render), height=visible + 1)), key_bindings=keys, full_screen=False, input=input, output=output)
+    return await app.run_async()

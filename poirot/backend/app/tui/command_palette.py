@@ -32,6 +32,8 @@ _GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     ("Session", [
         ("Show model routing", "/model"),
         ("Thread info", "/thread"),
+        ("Projects", "/project list"),
+        ("Project threads", "/project_thread list"),
         ("Toggle thinking display", "/thinking"),
         ("List available tools", "/tools"),
         ("Generate report", "/report"),

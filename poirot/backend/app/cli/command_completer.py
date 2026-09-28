@@ -33,6 +33,7 @@ from poirot.backend.app.cli.registry import CommandRegistry
 
 _SKILL_SUBCOMMANDS = ("list", "off", "enable", "disable", "install")
 _THREAD_SUBCOMMANDS = ("info", "list", "new", "switch", "rename", "delete")
+_PROJECT_SUBCOMMANDS = ("list",)
 
 
 class SlashCommandCompleter(Completer):
@@ -94,6 +95,16 @@ class SlashCommandCompleter(Completer):
                 for sub in _THREAD_SUBCOMMANDS:
                     if sub.startswith(word.lower()):
                         yield Completion(sub, start_position=-len(word), display_meta="thread command")
+            return
+        if stripped.startswith("/project_thread") and len(stripped) > 15 and stripped[15].isspace():
+            for sub in _PROJECT_SUBCOMMANDS:
+                if sub.startswith(word.lower()):
+                    yield Completion(sub, start_position=-len(word), display_meta="project thread command")
+            return
+        if stripped.startswith("/project") and len(stripped) > 8 and stripped[8].isspace():
+            for sub in _PROJECT_SUBCOMMANDS:
+                if sub.startswith(word.lower()):
+                    yield Completion(sub, start_position=-len(word), display_meta="project command")
             return
         if stripped.startswith("/skill") and len(stripped) > 6 and stripped[6] in (" ", "\t"):
             arg_word = word

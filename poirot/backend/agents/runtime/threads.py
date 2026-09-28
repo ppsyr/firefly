@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import builtins
 import os
 import re
 import tempfile
@@ -12,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
+
+from poirot.backend.agents.runtime.projects import ProjectStore, normalize_project_dir, validate_project_name
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
@@ -50,6 +53,8 @@ class ThreadMetadata:
     created_at: str
     updated_at: str
     title_set: bool = False
+    project: str | None = None
+    cwd: str | None = None
 
 
 class ThreadStore:
@@ -59,6 +64,7 @@ class ThreadStore:
         self._legacy_root = self.storage_root / "threads"
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
+        self.projects = ProjectStore(self.storage_root)
 
     def _path(self, thread_id: str) -> Path:
         thread_id = validate_thread_id(thread_id)
@@ -86,16 +92,25 @@ class ThreadStore:
                 raise ValueError(f"Invalid metadata field: {key}")
         thread_id = validate_thread_id(data["thread_id"])
         if path.name == "metadata.json":
-            matches = re.fullmatch(r"thread-\d{2}-\d{2}-\d{2}-" + re.escape(thread_id), path.parent.name)
+            matches_name = re.fullmatch(r"thread-\d{2}-\d{2}-\d{2}-" + re.escape(thread_id), path.parent.name) is not None
         else:
-            matches = path.stem == thread_id
-        if not matches:
+            matches_name = path.stem == thread_id
+        if not matches_name:
             raise ValueError("Thread ID does not match filename")
         for key in ("created_at", "updated_at"):
             if datetime.fromisoformat(data[key]).tzinfo is None:
                 raise ValueError(f"Timestamp lacks timezone: {key}")
         if "title_set" in data and not isinstance(data["title_set"], bool):
             raise ValueError("Invalid metadata field: title_set")
+        if (data.get("project") is None) != (data.get("cwd") is None):
+            raise ValueError("Thread project and cwd must be supplied together")
+        if data.get("project") is not None:
+            validate_project_name(data["project"])
+            if not isinstance(data["cwd"], str) or not Path(data["cwd"]).is_absolute():
+                raise ValueError("Invalid metadata field: cwd")
+        else:
+            data["project"] = None
+            data["cwd"] = None
         return ThreadMetadata(**{key: data[key] for key in ThreadMetadata.__dataclass_fields__ if key in data})
 
     def get(self, thread_id: str) -> ThreadMetadata | None:
@@ -128,17 +143,31 @@ class ThreadStore:
                 os.fsync(file.fileno())
             os.replace(temp, path)
             (self._legacy_root / f"{item.thread_id}.json").unlink(missing_ok=True)
+            self._sync_project(item.project)
         finally:
             if temp is not None:
                 temp.unlink(missing_ok=True)
 
-    def create(self, thread_id: str | None = None) -> ThreadMetadata:
+    def _sync_project(self, project: str | None) -> None:
+        if project is not None:
+            self.projects.sync_thread_index(project)
+            self.projects.touch(project)
+
+    def create(self, thread_id: str | None = None, *, project: str | None = None, cwd: str | Path | None = None) -> ThreadMetadata:
         with self._lock:
             thread_id = validate_thread_id(thread_id or str(uuid4()))
             if self._path(thread_id).exists():
                 raise FileExistsError(f"Thread already exists: {thread_id}")
             now = _now()
-            item = ThreadMetadata(thread_id, f"{_prefix(now)} 新会话", now, now)
+            if (project is None) != (cwd is None):
+                raise ValueError("Project and cwd must be supplied together")
+            if project is not None:
+                metadata = self.projects.get(validate_project_name(project))
+                canonical = str(normalize_project_dir(cwd))
+                if metadata is None or canonical != metadata.dir:
+                    raise ValueError("Thread project and cwd do not match a registered project")
+                cwd = canonical
+            item = ThreadMetadata(thread_id, f"{_prefix(now)} 新会话", now, now, project=project, cwd=str(cwd) if cwd else None)
             self._write(item)
             return item
 
@@ -168,10 +197,25 @@ class ThreadStore:
                     warnings.warn(f"Invalid thread metadata {path}: {exc}", stacklevel=2)
             return sorted(items, key=lambda item: (datetime.fromisoformat(item.updated_at), item.thread_id), reverse=True)
 
+    def list_project(self, project: str) -> builtins.list[ThreadMetadata]:
+        with self._lock:
+            index = self.projects.thread_index(project)
+            items = []
+            for entry in index:
+                try:
+                    item = self.require(entry["thread_id"])
+                    if item.project == project:
+                        items.append(item)
+                except Exception:
+                    continue
+            return sorted(items, key=lambda item: (datetime.fromisoformat(item.updated_at), item.thread_id), reverse=True)
+
     def delete(self, thread_id: str) -> None:
         with self._lock:
             path = self._path(thread_id)
             if not path.exists():
                 raise KeyError(f"Thread not found: {thread_id}")
+            item = self._read(path)
             path.unlink()
             (self._legacy_root / f"{thread_id}.json").unlink(missing_ok=True)
+            self._sync_project(item.project)

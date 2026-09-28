@@ -76,6 +76,7 @@ from poirot.backend.agents.multiagent.bootstrap import MultiAgentSetup, setup_mu
 from poirot.backend.agents.multiagent.config import load_multiagent_config
 from poirot.backend.agents.runtime.checkpointer import SQLiteCheckpointer, SessionCheckpointer
 from poirot.backend.agents.runtime.threads import ThreadStore, validate_thread_id
+from poirot.backend.agents.runtime.projects import ProjectMetadata, ProjectStore
 
 # 项目根路径（app/bootstrap.py 的上三级）。
 _PROJECT_ROOT = Path(__file__).parents[3]
@@ -156,6 +157,8 @@ class AppRuntime:
     thread_store: ThreadStore | None = None
     checkpointer: SQLiteCheckpointer | SessionCheckpointer | None = None
     active_threads: set[str] = field(default_factory=set)
+    project: ProjectMetadata | None = None
+    project_store: ProjectStore | None = None
 
     def begin_turn(self, question: str) -> None:
         if self.active_threads:
@@ -179,22 +182,54 @@ class AppRuntime:
             return self
         # Decode before replacing the active runtime; corrupt checkpoints remain untouched.
         self.checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
+        item = self.thread_store.require(thread_id)
+        project = self.project_store.get(item.project) if item.project and self.project_store else self.project
+        if item.project and (project is None or project.dir != item.cwd):
+            raise ValueError(f"Thread project binding is unavailable: {item.project}")
         thread_dir = self.thread_store.session_dir(thread_id)
         journal = RunJournal(thread_id, thread_dir / "thread-events.jsonl")
         journal.append("thread.resumed", {"previous_thread_id": self.thread_id})
-        return replace(self, thread_id=thread_id, thread_dir=thread_dir, thread_journal=journal)
+        return replace(self, thread_id=thread_id, thread_dir=thread_dir, thread_journal=journal,
+                       project=project)
 
     def new_thread(self) -> AppRuntime:
         if self.active_threads:
             raise RuntimeError("A conversation is running; wait for it to finish")
         if self.thread_store is None:
             raise RuntimeError("Thread storage is unavailable")
-        item = self.thread_store.create()
+        item = self.thread_store.create(project=self.project.project_name if self.project else None,
+                                        cwd=self.project.dir if self.project else None)
         try:
             return self.switch_thread(item.thread_id)
         except BaseException:
             self.thread_store.delete(item.thread_id)
             raise
+
+    def switch_project(self, project_name: str) -> AppRuntime:
+        if self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        if self.project_store is None or self.thread_store is None:
+            raise RuntimeError("Project storage is unavailable")
+        target = self.project_store.get(project_name)
+        if target is None:
+            raise KeyError(f"Project not found: {project_name}")
+        from poirot.backend.agents.runtime.projects import normalize_project_dir
+        normalize_project_dir(target.dir)
+        item = self.thread_store.create(project=target.project_name, cwd=target.dir)
+        try:
+            changed = self.switch_thread(item.thread_id)
+            return replace(changed, project=target)
+        except BaseException:
+            self.thread_store.delete(item.thread_id)
+            raise
+
+    def switch_project_thread(self, thread_id: str) -> AppRuntime:
+        if self.project is None or self.thread_store is None:
+            raise RuntimeError("No current project")
+        item = self.thread_store.require(thread_id)
+        if item.project != self.project.project_name or item.cwd != self.project.dir:
+            raise ValueError("Thread does not belong to the current project")
+        return self.switch_thread(thread_id)
 
     def delete_thread(self, thread_id: str) -> None:
         if thread_id in self.active_threads:
@@ -234,13 +269,17 @@ class AppRuntime:
         if self.active_threads:
             raise RuntimeError("A conversation is running; wait for it to finish")
         if self.thread_store is not None and self.thread_store.get(effective_thread_id) is None:
-            self.thread_store.create(effective_thread_id)
+            self.thread_store.create(effective_thread_id, project=self.project.project_name if self.project else None,
+                                     cwd=self.project.dir if self.project else None)
+        thread = self.thread_store.require(effective_thread_id) if self.thread_store else None
         context = self.run_manager.create_run(
             thread_id=effective_thread_id,
             user_id=user_id,
             run_id=run_id,
             model_name=self.researcher_model_name,
             thread_dir=self.thread_store.session_dir(effective_thread_id) if self.thread_store else self.thread_dir,
+            project=thread.project if thread else None,
+            cwd=thread.cwd if thread else None,
         )
         self.run_manager.mark_running(context.run_id)
         try:
@@ -323,6 +362,8 @@ class AppRuntime:
             thread_store=self.thread_store,
             checkpointer=self.checkpointer,
             active_threads=self.active_threads,
+            project=self.project,
+            project_store=self.project_store,
         )
 
     def reload_mcp_tools(self) -> AppRuntime:
@@ -366,6 +407,8 @@ class AppRuntime:
             thread_store=self.thread_store,
             checkpointer=self.checkpointer,
             active_threads=self.active_threads,
+            project=self.project,
+            project_store=self.project_store,
         )
 
     def switch_model(self, provider: str, model: str | None = None) -> AppRuntime:
@@ -437,6 +480,8 @@ class AppRuntime:
             thread_store=self.thread_store,
             checkpointer=self.checkpointer,
             active_threads=self.active_threads,
+            project=self.project,
+            project_store=self.project_store,
         )
 
 
@@ -573,6 +618,8 @@ def bootstrap_runtime(
     model: str | None = None,
     cli_overrides: dict[str, Any] | None = None,
     thread_id: str | None = None,
+    project_dir: str | Path | None = None,
+    project_name: str | None = None,
 ) -> AppRuntime:
     """★ 应用启动主入口：装配所有组件，返回 AppRuntime。
 
@@ -603,10 +650,17 @@ def bootstrap_runtime(
 
     # ── Thread-level setup：journal 在 MCP/LLM 加载之前创建 ──
     thread_store = ThreadStore(config.runtime.storage_root)
+    project_store = thread_store.projects
+    initial_project = project_store.ensure(project_dir, project_name)
+    project: ProjectMetadata | None = initial_project
     thread_id = validate_thread_id(thread_id) if thread_id else str(uuid4())
     existing_thread = thread_store.get(thread_id)
     if existing_thread is None:
-        thread_store.create(thread_id)
+        thread_store.create(thread_id, project=initial_project.project_name, cwd=initial_project.dir)
+    elif existing_thread.project is not None:
+        project = project_store.get(existing_thread.project)
+        if project is None or project.dir != existing_thread.cwd:
+            raise ValueError(f"Thread project binding is unavailable: {existing_thread.project}")
     thread_dir = thread_store.session_dir(thread_id)
     thread_dir.mkdir(parents=True, exist_ok=True)
     thread_journal = RunJournal(
@@ -876,4 +930,6 @@ def bootstrap_runtime(
         multiagent_setup=ma_setup,
         thread_store=thread_store,
         checkpointer=checkpointer,
+        project=project,
+        project_store=project_store,
     )

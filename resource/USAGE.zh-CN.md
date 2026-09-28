@@ -209,6 +209,8 @@ poirot
 
 ```bash
 poirot cli
+poirot --dir /path/to/project
+poirot --dir /path/to/project --project_name my-project
 ```
 
 ### 3. 单次研究（非交互）
@@ -257,10 +259,18 @@ poirot run "问题" --no-artifact
 | `/thread switch <id>` | 用完整 ID 恢复历史会话 |
 | `/thread rename <title>` | 重命名当前会话 |
 | `/thread delete <id>` | 删除其他会话的元数据和 checkpoint |
+| `/project list` | 选择项目；切换后在目标项目新建空会话 |
+| `/project_thread list` | 恢复当前项目中的历史会话 |
 
-会话状态保存在 `~/.poirot/checkpoints.db`，元数据保存在
-`~/.poirot/threads/<id>.json`。设置 `POIROT_STORAGE_ROOT` 可同时移动两者。
-CLI 每次启动会新建会话；用 `/thread list` 选择历史会话后即可继续对话。
+项目元数据保存在 `~/.poirot/projects/<项目名>.json`，项目会话索引保存在
+`~/.poirot/sessions/<项目名>/threads.json`。会话仍保存在
+`~/.poirot/sessions/YYYY/MM/DD/thread-HH-MM-SS-<id>/`，其中 `metadata.json`
+是项目绑定的权威记录，`checkpoints.db` 保存会话状态。索引丢失或损坏时会从
+会话元数据重建。设置 `POIROT_STORAGE_ROOT` 可以修改存储根目录。
+`--dir` 默认使用启动目录，支持相对路径和 `~`，不会改变进程当前目录、sandbox
+或输出路径。同一目录只能绑定一个项目，同名项目不能绑定不同目录。
+CLI 每次启动会为当前项目新建会话；`/project list` 切换项目并新建空会话，
+`/project_thread list` 恢复当前项目的会话。全局 `/thread` 命令仍可管理旧的未绑定会话。
 删除当前会话前须先切换或执行 `/thread new`。恢复的是最后已提交的 checkpoint，
 不会恢复外部进程或尚未完成的工具；不支持多个进程同时管理同一会话。
 

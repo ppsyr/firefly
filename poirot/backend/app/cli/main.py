@@ -83,6 +83,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="poirot")
     parser.add_argument("--provider", default=None)
     parser.add_argument("--model", default=None)
+    parser.add_argument("--dir", dest="project_dir", default=None)
+    parser.add_argument("--project_name", dest="project_name", default=None)
     subparsers = parser.add_subparsers(dest="command")
 
     run_parser = subparsers.add_parser("run")
@@ -93,16 +95,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--run-id", default=None)
     run_parser.add_argument("--logs-root", default=None)
     run_parser.add_argument("--no-artifact", action="store_true")
+    run_parser.add_argument("--dir", dest="project_dir", default=argparse.SUPPRESS)
+    run_parser.add_argument("--project_name", dest="project_name", default=argparse.SUPPRESS)
 
-    subparsers.add_parser("cli", help="traditional scrolling CLI (prompt_toolkit + rich)")
+    cli_parser = subparsers.add_parser("cli", help="traditional scrolling CLI (prompt_toolkit + rich)")
+    cli_parser.add_argument("--dir", dest="project_dir", default=argparse.SUPPRESS)
+    cli_parser.add_argument("--project_name", dest="project_name", default=argparse.SUPPRESS)
 
     args = parser.parse_args(argv)
 
     if args.command is None:
-        return run_chat(provider=args.provider, model=args.model, legacy=False)
+        return run_chat(provider=args.provider, model=args.model, legacy=False, project_dir=args.project_dir, project_name=args.project_name)
 
     if args.command == "cli":
-        return run_chat(provider=args.provider, model=args.model, legacy=True)
+        return run_chat(provider=args.provider, model=args.model, legacy=True, project_dir=args.project_dir, project_name=args.project_name)
 
     if args.command == "run":
         overrides: dict = {}
@@ -116,6 +122,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             model=args.model,
             cli_overrides=overrides,
             thread_id=args.thread_id,
+            project_dir=args.project_dir,
+            project_name=args.project_name,
         )
         try:
             result = runtime.run_question(
@@ -135,7 +143,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 1
 
 
-def run_chat(provider: str | None = None, model: str | None = None, legacy: bool = False) -> int:
+def run_chat(provider: str | None = None, model: str | None = None, legacy: bool = False,
+             project_dir: str | None = None, project_name: str | None = None) -> int:
     """启动 bootstrap 并进入 TUI 或传统 CLI。
 
     Args:
@@ -151,7 +160,7 @@ def run_chat(provider: str | None = None, model: str | None = None, legacy: bool
     except (AttributeError, OSError):
         pass
     # bootstrap 在 asyncio.run 之前（同步阶段），避免 MCP 的 asyncio.run 嵌套
-    runtime = bootstrap_runtime(provider=provider, model=model)
+    runtime = bootstrap_runtime(provider=provider, model=model, project_dir=project_dir, project_name=project_name)
 
     try:
         if not legacy:
@@ -384,6 +393,42 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
                     console.print(f"New thread: {cli_state['thread_title']} [{runtime.thread_id}]", style="green", markup=False)
                 except Exception as exc:
                     console.print(f"[red]Thread creation failed: {exc}[/red]")
+            if cli_state.pop("pending_project_list", False):
+                from poirot.backend.app.cli.thread_selector import select_project
+                if runtime.project_store is None:
+                    console.print("[red]Project storage is unavailable[/red]")
+                    continue
+                with patch_stdout():
+                    selected_project = await select_project(
+                        runtime.project_store.list(), runtime.project.project_name if runtime.project else None, console
+                    )
+                if selected_project:
+                    try:
+                        changed = runtime.switch_project(selected_project)
+                        if changed.thread_store is None:
+                            raise RuntimeError("Thread storage is unavailable")
+                        cli_state["thread_title"] = changed.thread_store.require(changed.thread_id).title
+                        runtime = changed
+                        console.print(f"Switched to project: {selected_project}", style="green")
+                    except Exception as exc:
+                        console.print(f"[red]Project switch failed: {exc}[/red]")
+            if cli_state.pop("pending_project_thread_list", False):
+                from poirot.backend.app.cli.thread_selector import select_thread
+                if runtime.project is None or runtime.thread_store is None:
+                    console.print("[dim]Current thread is not bound to a project[/dim]")
+                else:
+                    with patch_stdout():
+                        selected = await select_thread(runtime.thread_store.list_project(runtime.project.project_name), runtime.thread_id, console)
+                    if selected:
+                        try:
+                            changed = runtime.switch_project_thread(selected)
+                            if changed.thread_store is None:
+                                raise RuntimeError("Thread storage is unavailable")
+                            cli_state["thread_title"] = changed.thread_store.require(changed.thread_id).title
+                            runtime = changed
+                            console.print(f"Restored: {cli_state['thread_title']} [{selected}]", style="green", markup=False)
+                        except Exception as exc:
+                            console.print(f"[red]Project thread restore failed: {exc}[/red]")
             if cli_state.pop("pending_thread_list", False):
                 from poirot.backend.app.cli.thread_selector import select_thread
                 with patch_stdout():
@@ -458,12 +503,15 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
         # 流式研究
         ctx = None
         try:
+            current_thread = runtime.thread_store.require(runtime.thread_id) if runtime.thread_store else None
             ctx = runtime.run_manager.create_run(
                 thread_id=runtime.thread_id,
                 user_id="default-user",
                 run_id=None,
                 model_name=runtime.researcher_model_name,
                 thread_dir=runtime.thread_dir,
+                project=current_thread.project if current_thread else None,
+                cwd=current_thread.cwd if current_thread else None,
             )
             runtime.run_manager.mark_running(ctx.run_id)
             runtime.begin_turn(prompt)

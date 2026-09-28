@@ -28,6 +28,7 @@ from poirot.backend.app.cli.commands import get_registry, handle_command
 from poirot.backend.app.services.stream_service import PoirotStreamClient
 from poirot.backend.app.tui import theme
 from poirot.backend.app.tui.command_palette import CommandPalette
+from poirot.backend.app.tui.project_selector import ProjectPicker
 from poirot.backend.app.tui.conversation import ConversationLog
 from poirot.backend.app.tui.help_screen import HelpRequestScreen
 from poirot.backend.app.tui.mcp_panel import McpPanel
@@ -754,7 +755,19 @@ class PoirotTUI(App):
         if self.cli_state.pop("pending_thread_list", False):
             for item in self.runtime.thread_store.list():
                 conv.write(Text(f"{item.title} [{item.thread_id}]"))
-        if cmd.startswith("/thread"):
+        if self.cli_state.pop("pending_project_list", False):
+            projects = self.runtime.project_store.list()
+            self.push_screen(ProjectPicker(
+                [(item.project_name, f"{item.project_name} — {item.dir}") for item in projects],
+                title="Projects",
+            ), self._project_selected)
+        if self.cli_state.pop("pending_project_thread_list", False):
+            items = self.runtime.thread_store.list_project(self.runtime.project.project_name) if self.runtime.project else []
+            self.push_screen(ProjectPicker(
+                [(item.thread_id, f"{item.title} [{item.thread_id}]") for item in items],
+                title="Project threads",
+            ), self._project_thread_selected)
+        if cmd.startswith(("/thread", "/project")):
             self.query_one("#input-info", Static).update(self._input_info())
             self.query_one(StatusBar).update_state(self.cli_state)
             self._refresh_side_panel()
@@ -781,6 +794,43 @@ class PoirotTUI(App):
         if pending_report is not None:
             self.cli_state["pending_report"] = None
             self._trigger_report(pending_report)
+
+    def _show_switched_thread(self, label: str) -> None:
+        from rich.text import Text
+        conv = self.query_one(ConversationLog)
+        self.cli_state["thread_title"] = self.runtime.thread_store.require(self.runtime.thread_id).title
+        conv.clear()
+        conv.state["tool_results"] = []
+        conv.state["thinking_log"] = []
+        conv.state["full_answer"] = ""
+        conv.write(Text(f"{label}: {self.cli_state['thread_title']} [{self.runtime.thread_id}]"))
+        self.query_one("#input-info", Static).update(self._input_info())
+        self.query_one(StatusBar).update_state(self.cli_state)
+        self._refresh_side_panel()
+
+    def _project_selected(self, name: str | None) -> None:
+        if name is None:
+            return
+        try:
+            changed = self.runtime.switch_project(name)
+        except Exception as exc:
+            from rich.text import Text
+            self.query_one(ConversationLog).write(Text(f"Project switch failed: {exc}"))
+            return
+        self.runtime = changed
+        self._show_switched_thread(f"Switched to project {name}")
+
+    def _project_thread_selected(self, thread_id: str | None) -> None:
+        if thread_id is None:
+            return
+        try:
+            changed = self.runtime.switch_project_thread(thread_id)
+        except Exception as exc:
+            from rich.text import Text
+            self.query_one(ConversationLog).write(Text(f"Project thread restore failed: {exc}"))
+            return
+        self.runtime = changed
+        self._show_switched_thread("Restored")
 
     def _handle_report_intent(self, intent: Any, rt: Any) -> bool:
         self.cli_state["pending_report"] = ""
@@ -820,6 +870,8 @@ class PoirotTUI(App):
                 run_id=None,
                 model_name=self.runtime.researcher_model_name,
                 thread_dir=self.runtime.thread_dir,
+                project=self.runtime.thread_store.require(self.runtime.thread_id).project,
+                cwd=self.runtime.thread_store.require(self.runtime.thread_id).cwd,
             )
             self.runtime.run_manager.mark_running(ctx.run_id)
             self.runtime.begin_turn(question)

@@ -87,6 +87,8 @@ class RunManager:
         trace_id: str | None = None,
         model_name: str | None = None,
         thread_dir: Path | None = None,
+        project: str | None = None,
+        cwd: str | None = None,
     ) -> RunContext:
         """创建一次运行，初始化 RunContext / RunRecord / RunJournal 并写盘。
 
@@ -133,6 +135,8 @@ class RunManager:
             created_at=now,
             updated_at=now,
             model_name=model_name or self.config.models.researcher_model,
+            project=project,
+            cwd=cwd,
             metadata={"expert_mode": self.config.runtime.expert_mode},
         )
         self._contexts[created_run_id] = context

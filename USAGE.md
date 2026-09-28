@@ -260,6 +260,8 @@ poirot run "question" --no-artifact
 |-----|-------------|
 | `--provider <name>` | Force provider (`deepseek` / `openai` / `qwen`) |
 | `--model <name>` | Specify model name |
+| `--dir <path>` | Bind the new thread to this directory (defaults to the startup directory) |
+| `--project_name <name>` | Name the project (defaults to the directory name) |
 | `run <question>` | Single research subcommand |
 | `--expert` / `--no-expert` | Enable/disable deep research mode |
 | `--thread-id <id>` | Thread ID |
@@ -306,6 +308,8 @@ Type `/` in TUI or CLI for command completion.
 | `/thread switch <id>` | Restore a saved thread by its full ID |
 | `/thread rename <title>` | Set the current thread's title |
 | `/thread delete <id>` | Delete another thread's metadata and checkpoints |
+| `/project list` | Select a project; switching creates a new empty thread |
+| `/project_thread list` | Restore a thread from the current project |
 | `/prompt list` | List prompt templates |
 | `/prompt show <cat/name>` | Show prompt template |
 | `/prompt reload` | Reload prompt templates |
@@ -326,6 +330,16 @@ continue chatting. `/thread delete` refuses the current thread: switch or run
 `/thread new` first. Selection restores the last committed checkpoint; it does
 not resume external processes or unfinished tools. Concurrent management of the
 same thread by multiple processes is not supported.
+
+Projects are stored under `~/.poirot/projects/<name>.json`; each project's
+derived thread index is `~/.poirot/sessions/<name>/threads.json`. Thread
+`metadata.json` remains the source of truth, and missing or damaged indexes are
+rebuilt from it. `--dir` resolves relative paths from the startup directory and
+does not change the process working directory, sandbox, or output paths. A
+directory can belong to only one project, and a project name cannot refer to
+different directories. `/project list` switches to a fresh thread in the chosen
+project; `/project_thread list` restores a saved thread in that project. The
+global `/thread` commands continue to include older threads without a project.
 
 ### Skill
 

@@ -222,6 +222,29 @@ def _cmd_thread(ctx: CommandContext) -> None:
         ctx.console.print(f"[red]{exc}[/red]")
 
 
+def _cmd_project(ctx: CommandContext) -> None:
+    """List projects and request an interactive project switch."""
+    if ctx.arg.strip() != "list":
+        ctx.console.print("[yellow]Usage: /project list[/yellow]")
+        return
+    store = getattr(ctx.runtime, "project_store", None)
+    if store is None:
+        ctx.console.print("[red]Project storage is unavailable[/red]")
+        return
+    ctx.state["pending_project_list"] = True
+
+
+def _cmd_project_thread(ctx: CommandContext) -> None:
+    """List and restore a thread belonging to the current project."""
+    if ctx.arg.strip() != "list":
+        ctx.console.print("[yellow]Usage: /project_thread list[/yellow]")
+        return
+    if getattr(ctx.runtime, "project", None) is None:
+        ctx.console.print("[dim]Current thread is not bound to a project[/dim]")
+        return
+    ctx.state["pending_project_thread_list"] = True
+
+
 def _cmd_prompt(ctx: CommandContext) -> None:
     """Prompt 管理命令：/prompt list | /prompt show <cat/name> | /prompt reload。
 
@@ -612,6 +635,8 @@ _registry.register(CommandSpec("/thinking", "Toggle Thought fold row display (on
 _registry.register(CommandSpec("/tools", "List available tools", _cmd_tools))
 _registry.register(CommandSpec("/model", "Show or switch model (<provider> [model]); applies next round", _cmd_model))
 _registry.register(CommandSpec("/thread", "Manage threads (info|list|new|switch|rename|delete)", _cmd_thread))
+_registry.register(CommandSpec("/project", "Use /project list to select a project", _cmd_project))
+_registry.register(CommandSpec("/project_thread", "Use /project_thread list to restore a project thread", _cmd_project_thread))
 _registry.register(CommandSpec("/prompt", "Prompt management (list|show <cat/name>|reload)", _cmd_prompt))
 _registry.register(CommandSpec("/skill", "Skill control (list|search|<name>|off|enable|disable|install|evolve|capture|history)", _cmd_skill))
 _registry.register(CommandSpec("/mcp", "MCP control (list|reload)", _cmd_mcp))
