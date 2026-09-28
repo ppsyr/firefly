@@ -1,6 +1,8 @@
 """S4 SlashCommandCompleter 单测 — /skill <name> 补全 + 子命令优先 + 命令名补全。"""
 from __future__ import annotations
 
+from pathlib import Path
+
 from prompt_toolkit.document import Document
 
 from poirot.backend.app.cli.command_completer import SlashCommandCompleter
@@ -76,3 +78,17 @@ def test_skill_full_name_completes():
     c = SlashCommandCompleter(get_registry(), skill_provider=lambda: ["source-verification"])
     result = _completions(c, "/skill source-verification")
     assert "source-verification" in result
+
+
+def test_file_completion_ends_confirmed_reference_with_space(tmp_path: Path):
+    file_path = tmp_path / "main.py"
+    file_path.write_text("print('ok')", encoding="utf-8")
+    c = SlashCommandCompleter(
+        get_registry(),
+        file_provider=lambda fragment: [(file_path, "main.py")] if fragment == "main" else [],
+    )
+    document = Document("请看 @main", cursor_position=len("请看 @main"))
+    completions = list(c.get_completions(document, None))
+    assert len(completions) == 1
+    assert completions[0].text == "@main.py "
+    assert completions[0].display == [("", "@main.py")]

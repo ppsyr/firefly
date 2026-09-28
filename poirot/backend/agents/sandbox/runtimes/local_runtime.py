@@ -52,6 +52,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -107,6 +108,14 @@ def _is_path_ignored(file_path: Path, root: Path) -> bool:
     return False
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 class LocalRuntime:
     """本地运行时：subprocess 裸执行 + Python 标准库文件操作。
 
@@ -116,8 +125,28 @@ class LocalRuntime:
     核心约束见模块级 INVARIANT。
     """
 
-    def __init__(self, allow_host_bash: bool = True) -> None:
+    def __init__(
+        self,
+        allow_host_bash: bool = True,
+        working_dir: str | None = None,
+        allowed_root: str | None = None,
+        allowed_roots: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         self._allow_host_bash = allow_host_bash
+        self._working_dir = working_dir
+        roots = list(allowed_roots or ())
+        if allowed_root:
+            roots.append(allowed_root)
+        self._allowed_roots = tuple(Path(root).expanduser().resolve() for root in roots)
+
+    def _check_path(self, path: str, *, write: bool = False) -> Path:
+        candidate = Path(path)
+        resolved = candidate.resolve(strict=False)
+        if self._allowed_roots and not any(_is_relative_to(resolved, root) for root in self._allowed_roots):
+            raise SandboxPermissionError(
+                f"path outside thread workspace: {path}", path=path, operation="write" if write else "read"
+            )
+        return resolved
 
     def exec_command(self, command: str) -> str:
         """执行 shell 命令，返回 stdout。
@@ -129,6 +158,7 @@ class LocalRuntime:
             raise SandboxRuntimeError(
                 "host bash is disabled (POIROT_SANDBOX_ALLOW_HOST_BASH=false)"
             )
+        self._check_command_existing_paths(command)
         try:
             result = subprocess.run(
                 command,
@@ -136,10 +166,15 @@ class LocalRuntime:
                 capture_output=True,
                 text=True,
                 timeout=_EXEC_TIMEOUT_SECONDS,
+                cwd=self._working_dir,
             )
         except subprocess.TimeoutExpired as exc:
             raise SandboxCommandError(
                 "command timed out", command=command, exit_code=None
+            ) from exc
+        except FileNotFoundError as exc:
+            raise SandboxRuntimeError(
+                "thread workspace is unavailable", details={"path": self._working_dir}
             ) from exc
         if result.returncode != 0:
             raise SandboxCommandError(
@@ -149,10 +184,58 @@ class LocalRuntime:
             )
         return result.stdout
 
+    def _check_command_existing_paths(self, command: str) -> None:
+        """Reject existing relative/symlink paths that resolve outside cwd.
+
+        This is defense in depth for shell commands.  Commands can still
+        construct paths dynamically, so host bash is not equivalent to a
+        kernel-level container boundary.
+        """
+        if not self._allowed_roots:
+            return
+        try:
+            tokens = shlex.split(command)
+        except ValueError as exc:
+            raise SandboxPermissionError(
+                "command has unparseable quoting", path=command[:100], operation="validate_command"
+            ) from exc
+        for token in tokens:
+            candidate = token.strip("<>|;&()")
+            if not candidate or candidate.startswith("-") or "=" in candidate:
+                continue
+            # Bare command names and arguments to interpreters are not file
+            # paths (``echo``, ``python -c ...``).  Only inspect them when a
+            # same-named entry exists in the working directory; explicit
+            # slash/absolute/traversal paths are always checked below.
+            if (
+                not Path(candidate).is_absolute()
+                and "/" not in candidate
+                and not candidate.startswith((".", "~"))
+                and not (Path(self._working_dir or ".") / candidate).exists()
+            ):
+                continue
+            path = Path(candidate)
+            if not path.is_absolute():
+                path = Path(self._working_dir or ".") / path
+            resolved = path.resolve(strict=False)
+            if any(_is_relative_to(resolved, root) for root in self._allowed_roots):
+                continue
+            # System executables may be invoked by an allowed shell command;
+            # check the resolved path so ``/bin/../etc/passwd`` cannot use a
+            # textual prefix to bypass the workspace boundary.
+            system_roots = (Path("/bin"), Path("/usr/bin"), Path("/lib"), Path("/usr/lib"))
+            if any(_is_relative_to(resolved, root) for root in system_roots):
+                continue
+            raise SandboxPermissionError(
+                "command path resolves outside thread workspace",
+                path=candidate,
+                operation="validate_command",
+            )
+
     def read_file(self, path: str) -> str:
         """读文本文件；FileNotFoundError / PermissionError 包装为 SandboxError 子类。"""
         try:
-            return Path(path).read_text(encoding="utf-8")
+            return self._check_path(path).read_text(encoding="utf-8")
         except FileNotFoundError as exc:
             raise SandboxFileNotFoundError(
                 f"file not found: {path}", path=path, operation="read"
@@ -165,7 +248,7 @@ class LocalRuntime:
     def write_file(self, path: str, content: str, append: bool = False) -> None:
         """写 / 追加文本文件；自动创建父目录；PermissionError 包装。"""
         try:
-            p = Path(path)
+            p = self._check_path(path, write=True)
             p.parent.mkdir(parents=True, exist_ok=True)
             if append:
                 with p.open("a", encoding="utf-8") as f:
@@ -183,7 +266,7 @@ class LocalRuntime:
         S9: 替代 rglob("*") 先全遍历再过滤的反模式——node_modules 10 万文件不再 DoS。
         """
         try:
-            root = Path(path)
+            root = self._check_path(path)
             if not root.exists():
                 raise SandboxFileNotFoundError(
                     f"dir not found: {path}", path=path, operation="list_dir"
@@ -196,8 +279,8 @@ class LocalRuntime:
                 f"permission denied: {path}", path=path, operation="list_dir"
             ) from exc
 
-    @staticmethod
     def _scan_bfs(
+        self,
         root: Path, current: Path, depth: int, max_depth: int,
         max_entries: int, entries: list[str],
     ) -> None:
@@ -209,10 +292,15 @@ class LocalRuntime:
                 for entry in sorted(it, key=lambda e: e.name):
                     if len(entries) >= max_entries:
                         return
+                    if self._allowed_roots and not any(
+                        _is_relative_to(Path(entry.path).resolve(strict=False), root)
+                        for root in self._allowed_roots
+                    ):
+                        continue
                     rel = str(Path(entry.path).relative_to(root))
                     entries.append(rel)
                     if entry.is_dir() and depth < max_depth:
-                        LocalRuntime._scan_bfs(
+                        self._scan_bfs(
                             root, Path(entry.path), depth + 1, max_depth, max_entries, entries,
                         )
         except (PermissionError, OSError):
@@ -232,9 +320,13 @@ class LocalRuntime:
         PermissionError 包装为 SandboxPermissionError。
         """
         try:
-            root = Path(path)
+            root = self._check_path(path)
             matches: list[str] = []
             for item in root.rglob(pattern):
+                if self._allowed_roots and not any(
+                    _is_relative_to(item.resolve(strict=False), root) for root in self._allowed_roots
+                ):
+                    continue
                 if not include_dirs and item.is_dir():
                     continue
                 matches.append(str(item.relative_to(root)))
@@ -264,7 +356,7 @@ class LocalRuntime:
         - 每行命中结果截断到 DEFAULT_LINE_SUMMARY_LENGTH。
         """
         try:
-            root = Path(path)
+            root = self._check_path(path)
             flags = 0 if case_sensitive else re.IGNORECASE
             if literal:
                 regex = re.compile(re.escape(pattern), flags)
@@ -274,6 +366,10 @@ class LocalRuntime:
                 regex = re.compile(pattern, flags)
             matches: list[GrepMatch] = []
             for file_path in root.rglob(glob or "*"):
+                if self._allowed_roots and not any(
+                    _is_relative_to(file_path.resolve(strict=False), root) for root in self._allowed_roots
+                ):
+                    continue
                 if file_path.is_dir():
                     continue
                 if _is_path_ignored(file_path, root):
@@ -305,7 +401,7 @@ class LocalRuntime:
     def download_file(self, path: str) -> bytes:
         """读二进制文件（供 artifact 下载）；FileNotFoundError 包装。"""
         try:
-            return Path(path).read_bytes()
+            return self._check_path(path).read_bytes()
         except FileNotFoundError as exc:
             raise SandboxFileNotFoundError(
                 f"file not found: {path}", path=path, operation="download"
@@ -314,7 +410,7 @@ class LocalRuntime:
     def update_file(self, path: str, content: bytes) -> None:
         """写二进制文件（自动建父目录）；PermissionError 包装。"""
         try:
-            p = Path(path)
+            p = self._check_path(path, write=True)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(content)
         except PermissionError as exc:

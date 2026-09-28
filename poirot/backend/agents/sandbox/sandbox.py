@@ -41,6 +41,7 @@ from poirot.backend.agents.sandbox.contracts import (
     SecurityGuard,
 )
 from poirot.backend.agents.sandbox.types import GrepMatch
+from poirot.backend.agents.sandbox.exceptions import SandboxPermissionError
 
 
 class Sandbox:
@@ -83,6 +84,11 @@ class Sandbox:
             return self._translator.reverse_translate(virtual_path)
         return self._translator.translate_path(virtual_path)
 
+    def resolve_host_path(self, virtual_path: str) -> str:
+        """Validate a virtual path before resolving it for artifact handling."""
+        self._guard.validate_path(virtual_path, write=False)
+        return self.get_host_path(virtual_path)
+
     def execute_command(self, command: str) -> str:
         self._guard.validate_command(command)
         translated = self._translator.translate_command(command)
@@ -91,18 +97,27 @@ class Sandbox:
 
     def read_file(self, path: str) -> str:
         self._guard.validate_path(path, write=False)
-        physical = self._translator.translate_path(path)
+        try:
+            physical = self._translator.translate_path(path)
+        except PermissionError as exc:
+            raise SandboxPermissionError(str(exc), path=path, operation="read") from exc
         content = self._runtime.read_file(physical)
         return self._translator.mask_output(content)
 
     def write_file(self, path: str, content: str, append: bool = False) -> None:
         self._guard.validate_path(path, write=True)
-        physical = self._translator.translate_path(path)
+        try:
+            physical = self._translator.translate_path(path)
+        except PermissionError as exc:
+            raise SandboxPermissionError(str(exc), path=path, operation="write") from exc
         self._runtime.write_file(physical, content, append=append)
 
     def list_dir(self, path: str, max_depth: int = 2, max_entries: int = 1000) -> list[str]:
         self._guard.validate_path(path, write=False)
-        physical = self._translator.translate_path(path)
+        try:
+            physical = self._translator.translate_path(path)
+        except PermissionError as exc:
+            raise SandboxPermissionError(str(exc), path=path, operation="list_dir") from exc
         entries = self._runtime.list_dir(physical, max_depth=max_depth, max_entries=max_entries)
         return [self._translator.mask_output(e) for e in entries]
 
@@ -115,7 +130,10 @@ class Sandbox:
         max_results: int = 200,
     ) -> tuple[list[str], bool]:
         self._guard.validate_path(path, write=False)
-        physical = self._translator.translate_path(path)
+        try:
+            physical = self._translator.translate_path(path)
+        except PermissionError as exc:
+            raise SandboxPermissionError(str(exc), path=path, operation="glob") from exc
         results, truncated = self._runtime.glob(
             physical, pattern, include_dirs=include_dirs, max_results=max_results
         )
@@ -132,7 +150,10 @@ class Sandbox:
         max_results: int = 100,
     ) -> tuple[list[GrepMatch], bool]:
         self._guard.validate_path(path, write=False)
-        physical = self._translator.translate_path(path)
+        try:
+            physical = self._translator.translate_path(path)
+        except PermissionError as exc:
+            raise SandboxPermissionError(str(exc), path=path, operation="grep") from exc
         results, truncated = self._runtime.grep(
             physical,
             pattern,
@@ -153,12 +174,18 @@ class Sandbox:
 
     def download_file(self, path: str) -> bytes:
         self._guard.validate_path(path, write=False)
-        physical = self._translator.translate_path(path)
+        try:
+            physical = self._translator.translate_path(path)
+        except PermissionError as exc:
+            raise SandboxPermissionError(str(exc), path=path, operation="download") from exc
         return self._runtime.download_file(physical)
 
     def update_file(self, path: str, content: bytes) -> None:
         self._guard.validate_path(path, write=True)
-        physical = self._translator.translate_path(path)
+        try:
+            physical = self._translator.translate_path(path)
+        except PermissionError as exc:
+            raise SandboxPermissionError(str(exc), path=path, operation="update") from exc
         self._runtime.update_file(physical, content)
 
     def close(self) -> None:

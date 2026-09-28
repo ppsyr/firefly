@@ -48,7 +48,13 @@ class TitleMiddleware(AgentMiddleware):
         title = _get_runtime_value(runtime, "thread_title")
         if title is not None:
             return {"metadata": {"title": title}}
-        source = state.get("research_question") or state.get("user_input") or "Untitled"
+        metadata = state.get("metadata") or {}
+        source = (
+            metadata.get("title_question")
+            or state.get("research_question")
+            or state.get("user_input")
+            or "Untitled"
+        )
         return {"metadata": {"title": str(source)[:60]}}
 
     async def aafter_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:

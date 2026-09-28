@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+from contextvars import ContextVar
 from dataclasses import dataclass, replace, field
 from pathlib import Path
 from uuid import uuid4
@@ -80,6 +81,9 @@ from poirot.backend.agents.runtime.projects import ProjectMetadata, ProjectStore
 
 # 项目根路径（app/bootstrap.py 的上三级）。
 _PROJECT_ROOT = Path(__file__).parents[3]
+_SANDBOX_THREAD_STORE: ContextVar[ThreadStore | None] = ContextVar(
+    "sandbox_thread_store", default=None
+)
 
 
 def _resolve_relative_paths(config: AppConfig) -> AppConfig:
@@ -172,6 +176,36 @@ class AppRuntime:
         if self.thread_store is not None:
             self.thread_store.update(self.thread_id)
 
+    def prepare_question(self, question: str, *, choose=None, thread_id: str | None = None):
+        """Resolve one-turn ``@`` references using the current thread cwd."""
+        from poirot.backend.agents.runtime.file_access import (
+            PreparedQuestion,
+            ThreadFileAccess,
+            extract_references,
+            prepare_question,
+        )
+
+        if not extract_references(question):
+            return PreparedQuestion(question, question)
+        item = self.thread_store.require(thread_id or self.thread_id) if self.thread_store else None
+        access = ThreadFileAccess(item.cwd if item else None)
+        return prepare_question(question, access, choose=choose)
+
+    async def aprepare_question(self, question: str, *, choose=None, thread_id: str | None = None):
+        """Async ``@`` preparation, allowing the UI to select duplicate files."""
+        from poirot.backend.agents.runtime.file_access import (
+            PreparedQuestion,
+            ThreadFileAccess,
+            extract_references,
+            prepare_question_async,
+        )
+
+        if not extract_references(question):
+            return PreparedQuestion(question, question)
+        item = self.thread_store.require(thread_id or self.thread_id) if self.thread_store else None
+        access = ThreadFileAccess(item.cwd if item else None)
+        return await prepare_question_async(question, access, choose=choose)
+
     def switch_thread(self, thread_id: str) -> AppRuntime:
         if self.active_threads:
             raise RuntimeError("A conversation is running; wait for it to finish")
@@ -189,6 +223,10 @@ class AppRuntime:
         thread_dir = self.thread_store.session_dir(thread_id)
         journal = RunJournal(thread_id, thread_dir / "thread-events.jsonl")
         journal.append("thread.resumed", {"previous_thread_id": self.thread_id})
+        # ContextVar is process-local; never carry the previous thread's
+        # sandbox into a newly selected thread.
+        from poirot.backend.agents.sandbox.integration.context import set_sandbox_id
+        set_sandbox_id(None)
         return replace(self, thread_id=thread_id, thread_dir=thread_dir, thread_journal=journal,
                        project=project)
 
@@ -272,6 +310,7 @@ class AppRuntime:
             self.thread_store.create(effective_thread_id, project=self.project.project_name if self.project else None,
                                      cwd=self.project.dir if self.project else None)
         thread = self.thread_store.require(effective_thread_id) if self.thread_store else None
+        prepared = self.prepare_question(question, thread_id=effective_thread_id)
         context = self.run_manager.create_run(
             thread_id=effective_thread_id,
             user_id=user_id,
@@ -284,12 +323,17 @@ class AppRuntime:
         self.run_manager.mark_running(context.run_id)
         try:
             if self.thread_store is not None:
-                self.thread_store.update(effective_thread_id, first_message=question)
+                self.thread_store.update(effective_thread_id, first_message=prepared.original)
             self.active_threads.add(effective_thread_id)
             if self.thread_store is None:
-                result = self.leader_agent.run(question, context)
+                result = self.leader_agent.run(prepared.enriched, context, title_question=prepared.original)
             else:
-                result = self.leader_agent.run(question, context, thread_title=self.thread_store.require(effective_thread_id).title)
+                result = self.leader_agent.run(
+                    prepared.enriched,
+                    context,
+                    thread_title=self.thread_store.require(effective_thread_id).title,
+                    title_question=prepared.original,
+                )
             self.run_manager.mark_success(context.run_id)
             return result
         except Exception as exc:
@@ -485,18 +529,27 @@ class AppRuntime:
         )
 
 
-def _load_sandbox_provider(config: AppConfig) -> Any:
+def _load_sandbox_provider(config: AppConfig, thread_store: ThreadStore | None = None) -> Any:
     """反射加载 sandbox provider。config.sandbox.use 为空则返回 None。"""
     sandbox_config = config.sandbox
     if not sandbox_config.use:
         return None
+    thread_store = thread_store or _SANDBOX_THREAD_STORE.get()
     import importlib
 
     module_path, _, class_name = sandbox_config.use.partition(":")
     module = importlib.import_module(module_path)
     provider_cls = getattr(module, class_name)
     path_mappings = _build_path_mappings(sandbox_config)
-    return provider_cls(path_mappings=path_mappings, sandbox_config=sandbox_config)
+    def resolve_thread_cwd(thread_id: str) -> str | None:
+        item = thread_store.get(thread_id) if thread_store is not None else None
+        return item.cwd if item is not None else None
+
+    return provider_cls(
+        path_mappings=path_mappings,
+        sandbox_config=sandbox_config,
+        thread_cwd_resolver=resolve_thread_cwd,
+    )
 
 
 def _load_memory_provider(config: AppConfig) -> Any:
@@ -761,7 +814,11 @@ def bootstrap_runtime(
         )
 
     # ── Sandbox 装配（config 配了 provider 就加载，不论模式）──
-    sandbox_provider = _load_sandbox_provider(config)
+    store_token = _SANDBOX_THREAD_STORE.set(thread_store)
+    try:
+        sandbox_provider = _load_sandbox_provider(config)
+    finally:
+        _SANDBOX_THREAD_STORE.reset(store_token)
     sandbox_tools = []
     artifact_server = None
     if sandbox_provider is not None:

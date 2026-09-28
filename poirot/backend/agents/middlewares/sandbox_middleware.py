@@ -292,11 +292,16 @@ class SandboxMiddleware(AgentMiddleware):
                 )
                 continue
             filename = vp[len(_VIRTUAL_PREFIX):].lstrip("/")
+            relative_filename = Path(filename)
+            if relative_filename.is_absolute() or ".." in relative_filename.parts:
+                logger.warning("present_files: skipping path traversal candidate")
+                continue
 
             # 1. 解析 host 路径（通过 sandbox translator）
             try:
                 if sandbox is not None:
-                    host_path = sandbox.get_host_path(vp)
+                    resolver = getattr(sandbox, "resolve_host_path", sandbox.get_host_path)
+                    host_path = resolver(vp)
                 else:
                     host_path = f"{self._sandbox_root}/{sandbox_id}/{filename}" if self._sandbox_root else None
             except Exception as exc:
@@ -307,7 +312,12 @@ class SandboxMiddleware(AgentMiddleware):
                 continue
 
             # 2. 复制到 .poirot/outputs/（固定产出物目录）
-            dest = outputs_dir / filename
+            dest = (outputs_dir / relative_filename).resolve()
+            try:
+                dest.relative_to(outputs_dir.resolve())
+            except ValueError:
+                logger.warning("present_files: skipping destination outside outputs")
+                continue
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(host_path, dest)

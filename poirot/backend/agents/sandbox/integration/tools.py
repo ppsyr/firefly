@@ -51,6 +51,14 @@ from poirot.backend.agents.sandbox.utils.file_operation_lock import (
 
 _BASH_OUTPUT_MAX_CHARS = 10000
 WRITE_FILE_MAX_BYTES = 5 * 1024 * 1024
+_WORKSPACE_PREFIX = "/mnt/poirot/user-data/workspace/"
+
+
+def _workspace_path(path: str) -> str:
+    """Resolve a relative tool path inside the current thread workspace."""
+    if path.startswith("/"):
+        return path
+    return _WORKSPACE_PREFIX + path
 
 
 def _truncate_output(
@@ -104,7 +112,7 @@ def _make_read_file_tool(provider: SandboxProvider) -> BaseTool:
         Args:
             path: Virtual path to the file (e.g. /mnt/poirot/user-data/workspace/file.txt).
         """
-        return _ensure_sandbox(provider).read_file(path)
+        return _ensure_sandbox(provider).read_file(_workspace_path(path))
 
     return read_file_tool
 
@@ -126,7 +134,7 @@ def _make_write_file_tool(provider: SandboxProvider) -> BaseTool:
                 f"write_file content exceeds {WRITE_FILE_MAX_BYTES} bytes limit; "
                 "use append=True to write in chunks"
             )
-        _ensure_sandbox(provider).write_file(path, content, append=append)
+        _ensure_sandbox(provider).write_file(_workspace_path(path), content, append=append)
         return f"wrote {len(content)} chars to {path}"
 
     return write_file_tool
@@ -141,7 +149,7 @@ def _make_list_dir_tool(provider: SandboxProvider) -> BaseTool:
             path: Virtual path to the directory.
             max_depth: Maximum depth to traverse (default 2).
         """
-        entries = _ensure_sandbox(provider).list_dir(path, max_depth=max_depth)
+        entries = _ensure_sandbox(provider).list_dir(_workspace_path(path), max_depth=max_depth)
         if not entries:
             return "(empty)"
         lines: list[str] = []
@@ -168,6 +176,7 @@ def _make_str_replace_tool(provider: SandboxProvider) -> BaseTool:
             replace_all: If True, replace all occurrences; if False, replace first.
         """
         sandbox = _ensure_sandbox(provider)
+        path = _workspace_path(path)
         lock = get_file_operation_lock(sandbox.id, path)
         with lock:
             content = sandbox.read_file(path)

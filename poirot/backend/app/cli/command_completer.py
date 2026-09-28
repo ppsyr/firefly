@@ -24,6 +24,8 @@ active skill 名。选中/未选中行配色由 main.py 的 PromptSession Style 
 """
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Callable
 
 from prompt_toolkit.completion import Completer, Completion
@@ -52,6 +54,7 @@ class SlashCommandCompleter(Completer):
         self,
         registry: CommandRegistry,
         skill_provider: Callable[[], list[str]] | None = None,
+        file_provider: Callable[[str], list[tuple[Path, str]]] | None = None,
     ) -> None:
         """初始化。
 
@@ -61,6 +64,7 @@ class SlashCommandCompleter(Completer):
         """
         self._registry = registry
         self._skill_provider = skill_provider
+        self._file_provider = file_provider
 
     def get_completions(self, document: Document, complete_event):  # type: ignore[no-untyped-def]
         """产出补全候选。
@@ -134,3 +138,25 @@ class SlashCommandCompleter(Completer):
                             display=n,
                             display_meta="skill",
                         )
+
+        # File references are completed while the user is still typing.  The
+        # provider performs the thread-scoped path check; this class only
+        # presents its bounded results to prompt_toolkit.
+        if self._file_provider is not None:
+            match = re.search(r"(?<![\w@])@([^\s@()]*)$", document.text_before_cursor)
+            if match and match.group(1):
+                token = match.group(0)
+                try:
+                    candidates = self._file_provider(match.group(1)) or []
+                except Exception:
+                    candidates = []
+                for path, label in candidates:
+                    yield Completion(
+                        # A confirmed reference must be delimited before the
+                        # user continues typing (otherwise ``@main.py帮我看``
+                        # is parsed as one filename).
+                        text="@" + label + " ",
+                        start_position=-len(token),
+                        display="@" + label,
+                        display_meta="file" if Path(path).is_file() else "directory",
+                    )

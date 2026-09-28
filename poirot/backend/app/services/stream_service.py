@@ -194,7 +194,9 @@ class PoirotStreamClient:
         self._graph = graph
         self._config = config
 
-    async def stream(self, question: str) -> AsyncIterator[StreamEvent]:
+    async def stream(
+        self, question: str, *, title_question: str | None = None
+    ) -> AsyncIterator[StreamEvent]:
         """流式产出 StreamEvent。
 
         Args:
@@ -209,6 +211,7 @@ class PoirotStreamClient:
             "messages": [HumanMessage(content=question)],
             "user_input": question,
             "research_question": question,
+            "metadata": {"title_question": title_question if title_question is not None else question},
         }
 
         seen_ids: set[str] = set()

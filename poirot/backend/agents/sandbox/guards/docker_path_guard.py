@@ -1,7 +1,8 @@
 """DockerPathGuard — Docker 路径白名单守卫（写入必须落挂载区）。
 
 【整体职责】
-实现 security_guard 契约的"Docker 路径"版本：约束**写入**操作只能落在挂载区
+实现 security_guard 契约的"Docker 路径"版本：默认约束**写入**操作只能落在挂载区；
+配置 thread scope 时，读写都限制在允许挂载前缀内
 （/mnt/poirot/user-data/），包括两条路径——
 ① validate_path(write=True)：直接写入的路径；
 ② validate_command：bash 重定向目标（> / >>）的绝对路径。
@@ -34,6 +35,8 @@
 from __future__ import annotations
 
 import re
+import shlex
+from pathlib import PurePosixPath
 
 from poirot.backend.agents.sandbox.exceptions import SandboxPermissionError
 
@@ -46,14 +49,32 @@ class DockerPathGuard:
 
     - validate_path(write=True)：路径必须以 /mnt/poirot/user-data/ 为前缀。
     - validate_command：bash 重定向目标（绝对路径）必须以同一前缀为准。
-    - 读操作不限制（容器隔离兜底）。
+    - 未配置 thread scope 时读操作不限制（容器隔离兜底）。
     """
 
+    def __init__(
+        self,
+        allowed_prefixes: list[str] | tuple[str, ...] | None = None,
+        *,
+        enforce_scope: bool = False,
+    ) -> None:
+        self._allowed_prefixes = tuple(p.rstrip("/") for p in (allowed_prefixes or ()))
+        self._enforce_scope = enforce_scope
+
+    def _allowed(self, path: str) -> bool:
+        return any(path == prefix or path.startswith(prefix + "/") for prefix in self._allowed_prefixes)
+
     def validate_path(self, path: str, *, write: bool = False) -> None:
-        """写入路径校验：write=True 时要求路径落在 _VIRTUAL_PREFIX 下；否则放行。"""
-        if not write:
+        """Validate thread-scoped paths when prefixes were configured."""
+        if (self._enforce_scope or self._allowed_prefixes) and not self._allowed(path):
+            raise SandboxPermissionError(
+                f"path is outside the thread workspace: {path}",
+                path=path,
+                operation="validate",
+            )
+        if not self._enforce_scope and not self._allowed_prefixes and not write:
             return
-        if not path.startswith(_VIRTUAL_PREFIX):
+        if write and not path.startswith(_VIRTUAL_PREFIX):
             raise SandboxPermissionError(
                 f"write path must be under {_VIRTUAL_PREFIX}: {path}",
                 path=path,
@@ -62,9 +83,33 @@ class DockerPathGuard:
 
     def validate_command(self, command: str) -> None:
         """命令校验：所有绝对路径重定向目标必须落在 _VIRTUAL_PREFIX 下。"""
+        if self._enforce_scope or self._allowed_prefixes:
+            try:
+                tokens = shlex.split(command)
+            except ValueError as exc:
+                raise SandboxPermissionError(
+                    "command has unparseable quoting",
+                    path=command[:100],
+                    operation="validate_command",
+                ) from exc
+            for token in tokens:
+                if ".." in PurePosixPath(token).parts:
+                    raise SandboxPermissionError(
+                        "command contains a path traversal segment",
+                        path=command[:100],
+                        operation="validate_command",
+                    )
+                if token.startswith("/") and not (
+                    token.startswith(("/bin/", "/usr/", "/lib/")) or self._allowed(token)
+                ):
+                    raise SandboxPermissionError(
+                        f"command path is outside the thread workspace: {token}",
+                        path=token,
+                        operation="validate_command",
+                    )
         for match in _REDIRECT_PATTERN.finditer(command):
             target = match.group(1)
-            if not target.startswith(_VIRTUAL_PREFIX):
+            if not target.startswith(_VIRTUAL_PREFIX) and not self._allowed(target):
                 raise SandboxPermissionError(
                     f"bash redirect target must be under {_VIRTUAL_PREFIX}: {target}",
                     path=target,

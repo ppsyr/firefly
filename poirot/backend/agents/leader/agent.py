@@ -138,7 +138,14 @@ class LeaderAgent:
     graph: Any
     capability_registry: CapabilityRegistry
 
-    def run(self, question: str, run_context: Any, *, thread_title: str | None = None) -> AgentRunResult:
+    def run(
+        self,
+        question: str,
+        run_context: Any,
+        *,
+        thread_title: str | None = None,
+        title_question: str | None = None,
+    ) -> AgentRunResult:
         """驱动一次研究：构造 state + config → ainvoke → 收报告 → 存 artifact。
 
         Args:
@@ -158,7 +165,10 @@ class LeaderAgent:
         """
         initial = create_initial_thread_state(question)
         initial["research_question"] = question
-        initial["metadata"] = {"expert_mode": run_context.config.runtime.expert_mode}
+        initial["metadata"] = {
+            "expert_mode": run_context.config.runtime.expert_mode,
+            "title_question": title_question if title_question is not None else question,
+        }
 
         config = {
             "configurable": {
@@ -184,6 +194,9 @@ class LeaderAgent:
                 "messages": [HumanMessage(content=question)],
                 "user_input": question,
                 "research_question": question,
+                "metadata": {
+                    "title_question": title_question if title_question is not None else question,
+                },
             },
             config=config,
         ))

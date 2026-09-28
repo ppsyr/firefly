@@ -60,6 +60,7 @@ import hashlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from poirot.backend.agents.sandbox.contracts import SandboxProvider
@@ -114,6 +115,7 @@ class DockerSandboxProvider(SandboxProvider):
         environment: dict[str, str] | None = None,
         idle_timeout: int = _DEFAULT_IDLE_TIMEOUT,
         replicas: int = _DEFAULT_REPLICAS,
+        thread_cwd_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         # sandbox_config 若提供，覆盖对应参数（缺省回退到显式参数）
         if sandbox_config is not None:
@@ -125,6 +127,7 @@ class DockerSandboxProvider(SandboxProvider):
             replicas = sandbox_config.replicas or replicas
 
         self._path_mappings = path_mappings or []
+        self._thread_cwd_resolver = thread_cwd_resolver
         self._idle_timeout = idle_timeout
         self._replicas = replicas
         self._sandbox_root = (
@@ -256,7 +259,9 @@ class DockerSandboxProvider(SandboxProvider):
         if alive is False:
             self._drop_unhealthy(sandbox_id, "warm pool health check failed", expected_info=info)
             return None
-        sandbox = self._make_sandbox(sandbox_id, info)
+        sandbox = self._make_sandbox(
+            sandbox_id, info, workspace_allowed=self._thread_cwd(thread_id) is not None
+        )
         with self._lock:
             self._warm_pool.pop(sandbox_id, None)
             self._sandboxes[sandbox_id] = sandbox
@@ -295,7 +300,9 @@ class DockerSandboxProvider(SandboxProvider):
             return WslDockerExecutor(distro=distro, user=user)
         return LocalDockerExecutor()
 
-    def _make_sandbox(self, sandbox_id: str, info: SandboxInfo) -> Sandbox:
+    def _make_sandbox(
+        self, sandbox_id: str, info: SandboxInfo, *, workspace_allowed: bool = True
+    ) -> Sandbox:
         """按 Docker 模式组合 runtime / translator / guard，构造 Sandbox 门面。"""
         from poirot.backend.agents.sandbox.runtimes.docker_runtime import DockerRuntime
         from poirot.backend.agents.sandbox.translators.docker_path_translator import (
@@ -306,14 +313,33 @@ class DockerSandboxProvider(SandboxProvider):
         )
         runtime = DockerRuntime(info.sandbox_url)
         translator = DockerPathTranslator(self._sandbox_root, sandbox_id)
-        guard = AuditGuard(DockerPathGuard())
+        allowed = ["/mnt/poirot/user-data/workspace"] if workspace_allowed else []
+        allowed.extend(m.container_path for m in self._extra_mounts)
+        guard = AuditGuard(DockerPathGuard(allowed_prefixes=allowed, enforce_scope=True))
         return Sandbox(sandbox_id, runtime, translator, guard)
+
+    def _thread_cwd(self, thread_id: str) -> str | None:
+        if self._thread_cwd_resolver is None:
+            return None
+        try:
+            return self._thread_cwd_resolver(thread_id)
+        except Exception:
+            return None
+
+    def _extra_mounts_for_thread(self, thread_id: str) -> list[PathMapping]:
+        mounts = list(self._extra_mounts)
+        cwd = self._thread_cwd(thread_id)
+        if cwd:
+            mounts.append(PathMapping("/mnt/poirot/user-data/workspace", cwd, False))
+        return mounts
 
     def _register(
         self, thread_id: str, sandbox_id: str, info: SandboxInfo, user_id: str,
     ) -> str:
         """把新建 / 发现的 Sandbox 纳入 active 缓存并绑定线程。"""
-        sandbox = self._make_sandbox(sandbox_id, info)
+        sandbox = self._make_sandbox(
+            sandbox_id, info, workspace_allowed=self._thread_cwd(thread_id) is not None
+        )
         with self._lock:
             self._sandboxes[sandbox_id] = sandbox
             self._sandbox_infos[sandbox_id] = info
@@ -417,7 +443,7 @@ class DockerSandboxProvider(SandboxProvider):
         """创建容器：先副本软上限 → create → readiness 等待（60s）→ 注册。"""
         self._enforce_replicas()
         info = self._backend.create(
-            thread_id, sandbox_id, extra_mounts=self._extra_mounts or None,
+            thread_id, sandbox_id, extra_mounts=self._extra_mounts_for_thread(thread_id) or None,
         )
         if not wait_for_sandbox_ready(info.sandbox_url, timeout=60):
             self._backend.destroy(info)
@@ -434,7 +460,7 @@ class DockerSandboxProvider(SandboxProvider):
         await asyncio.to_thread(self._enforce_replicas)
         info = await asyncio.to_thread(
             self._backend.create, thread_id, sandbox_id,
-            extra_mounts=self._extra_mounts or None,
+            extra_mounts=self._extra_mounts_for_thread(thread_id) or None,
         )
         if not await wait_for_sandbox_ready_async(info.sandbox_url, timeout=60):
             await asyncio.to_thread(self._backend.destroy, info)

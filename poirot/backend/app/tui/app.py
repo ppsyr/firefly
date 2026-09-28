@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from textual import work
@@ -28,12 +29,13 @@ from poirot.backend.app.cli.commands import get_registry, handle_command
 from poirot.backend.app.services.stream_service import PoirotStreamClient
 from poirot.backend.app.tui import theme
 from poirot.backend.app.tui.command_palette import CommandPalette
-from poirot.backend.app.tui.project_selector import ProjectPicker
+from poirot.backend.app.tui.project_selector import FilePicker, ProjectPicker
 from poirot.backend.app.tui.conversation import ConversationLog
 from poirot.backend.app.tui.help_screen import HelpRequestScreen
 from poirot.backend.app.tui.mcp_panel import McpPanel
 from poirot.backend.app.tui.side_panel import SidePanel
 from poirot.backend.app.tui.status_bar import StatusBar
+from poirot.backend.agents.runtime.file_access import ThreadFileAccess, reference_fragment_at_cursor
 
 # 宽屏阈值：>= 此列数时展开右侧会话信息面板（仅全屏/极宽终端触发）。
 _WIDE_THRESHOLD = 160
@@ -119,6 +121,15 @@ class WelcomeView(Container):
     WelcomeView > InputRow > #welcome-input:focus {{
         border: tall {theme.BORDER_FOCUS};
     }}
+    #welcome-file-suggestions, #conv-file-suggestions {{
+        height: auto;
+        max-height: 10;
+        width: 100%;
+        color: {theme.TEXT_SECONDARY};
+        background: {theme.SURFACE};
+        padding: 0 1;
+        display: none;
+    }}
     WelcomeView > #tip {{
         width: 100%;
         text-align: center;
@@ -168,6 +179,14 @@ class ConversationInput(TextArea):
             self.value = value
             super().__init__()
 
+    class FileSuggestionSelected(Message):
+        """A live ``@`` candidate was accepted; keep editing the draft."""
+
+        def __init__(self, input: "ConversationInput", path: Path) -> None:
+            self.input = input
+            self.path = path
+            super().__init__()
+
     DEFAULT_CSS = f"""
     ConversationInput {{
         height: 1;
@@ -195,12 +214,21 @@ class ConversationInput(TextArea):
             pass
 
     async def _on_key(self, event: events.Key) -> None:
+        app = getattr(self, "app", None)
+        if event.key in ("up", "down") and app is not None and app.has_file_suggestions(self):
+            event.stop()
+            event.prevent_default()
+            app.move_file_suggestion(-1 if event.key == "up" else 1)
+            return
         # Enter（无修饰键）→ 发送。覆盖 TextArea 默认的 ``enter → 插入 \n``。
         #TextArea 默认在 ``_on_key`` 里把 ``enter`` 映射为 ``\n`` 插入，不走 BINDINGS，
         # 所以光在 BINDINGS 里加 binding 无效，必须在此拦截。
         if event.key == "enter":
             event.stop()
             event.prevent_default()
+            if app is not None and app.has_file_suggestions(self):
+                app.accept_file_suggestion(self)
+                return
             self.post_message(self.Submitted(self, self.text))
             return
         # Ctrl+Enter / Alt+Enter → 手动换行。终端能区分这两个组合键时才触发——
@@ -412,6 +440,13 @@ class PoirotTUI(App):
         self.model = model
         self._first_input = True
         self.draft = DraftState()
+        self._file_suggestions: list[Path] = []
+        self._file_suggestion_input: ConversationInput | None = None
+        self._file_suggestion_index = 0
+        self._accepted_file_text: dict[str, str] = {}
+        self._file_suggestion_generation = 0
+        self._file_suggestion_access: ThreadFileAccess | None = None
+        self._file_suggestion_access_key: tuple[str, str | None] | None = None
         self.cli_state: dict[str, Any] = {
             "pending_expert_mode": None,
             "pending_report": None,
@@ -485,6 +520,7 @@ class PoirotTUI(App):
             Static(subtitle, id="subtitle"),
             InputRow(
                 ConversationInput(placeholder="Ask anything...  (输入 / 查看命令)", id="welcome-input"),
+                Static("", id="welcome-file-suggestions"),
                 DraftSummary(self.draft, id="welcome-summary"),
             ),
             Static("", id="tip"),
@@ -499,6 +535,7 @@ class PoirotTUI(App):
                         placeholder="Ask anything...  (输入 / 查看命令 · Enter 发送 · Ctrl+Enter 换行)",
                         id="conv-input",
                     ),
+                    Static("", id="conv-file-suggestions"),
                     DraftSummary(self.draft, id="conv-summary"),
                     Static("", id="input-info"),
                 ),
@@ -645,9 +682,186 @@ class PoirotTUI(App):
         if not isinstance(event.text_area, ConversationInput):
             return
         if event.text_area.text == self.draft.text:
+            self._refresh_file_suggestions(event.text_area)
             return
         self.draft.text = event.text_area.text
         self._render_draft()
+        self._refresh_file_suggestions(event.text_area)
+
+    def _refresh_file_suggestions(self, input_widget: ConversationInput) -> None:
+        """Refresh candidates without blocking Textual's input event loop."""
+        accepted = self._accepted_file_text.get(input_widget.id or "")
+        if accepted == input_widget.text:
+            self._file_suggestions = []
+            self._file_suggestion_input = None
+            self._render_file_suggestions()
+            return
+        if accepted is not None:
+            self._accepted_file_text.pop(input_widget.id or "", None)
+        fragment_info = reference_fragment_at_cursor(
+            input_widget.text, self._cursor_offset(input_widget)
+        )
+        self._file_suggestion_generation += 1
+        generation = self._file_suggestion_generation
+        if fragment_info is None:
+            self._file_suggestions = []
+            self._file_suggestion_input = None
+            self._render_file_suggestions()
+            return
+        try:
+            item = self.runtime.thread_store.require(self.runtime.thread_id)
+            key = (self.runtime.thread_id, item.cwd)
+            if self._file_suggestion_access is None or self._file_suggestion_access_key != key:
+                self._file_suggestion_access = ThreadFileAccess(item.cwd)
+                self._file_suggestion_access_key = key
+            access = self._file_suggestion_access
+        except Exception:
+            self._file_suggestions = []
+            self._file_suggestion_input = None
+            self._render_file_suggestions()
+            return
+        self._load_file_suggestions(
+            input_widget,
+            input_widget.text,
+            self._cursor_offset(input_widget),
+            fragment_info[0],
+            generation,
+            access,
+        )
+
+    @work(thread=True, exclusive=True, group="file-suggestions")
+    def _load_file_suggestions(
+        self,
+        input_widget: ConversationInput,
+        expected_text: str,
+        expected_cursor: int,
+        fragment: str,
+        generation: int,
+        access: ThreadFileAccess,
+    ) -> None:
+        try:
+            paths = access.suggest_paths(fragment)
+        except Exception:
+            paths = []
+        self.call_from_thread(
+            self._apply_file_suggestions,
+            input_widget,
+            expected_text,
+            expected_cursor,
+            generation,
+            paths,
+        )
+
+    def _apply_file_suggestions(
+        self,
+        input_widget: ConversationInput,
+        expected_text: str,
+        expected_cursor: int,
+        generation: int,
+        paths: list[Path],
+    ) -> None:
+        """Apply only the result belonging to the latest input snapshot."""
+        if generation != self._file_suggestion_generation:
+            return
+        if input_widget.text != expected_text or self._cursor_offset(input_widget) != expected_cursor:
+            return
+        self._file_suggestions = paths
+        self._file_suggestion_input = input_widget if paths else None
+        self._file_suggestion_index = min(self._file_suggestion_index, max(0, len(paths) - 1))
+        self._render_file_suggestions()
+
+    def _render_file_suggestions(self) -> None:
+        active_id = self._file_suggestion_input.id if self._file_suggestion_input else None
+        for widget_id in ("#welcome-file-suggestions", "#conv-file-suggestions"):
+            try:
+                widget = self.query_one(widget_id, Static)
+                if not self._file_suggestions or widget_id[1:] != (
+                    "welcome-file-suggestions" if active_id == "welcome-input" else "conv-file-suggestions"
+                ):
+                    widget.update("")
+                    widget.styles.display = "none"
+                    continue
+                item = self.runtime.thread_store.require(self.runtime.thread_id)
+                root = Path(item.cwd).resolve()
+                rows = ["Files  ↑/↓ move  Enter select"]
+                for index, path in enumerate(self._file_suggestions[:10]):
+                    try:
+                        label = path.resolve().relative_to(root).as_posix()
+                    except ValueError:
+                        continue
+                    rows.append(f"{'>' if index == self._file_suggestion_index else ' '} @{label}")
+                widget.update("\n".join(rows))
+                widget.styles.display = "block"
+            except Exception:
+                pass
+
+    def _clear_file_suggestions(self) -> None:
+        self._file_suggestion_generation += 1
+        self._file_suggestions = []
+        self._file_suggestion_input = None
+        self._file_suggestion_index = 0
+        self._file_suggestion_access = None
+        self._file_suggestion_access_key = None
+        self._render_file_suggestions()
+
+    def has_file_suggestions(self, input_widget: ConversationInput) -> bool:
+        return self._file_suggestion_input is input_widget and bool(self._file_suggestions)
+
+    def move_file_suggestion(self, delta: int) -> None:
+        if self._file_suggestions:
+            self._file_suggestion_index = max(
+                0, min(len(self._file_suggestions) - 1, self._file_suggestion_index + delta)
+            )
+            self._render_file_suggestions()
+
+    def accept_file_suggestion(self, input_widget: ConversationInput) -> None:
+        if not self.has_file_suggestions(input_widget):
+            return
+        path = self._file_suggestions[self._file_suggestion_index]
+        try:
+            item = self.runtime.thread_store.require(self.runtime.thread_id)
+            root = Path(item.cwd).resolve()
+            label = path.resolve().relative_to(root).as_posix()
+        except Exception:
+            return
+        cursor = self._cursor_offset(input_widget)
+        fragment_info = reference_fragment_at_cursor(input_widget.text, cursor)
+        if fragment_info is None:
+            return
+        _, start = fragment_info
+        # End the confirmed reference with a delimiter so immediate typing is
+        # parsed as question text even when the user does not press Space.
+        selected_text = "@" + label + " "
+        new_text = input_widget.text[:start] + selected_text + input_widget.text[cursor:]
+        input_widget.text = new_text
+        try:
+            cursor_after_selection = start + len(selected_text)
+            line, column = new_text[:cursor_after_selection].count("\n"), len(
+                new_text[:cursor_after_selection].rsplit("\n", 1)[-1]
+            )
+            input_widget.move_cursor((line, column))
+        except Exception:
+            pass
+        self._accepted_file_text[input_widget.id or ""] = new_text
+        self._file_suggestions = []
+        self._file_suggestion_input = None
+        self._render_file_suggestions()
+
+    @staticmethod
+    def _cursor_offset(input_widget: ConversationInput) -> int:
+        location = getattr(input_widget, "cursor_location", None)
+        if isinstance(location, int):
+            return location
+        if isinstance(location, tuple) and len(location) == 2:
+            line, column = location
+            lines = input_widget.text.split("\n")
+            return sum(len(part) + 1 for part in lines[:line]) + column
+        return len(input_widget.text)
+
+    def on_conversation_input_file_suggestion_selected(
+        self, event: ConversationInput.FileSuggestionSelected
+    ) -> None:
+        self.accept_file_suggestion(event.input)
 
     def clear_draft(self) -> None:
         self.draft.text = ""
@@ -732,6 +946,7 @@ class PoirotTUI(App):
         if self.cli_state.pop("pending_thread_new", False):
             try:
                 self.runtime = self.runtime.new_thread()
+                self._clear_file_suggestions()
                 self.cli_state["thread_title"] = self.runtime.thread_store.require(self.runtime.thread_id).title
                 conv.clear()
                 conv.state["tool_results"] = []
@@ -744,6 +959,7 @@ class PoirotTUI(App):
         if selected:
             try:
                 self.runtime = self.runtime.switch_thread(selected)
+                self._clear_file_suggestions()
                 self.cli_state["thread_title"] = self.runtime.thread_store.require(self.runtime.thread_id).title
                 conv.clear()
                 conv.state["tool_results"] = []
@@ -818,6 +1034,7 @@ class PoirotTUI(App):
             self.query_one(ConversationLog).write(Text(f"Project switch failed: {exc}"))
             return
         self.runtime = changed
+        self._clear_file_suggestions()
         self._show_switched_thread(f"Switched to project {name}")
 
     def _project_thread_selected(self, thread_id: str | None) -> None:
@@ -830,6 +1047,7 @@ class PoirotTUI(App):
             self.query_one(ConversationLog).write(Text(f"Project thread restore failed: {exc}"))
             return
         self.runtime = changed
+        self._clear_file_suggestions()
         self._show_switched_thread("Restored")
 
     def _handle_report_intent(self, intent: Any, rt: Any) -> bool:
@@ -864,6 +1082,13 @@ class PoirotTUI(App):
 
         ctx = None
         try:
+            async def choose_file(reference, candidates):
+                return await self.push_screen_wait(
+                    FilePicker([Path(path) for path in candidates], title=f"Select @{reference}")
+                )
+
+            from pathlib import Path
+            prepared = await self.runtime.aprepare_question(question, choose=choose_file)
             ctx = self.runtime.run_manager.create_run(
                 thread_id=self.runtime.thread_id,
                 user_id="default-user",
@@ -878,7 +1103,7 @@ class PoirotTUI(App):
             config = self._build_stream_config(ctx)
             client = PoirotStreamClient(graph=self.runtime.leader_agent.graph, config=config)
 
-            async for event in client.stream(question):
+            async for event in client.stream(prepared.enriched, title_question=prepared.original):
                 budget = event.get("budget")
                 if budget:
                     self.cli_state["current_tokens"] = budget.get("total", 0)

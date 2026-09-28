@@ -38,6 +38,8 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
+from dataclasses import replace
 
 from poirot.backend.agents.sandbox.contracts import SandboxProvider
 from poirot.backend.agents.sandbox.guards.audit_guard import AuditGuard
@@ -74,8 +76,10 @@ class LocalSandboxProvider(SandboxProvider):
         path_mappings: list[PathMapping] | None = None,
         lru_size: int = _DEFAULT_LRU_SIZE,
         sandbox_config=None,
+        thread_cwd_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._path_mappings = path_mappings or []
+        self._thread_cwd_resolver = thread_cwd_resolver
         self._lru_size = lru_size
         self._sandboxes: OrderedDict[str, Sandbox] = OrderedDict()
         self._lock = threading.Lock()
@@ -105,9 +109,15 @@ class LocalSandboxProvider(SandboxProvider):
                 self._sandboxes.move_to_end(sandbox_id)
                 return sandbox_id
 
-            runtime = LocalRuntime(allow_host_bash=self._allow_host_bash)
-            translator = LocalPathTranslator(self._path_mappings)
-            guard = AuditGuard(LocalSecurityGuard(self._path_mappings))
+            path_mappings = self._path_mappings_for_thread(thread_id)
+            cwd = self._thread_cwd(thread_id)
+            runtime = LocalRuntime(
+                allow_host_bash=self._allow_host_bash,
+                working_dir=cwd,
+                allowed_roots=[mapping.local_path for mapping in path_mappings],
+            )
+            translator = LocalPathTranslator(path_mappings)
+            guard = AuditGuard(LocalSecurityGuard(path_mappings))
             sandbox = Sandbox(sandbox_id, runtime, translator, guard)
             self._sandboxes[sandbox_id] = sandbox
 
@@ -119,6 +129,43 @@ class LocalSandboxProvider(SandboxProvider):
         if evicted is not None:
             evicted.close()
         return sandbox_id
+
+    def _thread_cwd(self, thread_id: str) -> str | None:
+        if self._thread_cwd_resolver is None:
+            return None
+        try:
+            return self._thread_cwd_resolver(thread_id)
+        except Exception:
+            return None
+
+    def _path_mappings_for_thread(self, thread_id: str) -> list[PathMapping]:
+        """Bind the workspace mapping to the persisted thread cwd.
+
+        A missing cwd intentionally removes the workspace mapping, so legacy
+        unbound threads cannot silently inherit the process working directory.
+        """
+        cwd = self._thread_cwd(thread_id)
+        if self._thread_cwd_resolver is None:
+            return list(self._path_mappings)
+        if not cwd:
+            return []
+        result: list[PathMapping] = []
+        for mapping in self._path_mappings:
+            container_path = mapping.container_path.rstrip("/")
+            if container_path == "/mnt/poirot/user-data/workspace":
+                if cwd:
+                    result.append(replace(mapping, local_path=cwd))
+                continue
+            if container_path in {
+                "/mnt/poirot/user-data/uploads",
+                "/mnt/poirot/user-data/outputs",
+            }:
+                # These are process-level sandbox storage paths.  A
+                # thread-scoped provider must not expose them as a way around
+                # the persisted thread cwd.
+                continue
+            result.append(mapping)
+        return result
 
     def get(self, sandbox_id: str) -> Sandbox | None:
         """纯内存查找；未命中返回 None。"""

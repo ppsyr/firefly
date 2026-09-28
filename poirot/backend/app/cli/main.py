@@ -49,8 +49,11 @@ _PROJECT_ROOT = Path(__file__).parents[4]
 load_dotenv(_PROJECT_ROOT / ".env")
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import ThreadedCompleter
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import CompleteStyle
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from poirot.backend.app.bootstrap import bootstrap_runtime, AppRuntime
@@ -63,6 +66,7 @@ from poirot.backend.app.services.stream_service import PoirotStreamClient
 from poirot.backend.agents.intent import default_intent_tree
 from poirot.backend.agents.leader.agent import _resolve_actual_model_name
 from poirot.backend.agents.prompts import get_prompt_manager
+from poirot.backend.agents.runtime.file_access import ThreadFileAccess
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -126,11 +130,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             project_name=args.project_name,
         )
         try:
-            result = runtime.run_question(
-                question=args.question,
-                thread_id=args.thread_id,
-                run_id=args.run_id,
-            )
+            try:
+                result = runtime.run_question(
+                    question=args.question,
+                    thread_id=args.thread_id,
+                    run_id=args.run_id,
+                )
+            except Exception as exc:
+                from poirot.backend.agents.runtime.file_access import FileAccessError
+                if isinstance(exc, FileAccessError):
+                    print(f"File reference failed: {exc}", file=sys.stderr)
+                    return 1
+                raise
         finally:
             runtime.close()
         print(result.final_report)
@@ -287,10 +298,50 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
             return []
         return [s["name"] for s in mgr.list_skills()]
 
+    file_access_cache: tuple[tuple[str, str | None], ThreadFileAccess] | None = None
+
+    def _file_candidates(fragment: str):
+        """Provide live, thread-scoped ``@`` completion candidates."""
+        nonlocal file_access_cache
+        try:
+            item = runtime.thread_store.require(runtime.thread_id) if runtime.thread_store else None
+            key = (runtime.thread_id, item.cwd if item else None)
+            if file_access_cache is None or file_access_cache[0] != key:
+                file_access_cache = (key, ThreadFileAccess(item.cwd if item else None))
+            access = file_access_cache[1]
+            return [
+                (path, path.relative_to(access.cwd).as_posix())
+                for path in access.suggest_paths(fragment)
+            ]
+        except Exception:
+            return []
+
+    completion_keys = KeyBindings()
+
+    @completion_keys.add("enter", filter=Condition(
+        lambda: bool(getattr(session, "app", None)
+                     and session.app.current_buffer.complete_state is not None)
+    ), eager=True)
+    def _accept_completion(event):
+        # Enter accepts the highlighted @/slash candidate and leaves the
+        # prompt open.  A second Enter, after the completion menu closes,
+        # submits the question.
+        buffer = event.current_buffer
+        state = buffer.complete_state
+        if state is not None:
+            completion = state.current_completion
+            if completion is None and state.completions:
+                completion = state.completions[0]
+            if completion is not None:
+                buffer.apply_completion(completion)
+
     session: PromptSession = PromptSession(
-        completer=SlashCommandCompleter(get_registry(), skill_provider=_skill_names_provider),
+        completer=ThreadedCompleter(SlashCommandCompleter(
+            get_registry(), skill_provider=_skill_names_provider, file_provider=_file_candidates
+        )),
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,
+        key_bindings=completion_keys,
         bottom_toolbar=lambda: build_bottom_toolbar(cli_state),
         style=Style([
             ("completion-menu.completion.current", "bg:#6A5ACD fg:#ffffff"),
@@ -503,6 +554,12 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
         # 流式研究
         ctx = None
         try:
+            async def choose_file(reference, candidates):
+                from poirot.backend.app.cli.thread_selector import select_file
+                item = runtime.thread_store.require(runtime.thread_id) if runtime.thread_store else None
+                return await select_file(candidates, item.cwd if item else ".", console)
+
+            prepared = await runtime.aprepare_question(prompt, choose=choose_file)
             current_thread = runtime.thread_store.require(runtime.thread_id) if runtime.thread_store else None
             ctx = runtime.run_manager.create_run(
                 thread_id=runtime.thread_id,
@@ -527,7 +584,7 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
             renderer.state["model"] = provider or _p     # ← 看这里
             renderer.state["model_provider"] = model or _m
 
-            async for event in client.stream(prompt):
+            async for event in client.stream(prepared.enriched, title_question=prepared.original):
                 renderer.render(event)
 
             runtime.run_manager.mark_success(ctx.run_id)

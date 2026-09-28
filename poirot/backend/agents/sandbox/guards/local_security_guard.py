@@ -126,6 +126,16 @@ class LocalSecurityGuard:
                     operation="validate_command",
                 )
 
+        # Relative traversal is unsafe even when the shell starts in the
+        # thread directory (``cat ../other-project/file`` would otherwise
+        # escape before any absolute-path check runs).
+        if re.search(r"(?:^|[\s'\";/|&<>()])\.\.(?:$|[\s'\";/|&<>()])", command):
+            raise SandboxPermissionError(
+                "command contains a path traversal segment",
+                path=command[:100],
+                operation="validate_command",
+            )
+
         # shlex 解析 → 绝对路径白名单检查
         try:
             tokens = shlex.split(command)
