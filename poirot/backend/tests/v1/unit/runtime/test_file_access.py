@@ -99,6 +99,41 @@ def test_directory_reference_lists_without_injecting_body(tmp_path: Path):
     assert "secret body" not in prepared.enriched
 
 
+def test_extra_roots_use_cwd_priority_then_append_order(tmp_path: Path):
+    cwd = tmp_path / "project"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    cwd.mkdir()
+    first.mkdir()
+    second.mkdir()
+    (first / "shared.py").write_text("first", encoding="utf-8")
+    (second / "shared.py").write_text("second", encoding="utf-8")
+    access = ThreadFileAccess(cwd, [first, second])
+    assert [path.parent for path in access.search_filename("shared.py")] == [first, second]
+    prepared = prepare_question("@shared.py", access, choose=lambda _name, matches: matches[0])
+    assert "first" in prepared.enriched
+    (cwd / "shared.py").write_text("cwd", encoding="utf-8")
+    access.invalidate_suggestion_index()
+    assert access.search_filename("shared.py") == [cwd / "shared.py"]
+    assert "cwd" in prepare_question("@shared.py", access).enriched
+
+
+def test_extra_root_explicit_relative_path_and_symlink_escape(tmp_path: Path):
+    cwd = tmp_path / "project"
+    extra = tmp_path / "extra"
+    outside = tmp_path / "outside.py"
+    cwd.mkdir()
+    extra.mkdir()
+    outside.write_text("secret", encoding="utf-8")
+    (extra / "src").mkdir()
+    (extra / "src" / "foo.py").write_text("extra", encoding="utf-8")
+    (extra / "escape.py").symlink_to(outside)
+    access = ThreadFileAccess(cwd, [extra])
+    assert "extra" in prepare_question("@src/foo.py", access).enriched
+    with pytest.raises(FileOutsideThreadError):
+        access.resolve("escape.py")
+
+
 def test_local_sandbox_uses_thread_cwd_and_rejects_unbound(tmp_path: Path):
     bound = tmp_path / "bound"
     outside = tmp_path / "outside"

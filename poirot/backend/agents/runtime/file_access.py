@@ -107,7 +107,9 @@ class ThreadFileAccess:
         roots = [self.cwd]
         for root in extra_roots:
             resolved = Path(root).expanduser().resolve()
-            if resolved.is_dir() and resolved not in roots:
+            # Keep unavailable roots in the allow-list so a deleted directory
+            # cannot cause a later lookup to fall through to an unrelated root.
+            if resolved not in roots:
                 roots.append(resolved)
         self.roots = tuple(roots)
         # Suggestions are requested once per keystroke. Keep the expensive
@@ -122,16 +124,40 @@ class ThreadFileAccess:
         raw = str(value).strip()
         if not raw:
             raise FileReferenceNotFound("Empty file path")
-        candidate = Path(raw).expanduser()
-        # Relative references are always relative to the persisted thread cwd.
-        if not candidate.is_absolute():
-            candidate = self.cwd / candidate
-        resolved = candidate.resolve(strict=False)
-        if not self._under_root(resolved):
-            raise FileOutsideThreadError(f"Path is outside the current thread directory: {raw}")
-        if not allow_missing and not resolved.exists():
+        matches = self.resolve_candidates(value, allow_missing=allow_missing)
+        if not matches:
             raise FileReferenceNotFound(f"File or directory not found: {raw}")
-        return resolved
+        return matches[0]
+
+    def resolve_candidates(self, value: str | Path, *, allow_missing: bool = False) -> list[Path]:
+        """Resolve an explicit path in root priority order."""
+        raw = str(value).strip()
+        if not raw:
+            raise FileReferenceNotFound("Empty file path")
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute():
+            resolved = candidate.resolve(strict=False)
+            if not self._under_root(resolved):
+                raise FileOutsideThreadError(f"Path is outside the current thread directory: {raw}")
+            if allow_missing or resolved.exists():
+                return [resolved]
+            return []
+        if ".." in candidate.parts:
+            raise FileOutsideThreadError(f"Path traversal is not allowed: {raw}")
+        matches: list[Path] = []
+        escaped = False
+        for root in self.roots:
+            resolved = (root / candidate).resolve(strict=False)
+            if not _is_relative_to(resolved, root):
+                escaped = True
+                continue
+            if allow_missing or resolved.exists():
+                matches.append(resolved)
+        if not matches and escaped:
+            raise FileOutsideThreadError(f"Path is outside the current thread directory: {raw}")
+        # cwd has priority; appended roots are kept in their configured order.
+        cwd_matches = [path for path in matches if _is_relative_to(path, self.cwd)]
+        return cwd_matches or matches
 
     def read_text(self, value: str | Path) -> tuple[Path, str]:
         path = self.resolve(value)
@@ -212,10 +238,18 @@ class ThreadFileAccess:
         if target.name != name or not name or name in {".", ".."}:
             return []
         self._ensure_suggestion_index()
-        return [
-            path for path in self._suggestion_index
-            if path.name == name
-        ]
+        matches = [path for path in self._suggestion_index if path.name == name]
+        if not matches:
+            return []
+        # A cwd hit has priority over every appended root. Within a priority
+        # level retain all matches so the existing selector can disambiguate.
+        cwd_matches = [path for path in matches if _is_relative_to(path, self.cwd)]
+        if cwd_matches:
+            return sorted(cwd_matches, key=lambda p: _relative_display(p, self.cwd))
+        ordered: list[Path] = []
+        for root in self.roots[1:]:
+            ordered.extend(sorted((p for p in matches if _is_relative_to(p, root)), key=lambda p: p.as_posix()))
+        return ordered
 
     def suggest_paths(self, fragment: str, *, limit: int = 100) -> list[Path]:
         """Return allowed files/directories matching an in-progress ``@`` token."""
@@ -225,35 +259,39 @@ class ThreadFileAccess:
         found: set[Path] = set()
         if "/" in fragment:
             parent_text, _, leaf = fragment.rpartition("/")
-            if any(part in IGNORED_SEARCH_DIR_NAMES for part in Path(parent_text).parts):
+            if ".." in Path(parent_text).parts or any(part in IGNORED_SEARCH_DIR_NAMES for part in Path(parent_text).parts):
                 return []
-            try:
-                parent = self.resolve(parent_text or ".")
-            except FileAccessError:
-                return []
-            if not parent.is_dir():
-                return []
-            try:
-                entries = sorted(os.scandir(parent), key=lambda entry: entry.name)
-            except OSError:
-                return []
-            for entry in entries:
-                if entry.name in IGNORED_SEARCH_DIR_NAMES:
+            root_hits: list[set[Path]] = []
+            for root in self.roots:
+                parent = (root / (parent_text or ".")).resolve(strict=False)
+                if not _is_relative_to(parent, root) or not parent.is_dir():
+                    root_hits.append(set())
                     continue
-                if not entry.name.startswith(leaf):
+                hits: set[Path] = set()
+                try:
+                    entries = sorted(os.scandir(parent), key=lambda entry: entry.name)
+                except OSError:
+                    root_hits.append(set())
                     continue
-                resolved = Path(entry.path).resolve(strict=False)
-                if not self._under_root(resolved):
-                    continue
-                if resolved.is_file() or resolved.is_dir():
-                    found.add(resolved)
+                for entry in entries:
+                    if entry.name in IGNORED_SEARCH_DIR_NAMES or not entry.name.startswith(leaf):
+                        continue
+                    resolved = Path(entry.path).resolve(strict=False)
+                    if _is_relative_to(resolved, root) and (resolved.is_file() or resolved.is_dir()):
+                        hits.add(resolved)
+                root_hits.append(hits)
+            found = root_hits[0] if root_hits and root_hits[0] else set().union(*root_hits[1:]) if len(root_hits) > 1 else set()
         else:
             self._ensure_suggestion_index()
-            found = {
-                path for path in self._suggestion_index
-                if path.name.startswith(fragment)
-            }
-        return sorted(found, key=lambda p: _relative_display(p, self.cwd))[:limit]
+            matches = [path for path in self._suggestion_index if path.name.startswith(fragment)]
+            cwd_matches = [path for path in matches if _is_relative_to(path, self.cwd)]
+            if cwd_matches:
+                found = set(cwd_matches)
+            else:
+                found = set()
+                for root in self.roots[1:]:
+                    found.update(path for path in matches if _is_relative_to(path, root))
+        return sorted(found, key=lambda p: (_root_order(p, self.roots), p.as_posix()))[:limit]
 
     def _build_suggestion_index(self) -> tuple[Path, ...]:
         """Walk allowed roots once and retain only safe files/directories."""
@@ -343,7 +381,18 @@ def prepare_question(
     for reference in extract_references(question):
         path_value = Path(reference)
         if path_value.is_absolute() or "/" in reference:
-            path = access.resolve(reference)
+            matches = access.resolve_candidates(reference)
+            if not matches:
+                raise FileReferenceNotFound(f"No allowed file matches @{reference}")
+            if len(matches) > 1:
+                if choose is None:
+                    raise FileReferenceAmbiguous(reference, (_relative_display(p, access.cwd) for p in matches))
+                selected = choose(reference, matches)
+                if selected is None:
+                    raise FileAccessError(f"Reference cancelled: @{reference}")
+                path = access.resolve(selected)
+            else:
+                path = matches[0]
         else:
             matches = access.search_filename(reference)
             if not matches:
@@ -393,6 +442,12 @@ async def prepare_question_async(
     if choose is not None:
         for reference in extract_references(question):
             if Path(reference).is_absolute() or "/" in reference:
+                matches = access.resolve_candidates(reference)
+                if len(matches) > 1:
+                    path = await choose(reference, matches)
+                    if path is None:
+                        raise FileAccessError(f"Reference cancelled: @{reference}")
+                    selected[reference] = path
                 continue
             matches = access.search_filename(reference)
             if len(matches) > 1:
@@ -410,3 +465,10 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _root_order(path: Path, roots: tuple[Path, ...]) -> int:
+    for index, root in enumerate(roots):
+        if _is_relative_to(path, root):
+            return index
+    return len(roots)

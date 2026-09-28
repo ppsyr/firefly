@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 from datetime import datetime
+import shlex
 
 from rich.console import Console
 
@@ -243,6 +244,49 @@ def _cmd_project_thread(ctx: CommandContext) -> None:
         ctx.console.print("[dim]Current thread is not bound to a project[/dim]")
         return
     ctx.state["pending_project_thread_list"] = True
+
+
+def _cmd_add_dir(ctx: CommandContext) -> None:
+    """Manage extra read-only directories used by ``@`` file references."""
+    try:
+        parts = shlex.split(ctx.arg, posix=True)
+    except ValueError as exc:
+        ctx.console.print(f"[red]Invalid directory argument: {exc}[/red]")
+        return
+    if not parts:
+        try:
+            current = ctx.runtime.thread_store.require(ctx.runtime.thread_id)
+            if not current.extra_dirs:
+                ctx.console.print("No additional reference directories.")
+            else:
+                ctx.console.print("Additional reference directories:")
+                for directory in current.extra_dirs:
+                    ctx.console.print(f"  {directory}", markup=False)
+        except Exception as exc:
+            ctx.console.print(f"[red]{exc}[/red]")
+        return
+    if parts[0] == "--remove":
+        if len(parts) != 2:
+            ctx.console.print("[yellow]Usage: /add-dir [--remove] <directory>[/yellow]")
+            return
+        try:
+            item = ctx.runtime.remove_reference_dir(parts[1])
+            ctx.console.print(f"[green]Removed reference directory: {parts[1]}[/green]")
+            if not item.extra_dirs:
+                ctx.console.print("No additional reference directories remain.")
+        except Exception as exc:
+            ctx.console.print(f"[red]{exc}[/red]")
+        return
+    if len(parts) != 1:
+        ctx.console.print("[yellow]Usage: /add-dir [--remove] <directory>[/yellow]")
+        return
+    try:
+        item = ctx.runtime.add_reference_dir(parts[0])
+        ctx.console.print(f"[green]Added reference directory: {item.extra_dirs[-1]}[/green]", markup=False)
+    except FileExistsError as exc:
+        ctx.console.print(f"[yellow]{exc}[/yellow]", markup=False)
+    except Exception as exc:
+        ctx.console.print(f"[red]{exc}[/red]", markup=False)
 
 
 def _cmd_prompt(ctx: CommandContext) -> None:
@@ -637,6 +681,7 @@ _registry.register(CommandSpec("/model", "Show or switch model (<provider> [mode
 _registry.register(CommandSpec("/thread", "Manage threads (info|list|new|switch|rename|delete)", _cmd_thread))
 _registry.register(CommandSpec("/project", "Use /project list to select a project", _cmd_project))
 _registry.register(CommandSpec("/project_thread", "Use /project_thread list to restore a project thread", _cmd_project_thread))
+_registry.register(CommandSpec("/add-dir", "Add or remove directories available to @ file references", _cmd_add_dir))
 _registry.register(CommandSpec("/prompt", "Prompt management (list|show <cat/name>|reload)", _cmd_prompt))
 _registry.register(CommandSpec("/skill", "Skill control (list|search|<name>|off|enable|disable|install|evolve|capture|history)", _cmd_skill))
 _registry.register(CommandSpec("/mcp", "MCP control (list|reload)", _cmd_mcp))

@@ -467,7 +467,7 @@ class PoirotTUI(App):
         self._accepted_file_text: dict[str, str] = {}
         self._file_suggestion_generation = 0
         self._file_suggestion_access: ThreadFileAccess | None = None
-        self._file_suggestion_access_key: tuple[str, str | None] | None = None
+        self._file_suggestion_access_key: tuple[str, str | None, tuple[str, ...]] | None = None
         self._thread_suggestions = []
         self._thread_suggestion_input: ConversationInput | None = None
         self._thread_suggestion_index = 0
@@ -837,9 +837,9 @@ class PoirotTUI(App):
             return
         try:
             item = self.runtime.thread_store.require(self.runtime.thread_id)
-            key = (self.runtime.thread_id, item.cwd)
+            key = (self.runtime.thread_id, item.cwd, item.extra_dirs)
             if self._file_suggestion_access is None or self._file_suggestion_access_key != key:
-                self._file_suggestion_access = ThreadFileAccess(item.cwd)
+                self._file_suggestion_access = ThreadFileAccess(item.cwd, item.extra_dirs)
                 self._file_suggestion_access_key = key
             access = self._file_suggestion_access
         except Exception:
@@ -915,7 +915,7 @@ class PoirotTUI(App):
                     try:
                         label = path.resolve().relative_to(root).as_posix()
                     except ValueError:
-                        continue
+                        label = path.resolve().as_posix()
                     rows.append(f"{'>' if index == self._file_suggestion_index else ' '} @{label}")
                 widget.update("\n".join(rows))
                 widget.styles.display = "block"
@@ -952,7 +952,10 @@ class PoirotTUI(App):
         try:
             item = self.runtime.thread_store.require(self.runtime.thread_id)
             root = Path(item.cwd).resolve()
-            label = path.resolve().relative_to(root).as_posix()
+            try:
+                label = path.resolve().relative_to(root).as_posix()
+            except ValueError:
+                label = path.resolve().as_posix()
         except Exception:
             return
         cursor = self._cursor_offset(input_widget)

@@ -120,3 +120,11 @@ def test_thread_title_completion_is_live_for_bare_unicode_title():
     )
     result = list(c.get_completions(Document("请参考 @方案"), None))
     assert result and result[0].text == "@abc123 "
+
+
+def test_add_dir_remove_completion_quotes_spaces():
+    c = SlashCommandCompleter(
+        get_registry(), directory_provider=lambda: ["/tmp/shared lib", "/tmp/other"]
+    )
+    result = list(c.get_completions(Document("/add-dir --remove "), None))
+    assert result and result[0].text == "'/tmp/shared lib' "

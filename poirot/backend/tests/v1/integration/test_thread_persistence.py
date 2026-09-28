@@ -332,3 +332,26 @@ def test_migrate_legacy_checkpoints_and_pending_writes(tmp_path):
         assert conn.execute("SELECT count(*) FROM checkpoints WHERE thread_id='legacy'").fetchone()[0] == 0
         assert conn.execute("SELECT count(*) FROM writes WHERE thread_id='legacy'").fetchone()[0] == 0
         assert conn.execute("SELECT count(*) FROM checkpoints WHERE thread_id='other'").fetchone()[0] > 0
+
+
+def test_extra_reference_dirs_are_thread_scoped_and_persisted(tmp_path):
+    root = tmp_path / "storage"
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    store = ThreadStore(root)
+    first = store.create("first")
+    second = store.create("second")
+    store.add_extra_dir(first.thread_id, first_dir)
+    link = tmp_path / "first-link"
+    link.symlink_to(first_dir, target_is_directory=True)
+    with pytest.raises(FileExistsError):
+        store.add_extra_dir(first.thread_id, link)
+    assert store.require(first.thread_id).extra_dirs == (str(first_dir.resolve()),)
+    assert store.require(second.thread_id).extra_dirs == ()
+
+    restored = ThreadStore(root)
+    assert restored.require(first.thread_id).extra_dirs == (str(first_dir.resolve()),)
+    restored.remove_extra_dir(first.thread_id, link)
+    assert restored.require(first.thread_id).extra_dirs == ()

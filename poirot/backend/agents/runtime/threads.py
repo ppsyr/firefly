@@ -55,6 +55,7 @@ class ThreadMetadata:
     title_set: bool = False
     project: str | None = None
     cwd: str | None = None
+    extra_dirs: tuple[str, ...] = ()
 
 
 class ThreadStore:
@@ -115,6 +116,12 @@ class ThreadStore:
         else:
             data["project"] = None
             data["cwd"] = None
+        extra_dirs = data.get("extra_dirs", ())
+        if not isinstance(extra_dirs, (list, tuple)) or any(
+            not isinstance(value, str) or not Path(value).is_absolute() for value in extra_dirs
+        ):
+            raise ValueError("Invalid metadata field: extra_dirs")
+        data["extra_dirs"] = tuple(str(Path(value).expanduser().resolve(strict=False)) for value in extra_dirs)
         return ThreadMetadata(**{key: data[key] for key in ThreadMetadata.__dataclass_fields__ if key in data})
 
     def get(self, thread_id: str) -> ThreadMetadata | None:
@@ -210,6 +217,43 @@ class ThreadStore:
             elif first_message is not None and first_message.strip() and not item.title_set:
                 item = replace(item, title=f"{_prefix(item.created_at)} {_clean_title(first_message)[:60]}", title_set=True)
             item = replace(item, updated_at=_now())
+            if thread_id in self._pending:
+                self._pending[thread_id] = item
+            else:
+                self._write(item)
+            return item
+
+    def add_extra_dir(self, thread_id: str, directory: str | Path) -> ThreadMetadata:
+        """Add a canonical read-only reference directory to one thread."""
+        with self._lock:
+            item = self.require(thread_id)
+            canonical = Path(directory).expanduser().resolve(strict=True)
+            if not canonical.is_dir():
+                raise ValueError(f"Reference directory is not a directory: {directory}")
+            if not os.access(canonical, os.R_OK | os.X_OK):
+                raise ValueError(f"Reference directory is not accessible: {directory}")
+            value = str(canonical)
+            if value in item.extra_dirs or (item.cwd and value == str(Path(item.cwd).resolve())):
+                raise FileExistsError(f"Reference directory already added: {value}")
+            item = replace(item, extra_dirs=(*item.extra_dirs, value), updated_at=_now())
+            if thread_id in self._pending:
+                self._pending[thread_id] = item
+            else:
+                self._write(item)
+            return item
+
+    def remove_extra_dir(self, thread_id: str, directory: str | Path) -> ThreadMetadata:
+        """Remove a reference directory by its canonical real path."""
+        with self._lock:
+            item = self.require(thread_id)
+            canonical = str(Path(directory).expanduser().resolve(strict=False))
+            if canonical not in item.extra_dirs:
+                raise KeyError(f"Reference directory is not added: {directory}")
+            item = replace(
+                item,
+                extra_dirs=tuple(value for value in item.extra_dirs if value != canonical),
+                updated_at=_now(),
+            )
             if thread_id in self._pending:
                 self._pending[thread_id] = item
             else:

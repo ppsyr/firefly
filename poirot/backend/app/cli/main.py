@@ -299,21 +299,25 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
             return []
         return [s["name"] for s in mgr.list_skills()]
 
-    file_access_cache: tuple[tuple[str, str | None], ThreadFileAccess] | None = None
+    file_access_cache: tuple[tuple[str, str | None, tuple[str, ...]], ThreadFileAccess] | None = None
 
     def _file_candidates(fragment: str):
         """Provide live, thread-scoped ``@`` completion candidates."""
         nonlocal file_access_cache
         try:
             item = runtime.thread_store.require(runtime.thread_id) if runtime.thread_store else None
-            key = (runtime.thread_id, item.cwd if item else None)
+            key = (runtime.thread_id, item.cwd if item else None, item.extra_dirs if item else ())
             if file_access_cache is None or file_access_cache[0] != key:
-                file_access_cache = (key, ThreadFileAccess(item.cwd if item else None))
+                file_access_cache = (key, ThreadFileAccess(item.cwd if item else None, item.extra_dirs if item else ()))
             access = file_access_cache[1]
-            return [
-                (path, path.relative_to(access.cwd).as_posix())
-                for path in access.suggest_paths(fragment)
-            ]
+            candidates = []
+            for path in access.suggest_paths(fragment):
+                try:
+                    label = path.relative_to(access.cwd).as_posix()
+                except ValueError:
+                    label = path.as_posix()
+                candidates.append((path, label))
+            return candidates
         except Exception:
             return []
 
@@ -325,6 +329,13 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
             return [(item.thread_id, item.display, item.insert_text) for item in thread_candidates(
                 fragment, current=current, thread_store=runtime.thread_store, quoted_title=quoted
             )]
+        except Exception:
+            return []
+
+    def _reference_directories():
+        try:
+            current = runtime.thread_store.require(runtime.thread_id) if runtime.thread_store else None
+            return list(current.extra_dirs) if current else []
         except Exception:
             return []
 
@@ -350,7 +361,7 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
     session: PromptSession = PromptSession(
         completer=ThreadedCompleter(SlashCommandCompleter(
             get_registry(), skill_provider=_skill_names_provider, file_provider=_file_candidates,
-            thread_provider=_thread_candidates,
+            thread_provider=_thread_candidates, directory_provider=_reference_directories,
         )),
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,

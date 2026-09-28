@@ -142,3 +142,54 @@
 
 - 最近一次上述受影响测试结果为 **53 项通过**；Python `compileall` 和针对本次修改文件的 `git diff --check` 通过。全量测试结果为 **2757 通过、4 跳过、13 失败**；失败项来自既有配置默认值、模型环境、npm、Windows `msvcrt`、旧 state 字段及环境中的 `python` 命令断言，与本功能无关。
 - 尚未在本次验证中重新执行真实 CLI/TUI 的人工交互流程，也未启动 Docker 容器；自动化测试覆盖了共用消息处理链路和选择器逻辑。
+
+
+## 5. `/add-dir` 追加会话引用目录
+
+### 已完成功能
+
+- **会话级追加目录**：执行 `/add-dir <目录>` 后，当前 thread 的后续 `@文件` 引用可以从该目录读取；可添加多个目录，目录只对当前 thread 生效，不改变 `thread.cwd`、项目绑定、进程工作目录或 sandbox 权限。
+- **目录管理命令**：`/add-dir` 无参数时列出当前 thread 已追加的目录；`/add-dir --remove <目录>` 移除目录；目录不存在、不可访问或未添加时给出明确提示。路径支持现有 CLI 的引号写法，空格路径可以正常处理。
+- **规范化与去重**：添加目录时校验目录存在且可访问，并保存真实绝对路径。重复添加同一目录，以及通过符号链接添加同一真实目录，不会产生重复项；当前 `cwd` 也不会被重复加入。
+- **查找优先级**：`@文件名` 先查当前 thread 的 `cwd`；当前目录没有命中时，再按追加顺序查找 `extra_dirs`。同一优先级有多个命中时继续使用原有候选选择流程。带相对路径的引用沿用相同优先级，绝对路径只能落在 `cwd` 或已追加目录内。
+- **安全边界**：查找、读取和候选补全均按真实路径判断目录归属，拒绝 `../` 穿越、越界绝对路径和指向允许范围外的符号链接。原有单文件大小、二进制、UTF-8、目录清单和上下文预算限制保持不变。
+- **失效目录处理**：追加目录不会预先读取或注入文件；目录之后被删除、移动或失去访问权限时，不会扩大搜索范围，引用只返回文件不存在或不可访问提示。
+- **CLI/TUI 共享状态**：CLI 和 TUI 都从当前 thread 元数据构造 `ThreadFileAccess`；CLI 补全支持 `--remove`，并列出当前 thread 的追加目录，带空格的目录会自动使用引号。
+
+### 存储位置
+
+- 追加目录保存在当前 thread 的 session 元数据中：
+
+  ```text
+  {storage_root}/sessions/YYYY/MM/DD/thread-{HH-MM-SS}-{thread_id}/metadata.json
+  ```
+
+- 元数据字段为 `extra_dirs`，内容是按添加顺序排列的真实绝对路径列表。旧 thread 没有该字段时按空列表读取；不新增独立目录、checkpoint 或项目索引布局。
+- pending thread 在首次发送时物化时一并保存追加目录；thread 切换、项目切换和跨进程恢复时只读取目标 thread 自己的列表，移除后不会在恢复时重新出现。
+
+### 实现方式
+
+- `runtime/threads.py` 为 `ThreadMetadata` 增加 `extra_dirs`，通过 `ThreadStore.add_extra_dir()` 和 `remove_extra_dir()` 使用现有原子元数据写入流程持久化目录列表。
+- `app/bootstrap.py` 为 `AppRuntime` 提供追加和移除目录的方法，并在同步、异步 `prepare_question` 中把当前 thread 的 `extra_dirs` 传给 `ThreadFileAccess`。
+- `agents/runtime/file_access.py` 负责 cwd 与追加目录的优先级搜索、相对路径候选、绝对路径边界检查、真实路径校验和文件读取；追加目录只扩展 `@文件` 只读引用范围，不扩展 sandbox 文件工具权限。
+- `app/cli/commands.py` 注册 `/add-dir`；`app/cli/main.py` 和 `app/tui/app.py` 的候选缓存都按 thread ID、cwd 和追加目录列表区分，避免切换 thread 后复用旧范围。
+- `app/cli/command_completer.py` 提供 `/add-dir --remove` 及已添加目录的补全；TUI 沿用现有文件候选展示和确认流程。
+
+### 验证
+
+- 针对性测试覆盖追加后引用、移除后拒绝、cwd 优先、多个追加目录按顺序产生候选、相对路径、绝对路径、重复添加、符号链接去重、空格路径、失效目录、thread 隔离和元数据恢复。
+- 受影响测试命令：
+
+  ```bash
+  .venv/bin/pytest -q \
+    poirot/backend/tests/v1/unit/runtime/test_file_access.py \
+    poirot/backend/tests/v1/unit/cli \
+    poirot/backend/tests/v1/unit/tui \
+    poirot/backend/tests/v1/unit/sandbox/test_local_runtime.py \
+    poirot/backend/tests/v1/integration/test_thread_persistence.py \
+    poirot/backend/tests/v1/integration/test_project_binding.py
+  ```
+
+- 上述受影响测试共 **119 项通过**；Python `compileall` 和 `git diff --check` 均通过。
+- 全量测试结果为 **2761 通过、4 跳过、14 失败**。失败项来自既有配置默认值、模板版本、npm/PATH、平台锁和 `python` 命令环境问题，与本次 `/add-dir` 功能无关。
+- 已通过自动化命令处理、补全、文件引用和持久化链路验证；尚未重新执行真实交互式 CLI/TUI 人工流程，也未启动 Docker 容器。

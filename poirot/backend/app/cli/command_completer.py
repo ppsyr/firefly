@@ -25,6 +25,7 @@ active skill 名。选中/未选中行配色由 main.py 的 PromptSession Style 
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 from typing import Callable
 
@@ -36,6 +37,7 @@ from poirot.backend.app.cli.registry import CommandRegistry
 _SKILL_SUBCOMMANDS = ("list", "off", "enable", "disable", "install")
 _THREAD_SUBCOMMANDS = ("info", "list", "new", "switch", "rename", "delete")
 _PROJECT_SUBCOMMANDS = ("list",)
+_ADD_DIR_OPTIONS = ("--remove",)
 
 
 class SlashCommandCompleter(Completer):
@@ -56,6 +58,7 @@ class SlashCommandCompleter(Completer):
         skill_provider: Callable[[], list[str]] | None = None,
         file_provider: Callable[[str], list[tuple[Path, str]]] | None = None,
         thread_provider: Callable[[str, bool], list[tuple[str, str, str]]] | None = None,
+        directory_provider: Callable[[], list[str]] | None = None,
     ) -> None:
         """初始化。
 
@@ -67,6 +70,7 @@ class SlashCommandCompleter(Completer):
         self._skill_provider = skill_provider
         self._file_provider = file_provider
         self._thread_provider = thread_provider
+        self._directory_provider = directory_provider
 
     def get_completions(self, document: Document, complete_event):  # type: ignore[no-untyped-def]
         """产出补全候选。
@@ -111,6 +115,23 @@ class SlashCommandCompleter(Completer):
             for sub in _PROJECT_SUBCOMMANDS:
                 if sub.startswith(word.lower()):
                     yield Completion(sub, start_position=-len(word), display_meta="project command")
+            return
+        if stripped.startswith("/add-dir") and len(stripped) > 8 and stripped[8].isspace():
+            if stripped.startswith("/add-dir --remove"):
+                fragment = word.lower()
+                try:
+                    directories = self._directory_provider() if self._directory_provider else []
+                except Exception:
+                    directories = []
+                for directory in directories:
+                    if fragment and not directory.lower().startswith(fragment):
+                        continue
+                    text = shlex.quote(directory) + " "
+                    yield Completion(text, start_position=-len(word), display=directory, display_meta="reference directory")
+            elif word.startswith("-"):
+                for option in _ADD_DIR_OPTIONS:
+                    if option.startswith(word):
+                        yield Completion(option, start_position=-len(word), display_meta="add-dir option")
             return
         if stripped.startswith("/skill") and len(stripped) > 6 and stripped[6] in (" ", "\t"):
             arg_word = word

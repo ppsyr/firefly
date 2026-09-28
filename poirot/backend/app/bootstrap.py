@@ -204,7 +204,7 @@ class AppRuntime:
         current = self.thread_store.require(effective_thread_id) if self.thread_store else None
         access = None
         if self.thread_store and self.checkpointer:
-            access = ThreadFileAccess(current.cwd if current else None) if parse_thread_references(question) else None
+            access = ThreadFileAccess(current.cwd if current else None, current.extra_dirs if current else ()) if parse_thread_references(question) else None
             thread_result = quote_threads(
                 question,
                 current=current,
@@ -220,7 +220,7 @@ class AppRuntime:
             enriched = question + ("\n\n" + suffix if suffix else "")
             return PreparedQuestion(question, enriched, thread_references=thread_result.quotes if thread_result else ())
         if access is None:
-            access = ThreadFileAccess(current.cwd if current else None)
+            access = ThreadFileAccess(current.cwd if current else None, current.extra_dirs if current else ())
         prepared_files = prepare_question(parse_question, access, choose=choose)
         file_suffix = prepared_files.enriched[len(parse_question):]
         enriched = question + file_suffix
@@ -244,7 +244,7 @@ class AppRuntime:
         current = self.thread_store.require(effective_thread_id) if self.thread_store else None
         access = None
         if self.thread_store and self.checkpointer:
-            access = ThreadFileAccess(current.cwd if current else None) if parse_thread_references(question) else None
+            access = ThreadFileAccess(current.cwd if current else None, current.extra_dirs if current else ()) if parse_thread_references(question) else None
             thread_result = quote_threads(
                 question,
                 current=current,
@@ -260,7 +260,7 @@ class AppRuntime:
             enriched = question + ("\n\n" + suffix if suffix else "")
             return PreparedQuestion(question, enriched, thread_references=thread_result.quotes if thread_result else ())
         if access is None:
-            access = ThreadFileAccess(current.cwd if current else None)
+            access = ThreadFileAccess(current.cwd if current else None, current.extra_dirs if current else ())
         prepared_files = await prepare_question_async(parse_question, access, choose=choose)
         file_suffix = prepared_files.enriched[len(parse_question):]
         enriched = question + file_suffix
@@ -360,6 +360,20 @@ class AppRuntime:
         if self.thread_store is None:
             raise RuntimeError("Thread storage is unavailable")
         return self.thread_store.update(self.thread_id, title=title)
+
+    def add_reference_dir(self, directory: str | Path):
+        if self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        if self.thread_store is None:
+            raise RuntimeError("Thread storage is unavailable")
+        return self.thread_store.add_extra_dir(self.thread_id, directory)
+
+    def remove_reference_dir(self, directory: str | Path):
+        if self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        if self.thread_store is None:
+            raise RuntimeError("Thread storage is unavailable")
+        return self.thread_store.remove_extra_dir(self.thread_id, directory)
 
     def close(self) -> None:
         if self.checkpointer is not None:

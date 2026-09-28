@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 from types import SimpleNamespace
+from pathlib import Path
 
 from prompt_toolkit.document import Document
 from rich.console import Console
@@ -18,7 +19,7 @@ def test_thread_commands(tmp_path):
     deleted = []
     runtime = SimpleNamespace(thread_id=current.thread_id, thread_store=store, delete_thread=lambda tid: deleted.append(tid), rename_thread=lambda title: store.update(current.thread_id, title=title))
     output = StringIO()
-    console = Console(file=output, force_terminal=False)
+    console = Console(file=output, force_terminal=False, width=240)
     state = {}
 
     def command(value):
@@ -58,3 +59,35 @@ def test_thread_subcommands_complete():
         return {item.text for item in completer.get_completions(Document(text), None)}
     assert candidates("/thread ") == {"info", "list", "new", "switch", "rename", "delete"}
     assert candidates("/thread sw") == {"switch"}
+
+
+def test_add_dir_command_persists_lists_and_deduplicates(tmp_path: Path):
+    project = tmp_path / "project"
+    extra = tmp_path / "shared lib"
+    project.mkdir()
+    extra.mkdir()
+    store = ThreadStore(tmp_path / "storage")
+    current = store.create("current")
+    runtime = SimpleNamespace(
+        thread_id=current.thread_id,
+        thread_store=store,
+        add_reference_dir=lambda value: store.add_extra_dir(current.thread_id, value),
+        remove_reference_dir=lambda value: store.remove_extra_dir(current.thread_id, value),
+    )
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=240)
+
+    handle_command('/add-dir "{}"'.format(extra), console, None, {}, runtime)
+    assert store.require("current").extra_dirs == (str(extra.resolve()),)
+    output.seek(0)
+    output.truncate()
+    handle_command('/add-dir "{}"'.format(extra), console, None, {}, runtime)
+    assert "already added" in output.getvalue()
+    output.seek(0)
+    output.truncate()
+    handle_command('/add-dir', console, None, {}, runtime)
+    assert str(extra.resolve()) in output.getvalue()
+    output.seek(0)
+    output.truncate()
+    handle_command('/add-dir --remove "{}"'.format(extra), console, None, {}, runtime)
+    assert store.require("current").extra_dirs == ()
