@@ -1,0 +1,307 @@
+这个项目已有“线程目录、运行目录、事件日志”的基础，适合渐进式改造成“项目 → 会话 → 运行”三层模型。
+
+**现状问题**
+
+- `bootstrap_runtime()` 每次启动都会随机生成新 thread，并把目录放到项目代码根目录下。[bootstrap.py:482](/Users/lucia/Desktop/Projects/code-python/agent-practice/firefly/poirot/backend/app/bootstrap.py:482)
+- LangGraph 使用全局 `InMemorySaver`，状态只存在当前进程，重启后无法恢复。[checkpointer.py:28](/Users/lucia/Desktop/Projects/code-python/agent-practice/firefly/poirot/backend/agents/runtime/checkpointer.py:28)
+- `run_question(thread_id=...)` 可以覆盖 thread ID，但仍使用 runtime 原来的 `thread_dir`，会造成状态 ID 与文件目录不匹配。[bootstrap.py:167](/Users/lucia/Desktop/Projects/code-python/agent-practice/firefly/poirot/backend/app/bootstrap.py:167)
+- 日志、memory、sandbox、MCP 配置仍大量依赖代码根目录或 `Path.cwd()`。
+- `/thread` 只能显示当前 thread，没有项目列表、会话列表或切换能力。[commands.py:167](/Users/lucia/Desktop/Projects/code-python/agent-practice/firefly/poirot/backend/app/cli/commands.py:167)
+
+## 目标模型
+
+```text
+Project
+├── project_root
+├── project_config
+├── AGENTS.md
+├── Session A
+│   ├── LangGraph state
+│   ├── runs
+│   ├── artifacts
+│   └── summary
+└── Session B
+    ├── LangGraph state
+    ├── runs
+    ├── artifacts
+    └── summary
+```
+
+项目负责共享工作区和配置，会话负责独立对话状态。多个会话可以访问同一项目文件，但各自保留独立的 LangGraph state。
+
+## 推荐目录结构
+
+```text
+your-project/
+├── AGENTS.md
+├── src/
+└── .poirot/
+    ├── project.yaml
+    ├── index.sqlite
+    ├── checkpoints.sqlite
+    └── sessions/
+        └── <session-id>/
+            ├── session.json
+            ├── thread-events.jsonl
+            ├── summary.md
+            ├── refs.jsonl
+            └── runs/
+                └── <run-id>/
+                    ├── record.json
+                    ├── events.jsonl
+                    └── artifacts/
+```
+
+`.poirot/` 应加入项目的 `.gitignore`，除非用户明确希望提交项目级配置。
+
+## 核心抽象
+
+建议新增：
+
+```python
+ProjectContext:
+    project_id
+    root_path
+    metadata_path
+    config
+    instructions
+
+SessionRecord:
+    session_id
+    project_id
+    title
+    summary
+    created_at
+    updated_at
+    parent_session_id
+
+SessionReference:
+    source_session_id
+    target_session_id
+    reference_type
+    locator
+    snapshot
+```
+
+新增两个服务：
+
+```text
+ProjectManager
+- open_project(path)
+- create_project(path)
+- load_project_config()
+- load_project_instructions()
+
+SessionManager
+- create_session(project_id)
+- list_sessions(project_id)
+- open_session(project_id, session_id)
+- rename_session()
+- archive_session()
+- create_reference()
+- read_reference()
+```
+
+`thread_id` 可以暂时保留为 LangGraph 内部概念，但它应由会话统一派生：
+
+```text
+thread_id = project_id + ":" + session_id
+```
+
+外部 API 使用 `project_id` 和 `session_id`，避免业务代码继续直接拼接 thread 目录。
+
+## Runtime 改造
+
+`bootstrap_runtime()` 建议改成：
+
+```python
+bootstrap_runtime(
+    project_root: Path | None = None,
+    session_id: str | None = None,
+    expert_mode: bool = False,
+    ...
+)
+```
+
+`AppRuntime` 增加：
+
+```python
+project_id
+project_root
+session_id
+session_dir
+project_context
+```
+
+现有的 `thread_id`、`thread_dir` 可以保留为兼容属性，但所有目录都从同一个 `SessionRecord` 派生。
+
+`run_question()` 应只接受 `session_id`，并同时解析：
+
+- LangGraph thread key
+- session directory
+- run output directory
+- journal
+- artifact directory
+
+这样可以消除当前 ID 和目录不一致的问题。
+
+## 状态持久化
+
+这是实现“像 Codex 一样可重新打开会话”的必要条件。
+
+建议：
+
+1. 用 SQLite 替换全局 `InMemorySaver`。
+2. 每个项目使用自己的 checkpoint 数据库。
+3. SQLite 开启 WAL 和 busy timeout，支持多个会话并行运行。
+4. `index.sqlite` 保存项目、会话、引用关系。
+5. `checkpoints.sqlite` 保存 LangGraph checkpoint。
+
+如果当前 LangGraph 版本不适合直接接入 `SqliteSaver`，可以先封装：
+
+```python
+get_checkpointer(project_context)
+```
+
+将来替换底层实现时不影响 `LeaderAgent`。
+
+## 同项目会话互相引用
+
+建议采用“显式引用 + 摘要优先”的方式。
+
+会话结束或每轮完成后生成：
+
+```text
+sessions/<id>/summary.md
+```
+
+当前会话可以通过以下接口引用其他会话：
+
+```text
+list_project_sessions()
+read_session_summary(session_id)
+search_project_sessions(query)
+read_session_artifact(session_id, artifact_id)
+```
+
+CLI 可以提供：
+
+```text
+/project
+/sessions
+/session new
+/session switch <id>
+/session rename <id> <title>
+/session ref <id>
+```
+
+引用默认只返回摘要、标题、产物索引和有限消息片段。完整历史需要显式读取，并设置 token 上限。这样可以避免把整个项目所有会话都塞进上下文，也能减少旧会话内容对当前任务的干扰。
+
+同项目会话共享项目文件，但不要共享同一个 LangGraph state。需要“从旧会话继续”时，可以再实现 session fork。
+
+## 工作目录与配置
+
+需要把当前代码中的两类根路径分开：
+
+```text
+package_root   Poirot 自身代码、内置 prompt、默认资源
+project_root   用户项目、项目配置、项目文件、会话目录
+```
+
+以下模块都需要接收 `project_root`：
+
+- sandbox path mappings
+- MCP 配置路径
+- memory storage
+- artifact store
+- subagent 的 `cwd`
+- `CodexRuntime` 的 `new_session(cwd=...)`
+- 相对路径解析
+- 项目级 prompt 加载
+
+项目级配置可以采用：
+
+```text
+全局默认配置
+    ↓
+项目 .poirot/project.yaml
+    ↓
+会话运行时覆盖
+```
+
+API key、凭证等仍应来自全局环境或用户配置，不应允许项目配置覆盖。
+
+项目根的 `AGENTS.md` 可以在构建 system prompt 时加载，并作为项目上下文注入。它应位于系统安全规则之后，不能覆盖系统级约束。
+
+## 推荐实施顺序
+
+### 第一阶段：项目和会话目录
+
+- 新增 `ProjectContext`、`ProjectManager`、`SessionManager`
+- 增加 `--project-root`
+- 增加 `--session-id`
+- 将现有 thread 目录迁移到 `.poirot/sessions/<id>`
+- 保留 `thread_id/thread_dir` 兼容属性
+
+### 第二阶段：持久化会话
+
+- 替换 `InMemorySaver`
+- 增加项目级 checkpoint 数据库
+- 实现关闭进程后重新打开会话
+- 修复 `run_question()` 的 ID、目录一致性
+
+### 第三阶段：工作区绑定
+
+- sandbox、MCP、memory、artifact、subagent 全部使用 `project_root`
+- 所有路径做 `resolve()` 和越界检查
+- 加载项目配置和 `AGENTS.md`
+
+### 第四阶段：跨会话引用
+
+- 会话摘要
+- 项目会话索引
+- `/sessions`、`/session switch`、`/session ref`
+- Agent 可调用的 session 查询工具
+- 引用内容限长、带来源标识
+
+### 第五阶段：TUI
+
+当前 TUI 的右侧面板主要展示 token、MCP、sandbox 信息。[side_panel.py](/Users/lucia/Desktop/Projects/code-python/agent-practice/firefly/poirot/backend/app/tui/side_panel.py:40)
+
+可以扩展为：
+
+```text
+Project: firefly
+Session:
+├── Fix authentication
+├── Add tests
+└── Refactor CLI
+```
+
+## 迁移兼容
+
+旧的：
+
+```text
+.poirt/logs/threads/<thread-id>
+```
+
+可以迁移为“legacy session”：
+
+```text
+.poirt/sessions/<legacy-thread-id>
+```
+
+旧的事件日志和 artifact 可以保留。由于原先 checkpoint 在内存中，历史对话状态无法从旧进程恢复，只能恢复目录、运行记录和产物。
+
+## 关键验收标准
+
+1. 同一项目下新建两个会话，状态互不混淆。
+2. 重启进程后可以重新打开原会话。
+3. 同一项目的会话都使用同一个 `project_root`。
+4. 不同项目之间不会共享 checkpoint、memory、sandbox 或引用。
+5. `run_id`、`session_id`、artifact 路径始终一致。
+6. 一个会话可以读取另一个会话的摘要和指定产物。
+7. 旧的 `--thread-id` 和测试用例仍能通过兼容层运行。
+
+最适合的第一步是先实现 `ProjectContext + SessionManager`，并把 `bootstrap_runtime()` 改为显式接收 `project_root/session_id`。这一步完成后，再接入持久化 checkpointer 和跨会话引用，改动边界会比较清晰。
