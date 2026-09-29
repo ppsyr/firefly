@@ -191,7 +191,7 @@
   ```
 
 - 上述受影响测试共 **119 项通过**；Python `compileall` 和 `git diff --check` 均通过。
-- 全量测试结果为 **2761 通过、4 跳过、14 失败**。失败项来自既有配置默认值、模板版本、npm/PATH、平台锁和 `python` 命令环境问题，与本次 `/add-dir` 功能无关。
+- 全scm-history-item:/Users/lucia/Desktop/Projects/code-python/agent-practice/firefly?%7B%22repositoryId%22%3A%22scm0%22%2C%22historyItemId%22%3A%225da9ce851a7d80be341a0ea66eda7928e31cc1e2%22%2C%22historyItemParentId%22%3A%22e40579ddaf3d0b69fec11190d244bac0c379cbf8%22%2C%22historyItemDisplayId%22%3A%225da9ce8%22%7D量测试结果为 **2761 通过、4 跳过、14 失败**。失败项来自既有配置默认值、模板版本、npm/PATH、平台锁和 `python` 命令环境问题，与本次 `/add-dir` 功能无关。
 - 已通过自动化命令处理、补全、文件引用和持久化链路验证；尚未重新执行真实交互式 CLI/TUI 人工流程，也未启动 Docker 容器。
 
 
