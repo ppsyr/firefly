@@ -289,6 +289,22 @@ def _cmd_add_dir(ctx: CommandContext) -> None:
         ctx.console.print(f"[red]{exc}[/red]", markup=False)
 
 
+def _cmd_cd(ctx: CommandContext) -> None:
+    """Request a directory-bound thread switch for the UI/runtime loop."""
+    try:
+        parts = shlex.split(ctx.arg, posix=True)
+    except ValueError as exc:
+        ctx.console.print(f"[red]Invalid directory argument: {exc}[/red]")
+        return
+    if len(parts) != 1 or not parts[0].strip():
+        ctx.console.print("[yellow]Usage: /cd <directory>[/yellow]")
+        return
+    if ctx.state.get("_running"):
+        ctx.console.print("[red]A conversation is running; wait for it to finish[/red]")
+        return
+    ctx.state["pending_cd"] = parts[0]
+
+
 def _cmd_prompt(ctx: CommandContext) -> None:
     """Prompt 管理命令：/prompt list | /prompt show <cat/name> | /prompt reload。
 
@@ -682,6 +698,7 @@ _registry.register(CommandSpec("/thread", "Manage threads (info|list|new|switch|
 _registry.register(CommandSpec("/project", "Use /project list to select a project", _cmd_project))
 _registry.register(CommandSpec("/project_thread", "Use /project_thread list to restore a project thread", _cmd_project_thread))
 _registry.register(CommandSpec("/add-dir", "Add or remove directories available to @ file references", _cmd_add_dir))
+_registry.register(CommandSpec("/cd", "Create a new thread bound to a directory", _cmd_cd))
 _registry.register(CommandSpec("/prompt", "Prompt management (list|show <cat/name>|reload)", _cmd_prompt))
 _registry.register(CommandSpec("/skill", "Skill control (list|search|<name>|off|enable|disable|install|evolve|capture|history)", _cmd_skill))
 _registry.register(CommandSpec("/mcp", "MCP control (list|reload)", _cmd_mcp))

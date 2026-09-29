@@ -193,3 +193,31 @@
 - 上述受影响测试共 **119 项通过**；Python `compileall` 和 `git diff --check` 均通过。
 - 全量测试结果为 **2761 通过、4 跳过、14 失败**。失败项来自既有配置默认值、模板版本、npm/PATH、平台锁和 `python` 命令环境问题，与本次 `/add-dir` 功能无关。
 - 已通过自动化命令处理、补全、文件引用和持久化链路验证；尚未重新执行真实交互式 CLI/TUI 人工流程，也未启动 Docker 容器。
+
+
+## 6. `/cd` 切换目录并创建新会话
+
+### 已实现功能
+
+- **切换目录并新建 thread**：`/cd <目录>` 创建新的 thread ID，绑定目标目录及其项目，再将当前会话切到新 thread。即使目标与当前 `cwd` 是同一真实目录，也会新建 thread；原 thread 的 ID、`cwd`、历史、checkpoint 和追加目录不变。新 thread 不继承历史或 `/add-dir` 的 `extra_dirs`。
+- **路径与项目规则**：支持 `~`、相对路径和符号链接，统一解析为真实绝对目录；相对路径以当前 thread 的 `cwd` 为基准。无 `cwd` 的旧 thread 只能使用绝对路径。目标不存在或不是目录时拒绝；同一真实目录复用已注册项目，新目录按 `--dir` 的默认规则以目录名注册项目。项目名已绑定其他目录时明确报错，不覆盖原绑定，也不调用 `os.chdir()`。
+- **会话与权限恢复**：`/thread switch <旧 ID>` 根据目标 thread 元数据恢复项目和逻辑 `cwd`；文件引用使用目标 thread 的 `cwd`、`extra_dirs`，sandbox 上下文在切换时清空，并释放上一会话的 sandbox 资源。运行中的对话会阻止切换。
+- **CLI/TUI 入口**：两者共用 `/cd` 命令处理，支持用引号传入含空格的目录；切换成功后更新当前 thread 和界面状态，失败时显示错误。CLI 提供目录候选补全，TUI 命令面板列出 `/cd`。
+
+### 持久化与实现
+
+- 新 thread 创建时先在 `ThreadStore` 中保留 pending 元数据，包含新 ID、项目及 `cwd`，但**尚不写入磁盘**。首次发起对话时才物化到其 session 目录并进入项目 thread 索引；未发起对话就切走的 pending thread 会被删除。这沿用现有新会话生命周期，因此“立即创建”指当前进程中立即可用，不表示立即持久化。
+- 已物化的旧、新 thread 各自继续使用原有 session 目录保存元数据、checkpoint、运行日志和产物；不搬迁或复制数据。`AppRuntime.cd()` 先解析目录并确认项目绑定，再创建 pending thread，通过现有 `switch_thread()` 切换。目录、项目或切换准备阶段失败时保留原 runtime，并清理这次创建的 pending thread。
+
+### 验证与待确认项
+
+- 新增测试覆盖 A 到 B 的新 ID、目录和项目绑定、旧 thread 保留、`extra_dirs` 不继承、B 首次对话前不进入项目索引、同目录再次 `/cd`、相对路径、目录不存在、项目名冲突、无 `cwd` 旧 thread 的相对路径限制，以及 checkpoint 读取失败时的 pending thread 清理。命令和补全单测也已覆盖。
+- 本次验证命令：
+
+  ```bash
+  .venv/bin/pytest -q poirot/backend/tests/v1/integration/test_cd_command.py poirot/backend/tests/v1/unit/cli/test_thread_commands.py poirot/backend/tests/v1/unit/cli/test_command_completer.py
+  .venv/bin/pytest -q poirot/backend/tests/v1/integration/test_cd_command.py poirot/backend/tests/v1/integration/test_project_binding.py poirot/backend/tests/v1/integration/test_thread_persistence.py poirot/backend/tests/v1/unit/cli poirot/backend/tests/v1/unit/tui poirot/backend/tests/v1/unit/sandbox/test_local_runtime.py
+  ```
+
+- 上述测试分别为 **22 项通过**、**113 项通过**。前一轮全量测试为 **2768 项通过、4 项跳过、13 项失败**；失败涉及既有配置断言、环境依赖、平台差异和缺少系统 `python` 命令，未见 `/cd` 测试失败。本次文档更新没有重新运行全量测试。
+- 尚未对 `/cd` 单独完成真实 CLI 的 A → B → 旧 thread 操作、TUI 交互、跨进程切回、sandbox 与 `@文件` 的 A/B 权限边界、`~`/符号链接/普通文件路径，以及切换后段异常的回退测试。目录补全目前只做了基本覆盖；这些场景不能算作已验证完成。

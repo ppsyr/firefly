@@ -1090,6 +1090,14 @@ class PoirotTUI(App):
                 conv.write(Text(f"New thread: {self.cli_state['thread_title']} [{self.runtime.thread_id}]"))
             except Exception as exc:
                 conv.write(Text(f"Thread creation failed: {exc}"))
+        pending_cd = self.cli_state.pop("pending_cd", None)
+        if pending_cd is not None:
+            try:
+                self.runtime = self.runtime.cd(pending_cd)
+                self._clear_file_suggestions()
+                self._show_switched_thread(f"Switched to directory {self.runtime.project.dir}")
+            except Exception as exc:
+                conv.write(Text(f"Directory switch failed: {exc}"))
         selected = self.cli_state.pop("pending_thread_switch", None)
         if selected:
             try:

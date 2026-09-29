@@ -280,6 +280,8 @@ class AppRuntime:
         self.checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
         item = self.thread_store.require(thread_id)
         target_pending = self.thread_store.is_pending(thread_id)
+        # Keep the legacy runtime project label for unbound threads, while all
+        # thread-scoped cwd/sandbox decisions continue to use target metadata.
         project = self.project_store.get(item.project) if item.project and self.project_store else self.project
         if item.project and (project is None or project.dir != item.cwd):
             raise ValueError(f"Thread project binding is unavailable: {item.project}")
@@ -293,10 +295,51 @@ class AppRuntime:
             self.thread_store.delete(self.thread_id)
         # ContextVar is process-local; never carry the previous thread's
         # sandbox into a newly selected thread.
-        from poirot.backend.agents.sandbox.integration.context import set_sandbox_id
+        from poirot.backend.agents.sandbox.integration.context import get_sandbox_id, set_sandbox_id
+        previous_sandbox_id = get_sandbox_id()
         set_sandbox_id(None)
+        if previous_sandbox_id:
+            provider = getattr(self.capability_registry, "sandbox_provider", None)
+            if provider is not None:
+                try:
+                    provider.release(previous_sandbox_id)
+                except Exception:
+                    pass
         return replace(self, thread_id=thread_id, thread_dir=thread_dir, thread_journal=journal,
                        project=project, thread_persisted=not target_pending)
+
+    def cd(self, directory: str | Path) -> AppRuntime:
+        """Create and activate a new thread bound to ``directory``.
+
+        The current thread is never mutated. Relative paths are resolved from
+        its persisted cwd; an unbound legacy thread must use an absolute path.
+        """
+        if self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        if self.thread_store is None or self.project_store is None:
+            raise RuntimeError("Project storage is unavailable")
+        current = self.thread_store.require(self.thread_id)
+        raw = Path(directory).expanduser()
+        if not raw.is_absolute() and current.cwd is None:
+            raise ValueError("Current thread has no cwd; /cd requires an absolute path")
+        from poirot.backend.agents.runtime.projects import normalize_project_dir
+
+        target_dir = normalize_project_dir(
+            raw,
+            base=Path(current.cwd) if current.cwd is not None else None,
+        )
+        target_project = self.project_store.ensure(target_dir)
+        item = self.thread_store.create(
+            project=target_project.project_name,
+            cwd=target_project.dir,
+            persist=False,
+        )
+        try:
+            changed = self.switch_thread(item.thread_id)
+            return replace(changed, project=target_project)
+        except BaseException:
+            self.thread_store.delete(item.thread_id)
+            raise
 
     def new_thread(self) -> AppRuntime:
         if self.active_threads:
@@ -813,6 +856,9 @@ def bootstrap_runtime(
         project = project_store.get(existing_thread.project)
         if project is None or project.dir != existing_thread.cwd:
             raise ValueError(f"Thread project binding is unavailable: {existing_thread.project}")
+    else:
+        # An old unbound thread must not inherit the startup directory/project.
+        project = None
     if thread_persisted:
         thread_dir = thread_store.session_dir(thread_id)
     else:

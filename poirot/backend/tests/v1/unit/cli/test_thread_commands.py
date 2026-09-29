@@ -91,3 +91,18 @@ def test_add_dir_command_persists_lists_and_deduplicates(tmp_path: Path):
     output.truncate()
     handle_command('/add-dir --remove "{}"'.format(extra), console, None, {}, runtime)
     assert store.require("current").extra_dirs == ()
+
+
+def test_cd_command_queues_one_path_and_validates_arguments(tmp_path: Path):
+    store = ThreadStore(tmp_path / "storage")
+    current = store.create("current")
+    runtime = SimpleNamespace(thread_id=current.thread_id, thread_store=store)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    state = {}
+    handle_command('/cd "directory with spaces"', console, None, state, runtime)
+    assert state["pending_cd"] == "directory with spaces"
+    state.clear()
+    handle_command('/cd one two', console, None, state, runtime)
+    assert "Usage:" in output.getvalue()
+    assert "pending_cd" not in state

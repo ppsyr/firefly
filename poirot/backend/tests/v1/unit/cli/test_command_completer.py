@@ -128,3 +128,14 @@ def test_add_dir_remove_completion_quotes_spaces():
     )
     result = list(c.get_completions(Document("/add-dir --remove "), None))
     assert result and result[0].text == "'/tmp/shared lib' "
+
+
+def test_cd_directory_completion_uses_provider():
+    c = SlashCommandCompleter(
+        get_registry(),
+        cd_directory_provider=lambda fragment: [("'/tmp/project-a' ", "/tmp/project-a")]
+        if fragment == "pro"
+        else [],
+    )
+    result = list(c.get_completions(Document("/cd pro"), None))
+    assert result and result[0].text == "'/tmp/project-a' "

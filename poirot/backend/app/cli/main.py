@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -339,6 +340,30 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
         except Exception:
             return []
 
+    def _cd_directory_candidates(fragment: str):
+        """Complete directories relative to the current thread cwd."""
+        try:
+            item = runtime.thread_store.require(runtime.thread_id) if runtime.thread_store else None
+            base = Path(item.cwd) if item and item.cwd else None
+            if base is None:
+                return []
+            expanded = Path(fragment).expanduser()
+            parent = expanded.parent if str(expanded.parent) not in (".", "") else base
+            if not expanded.is_absolute():
+                parent = (base / parent).resolve(strict=False)
+            if not parent.is_dir():
+                return []
+            prefix = expanded.name if str(expanded.parent) not in (".", "") else ""
+            results = []
+            for child in sorted(parent.iterdir(), key=lambda value: value.name.lower()):
+                if not child.is_dir() or (prefix and not child.name.lower().startswith(prefix.lower())):
+                    continue
+                value = str(child)
+                results.append((shlex.quote(value) + " ", value))
+            return results
+        except Exception:
+            return []
+
     completion_keys = KeyBindings()
 
     @completion_keys.add("enter", filter=Condition(
@@ -362,6 +387,7 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
         completer=ThreadedCompleter(SlashCommandCompleter(
             get_registry(), skill_provider=_skill_names_provider, file_provider=_file_candidates,
             thread_provider=_thread_candidates, directory_provider=_reference_directories,
+            cd_directory_provider=_cd_directory_candidates,
         )),
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,
@@ -468,6 +494,19 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
                     console.print(f"New thread: {cli_state['thread_title']} [{runtime.thread_id}]", style="green", markup=False)
                 except Exception as exc:
                     console.print(f"[red]Thread creation failed: {exc}[/red]")
+            pending_cd = cli_state.pop("pending_cd", None)
+            if pending_cd is not None:
+                try:
+                    changed = runtime.cd(pending_cd)
+                    runtime = changed
+                    cli_state["thread_title"] = runtime.thread_store.require(runtime.thread_id).title
+                    console.print(
+                        f"Switched to directory: {runtime.project.dir} "
+                        f"(project: {runtime.project.project_name}) [{runtime.thread_id}]",
+                        style="green", markup=False,
+                    )
+                except Exception as exc:
+                    console.print(f"[red]Directory switch failed: {exc}[/red]")
             if cli_state.pop("pending_project_list", False):
                 from poirot.backend.app.cli.thread_selector import select_project
                 if runtime.project_store is None:

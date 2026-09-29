@@ -59,6 +59,7 @@ class SlashCommandCompleter(Completer):
         file_provider: Callable[[str], list[tuple[Path, str]]] | None = None,
         thread_provider: Callable[[str, bool], list[tuple[str, str, str]]] | None = None,
         directory_provider: Callable[[], list[str]] | None = None,
+        cd_directory_provider: Callable[[str], list[tuple[str, str]]] | None = None,
     ) -> None:
         """初始化。
 
@@ -71,6 +72,7 @@ class SlashCommandCompleter(Completer):
         self._file_provider = file_provider
         self._thread_provider = thread_provider
         self._directory_provider = directory_provider
+        self._cd_directory_provider = cd_directory_provider
 
     def get_completions(self, document: Document, complete_event):  # type: ignore[no-untyped-def]
         """产出补全候选。
@@ -132,6 +134,22 @@ class SlashCommandCompleter(Completer):
                 for option in _ADD_DIR_OPTIONS:
                     if option.startswith(word):
                         yield Completion(option, start_position=-len(word), display_meta="add-dir option")
+            return
+        if stripped.startswith("/cd") and len(stripped) > 3 and stripped[3].isspace():
+            if self._cd_directory_provider is None:
+                return
+            fragment = word
+            try:
+                candidates = self._cd_directory_provider(fragment) or []
+            except Exception:
+                candidates = []
+            for insert, display in candidates:
+                yield Completion(
+                    text=insert,
+                    start_position=-len(fragment),
+                    display=display,
+                    display_meta="directory",
+                )
             return
         if stripped.startswith("/skill") and len(stripped) > 6 and stripped[6] in (" ", "\t"):
             arg_word = word
