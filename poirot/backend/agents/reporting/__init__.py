@@ -30,6 +30,9 @@ from poirot.backend.agents.reporting.thread_report import (
 )
 from poirot.backend.agents.reporting.report_store import ReportStore, SavedReport
 from poirot.backend.agents.reporting.report_index import ReportBlock, ReportIndex, RebuildResult
+from poirot.backend.agents.reporting.report_search import (
+    SearchAnswer, SearchResult, answer_search, format_search_result, parse_search_command, search_reports,
+)
 
 __all__ = [
     "ReportArtifact",
@@ -40,4 +43,10 @@ __all__ = [
     "ReportBlock",
     "ReportIndex",
     "RebuildResult",
+    "SearchResult",
+    "SearchAnswer",
+    "answer_search",
+    "format_search_result",
+    "parse_search_command",
+    "search_reports",
 ]

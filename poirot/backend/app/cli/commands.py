@@ -95,6 +95,17 @@ def _cmd_report(ctx: CommandContext) -> None:
     ctx.state["pending_report"] = ctx.arg.strip()
 
 
+def _cmd_search(ctx: CommandContext) -> None:
+    """Search persisted reports, then ask the agent to answer."""
+    from poirot.backend.agents.reporting import answer_search
+
+    try:
+        result = answer_search(ctx.runtime, ctx.arg)
+        ctx.console.print(result.answer, markup=False)
+    except ValueError as exc:
+        ctx.console.print(f"[yellow]{exc}[/yellow]")
+
+
 def _cmd_exit(ctx: CommandContext) -> bool:
     """退出 CLI。"""
     return True
@@ -688,6 +699,7 @@ _registry.register(CommandSpec("/clear", "Clear screen", _cmd_clear))
 _registry.register(CommandSpec("/expert", "Switch to expert mode (deep research), applies next round", _cmd_expert))
 _registry.register(CommandSpec("/default", "Switch to default mode (lightweight chat), applies next round", _cmd_default))
 _registry.register(CommandSpec("/report", "Generate report from current thread; optional topic", _cmd_report))
+_registry.register(CommandSpec("/search", "Search saved reports with bounded progressive disclosure", _cmd_search))
 _registry.register(CommandSpec("/exit", "Exit (also /quit)", _cmd_exit))
 _registry.register(CommandSpec("/quit", "Exit (alias of /exit)", _cmd_exit))
 _registry.register(CommandSpec("/expand", "Expand last round tool results and Thought", _cmd_expand))

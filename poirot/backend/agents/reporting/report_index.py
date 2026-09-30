@@ -306,3 +306,16 @@ class ReportIndex:
                 seen.add(key)
                 found.append(ReportBlock(**{name: row[name] for name in ReportBlock.__dataclass_fields__}))
         return found
+
+    def blocks_for_report(self, report_path: str, *, levels: tuple[str, ...] = ("L0", "L1", "L2")) -> list[ReportBlock]:
+        """Read already-indexed blocks for one validated report path."""
+        rel = self._relative_path(self.reports_root / report_path)
+        if not self.path.exists():
+            return []
+        placeholders = ",".join("?" for _ in levels)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT *, 0.0 AS score FROM blocks WHERE report_path=? AND level IN ({placeholders}) ORDER BY id",
+                (rel, *levels),
+            ).fetchall()
+        return [ReportBlock(**{name: row[name] for name in ReportBlock.__dataclass_fields__}) for row in rows]
