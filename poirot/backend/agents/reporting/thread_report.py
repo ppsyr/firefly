@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from poirot.backend.agents.reporting.report_store import ReportStore, SavedReport
+
 
 @dataclass
 class ReportArtifact:
@@ -33,10 +35,16 @@ class ReportArtifact:
     Attributes:
         final_report: 合成的最终报告文本。
         artifact_path: 保存的 artifact 路径；未保存时为 None。
+        report_path: 手动用户级报告路径；自动 export 时为 None。
+        conversation_path: 手动报告对应的 JSONL 对话副本路径。
     """
 
     final_report: str
     artifact_path: str | None
+    report_path: str | None = None
+    conversation_path: str | None = None
+    title: str | None = None
+    thread_id: str | None = None
 
 
 class _ReportRuntime(Protocol):
@@ -100,3 +108,70 @@ def generate_report_from_thread(
         )
         artifact_path = artifact.path
     return ReportArtifact(final_report=result.final_report, artifact_path=artifact_path)
+
+
+def _thread_state(runtime: _ReportRuntime) -> dict[str, Any]:
+    """Read the latest committed state without changing the runtime."""
+    config = {"configurable": {"thread_id": runtime.thread_id}}
+    snapshot = runtime.leader_agent.graph.get_state(config)
+    if not snapshot or not getattr(snapshot, "values", None):
+        return {}
+    return dict(snapshot.values)
+
+
+def persist_report_from_thread(
+    runtime: _ReportRuntime,
+    title: str | None = None,
+) -> ReportArtifact:
+    """Generate and persist a manual report under the user storage root.
+
+    This path is intentionally separate from ``generate_report_from_thread``:
+    automatic export keeps its run artifact contract, while ``/report`` creates
+    a paired, durable Markdown and conversation snapshot.
+    """
+    state = _thread_state(runtime)
+    messages = state.get("messages") or []
+    has_material = bool(
+        messages
+        or state.get("final_report")
+        or state.get("observations")
+        or state.get("sources")
+        or state.get("errors")
+    )
+    if not has_material:
+        raise ValueError("当前 thread 没有可生成报告的已保存历史")
+
+    reporter = runtime.capability_registry.get_reporter()
+    result = reporter.generate_report(state, run_context=None)
+    thread_store = getattr(runtime, "thread_store", None)
+    item = thread_store.require(runtime.thread_id) if thread_store is not None else None
+    report_title = title if title is not None else (getattr(item, "title", None) or "Report")
+    if title is not None and not title.strip():
+        raise ValueError("报告标题不能为空")
+    thread_location = ""
+    storage_root = getattr(getattr(runtime, "config", None), "runtime", None)
+    storage_value = getattr(storage_root, "storage_root", None)
+    if storage_value is None:
+        raise RuntimeError("storage_root is unavailable")
+    if thread_store is not None:
+        thread_location = str(thread_store.session_dir(runtime.thread_id))
+    metadata = {
+        "thread_id": runtime.thread_id,
+        "project": getattr(item, "project", None),
+        "cwd": getattr(item, "cwd", None),
+        "thread_location": thread_location,
+    }
+    saved: SavedReport = ReportStore(storage_value).save(
+        title=report_title,
+        final_report=result.final_report,
+        state=state,
+        metadata=metadata,
+    )
+    return ReportArtifact(
+        final_report=result.final_report,
+        artifact_path=None,
+        report_path=saved.report_path,
+        conversation_path=saved.conversation_path,
+        title=saved.title,
+        thread_id=runtime.thread_id,
+    )

@@ -84,3 +84,38 @@ def test_generate_report_from_thread_none_snapshot(tmp_path) -> None:
 
     result = generate_report_from_thread(runtime=runtime)
     assert result.final_report  # 非 None（reporter fallback）
+
+
+def test_persist_report_from_thread_uses_user_storage(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    state = {
+        "research_question": "测试问题",
+        "messages": [
+            {"role": "user", "content": "做总结"},
+            {"role": "assistant", "content": "总结完成"},
+        ],
+        "observations": [{"content": "稳定事实"}],
+    }
+    graph = SimpleNamespace(get_state=lambda config: SimpleNamespace(values=state))
+    reporter = SimpleNamespace(generate_report=lambda s, run_context=None: SimpleNamespace(final_report="结果"))
+    item = SimpleNamespace(thread_id="thread-test", title="线程标题", project="demo", cwd=str(tmp_path))
+    store = SimpleNamespace(
+        require=lambda thread_id: item,
+        session_dir=lambda thread_id: tmp_path / "sessions" / thread_id,
+    )
+    runtime = SimpleNamespace(
+        leader_agent=SimpleNamespace(graph=graph),
+        thread_id="thread-test",
+        thread_store=store,
+        capability_registry=SimpleNamespace(get_reporter=lambda: reporter),
+        config=SimpleNamespace(runtime=SimpleNamespace(storage_root=str(tmp_path / "user-store"))),
+    )
+    from poirot.backend.agents.reporting import persist_report_from_thread
+
+    result = persist_report_from_thread(runtime)
+    assert result.artifact_path is None
+    assert result.title == "线程标题"
+    assert result.report_path.startswith(str(tmp_path / "user-store" / "reports"))
+    assert Path(result.report_path).exists()
+    assert Path(result.conversation_path).exists()

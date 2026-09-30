@@ -422,6 +422,18 @@ class AppRuntime:
         if self.checkpointer is not None:
             self.checkpointer.close()
 
+    def generate_report(self, topic: str | None = None):
+        """Create a user-level manual report snapshot for the current thread.
+
+        ``topic`` is the report title for the ``/report`` command.  The current
+        thread, project, cwd, checkpoint and sandbox are left unchanged.
+        """
+        if self.active_threads:
+            raise RuntimeError("A conversation is running; wait for it to finish")
+        from poirot.backend.agents.reporting import persist_report_from_thread
+
+        return persist_report_from_thread(self, title=topic)
+
     def run_question(
         self,
         question: str,

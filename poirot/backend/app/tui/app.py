@@ -1202,8 +1202,8 @@ class PoirotTUI(App):
         from rich.text import Text
         conv.write(Text(f"Generating report{' on: ' + topic if topic else ''}...", style="cyan"))
         try:
-            self.runtime.generate_report(topic=topic or None)
-            conv.write(Text("Report generated.", style="green"))
+            result = self.runtime.generate_report(topic=topic or None)
+            conv.write(Text(f"Report generated: {result.report_path}", style="green"))
         except Exception as exc:
             conv.write(Text(f"Report failed: {exc}", style="red"))
 

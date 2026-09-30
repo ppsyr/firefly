@@ -428,26 +428,16 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
         return True
 
     def _trigger_report(topic: str | None, rt: AppRuntime, con: Console) -> None:
-        """default 模式手动触发报告：调 reporting 服务 + rich Markdown 输出。
-
-        报告生成逻辑（graph.get_state + reporter + artifact）在 agents/reporting 层，
-        CLI 仅负责 presentation（expert 提示 + Markdown 渲染）。
-        """
-        if rt.config.runtime.expert_mode:
-            con.print("[yellow]expert 模式已自动生成报告，无需手动触发。[/yellow]\n")
-            return
+        """Generate a durable user-level report and render its Markdown."""
         try:
-            from poirot.backend.agents.reporting import generate_report_from_thread
-            result = generate_report_from_thread(runtime=rt, topic=topic)
+            result = rt.generate_report(topic=topic)
         except Exception as exc:
             con.print(f"[red]✗ 报告生成失败: {exc}[/red]\n")
             return
         from rich.markdown import Markdown
         con.print(Markdown(result.final_report))
-        if result.artifact_path:
-            con.print(f"[dim]report saved: {result.artifact_path}[/dim]\n")
-        else:
-            con.print()
+        con.print(f"[dim]report saved: {result.report_path}[/dim]")
+        con.print(f"[dim]conversation saved: {result.conversation_path}[/dim]\n")
 
     intent_tree = default_intent_tree(report_handler=_handle_report_intent)
 

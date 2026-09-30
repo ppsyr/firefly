@@ -26,6 +26,14 @@ AppRuntime 结构性满足，避免反向依赖。
 from poirot.backend.agents.reporting.thread_report import (
     ReportArtifact,
     generate_report_from_thread,
+    persist_report_from_thread,
 )
+from poirot.backend.agents.reporting.report_store import ReportStore, SavedReport
 
-__all__ = ["ReportArtifact", "generate_report_from_thread"]
+__all__ = [
+    "ReportArtifact",
+    "ReportStore",
+    "SavedReport",
+    "generate_report_from_thread",
+    "persist_report_from_thread",
+]
