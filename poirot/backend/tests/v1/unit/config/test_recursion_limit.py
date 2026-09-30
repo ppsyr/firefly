@@ -20,7 +20,14 @@ def _make_runtime_context(max_loop_steps: int = 50, multiplier: int = 10) -> Sim
 
 
 def _make_app_runtime() -> SimpleNamespace:
-    return SimpleNamespace(capability_registry=SimpleNamespace())
+    return SimpleNamespace(
+        capability_registry=SimpleNamespace(),
+        build_search_scope=lambda thread_id, user_text: {
+            "thread_id": thread_id, "project": None, "cwd": None,
+            "storage_root": None, "all_projects_allowed": False,
+            "authorization": "no cross-project request in this turn",
+        },
+    )
 
 
 class TestRecursionLimitDerivation:

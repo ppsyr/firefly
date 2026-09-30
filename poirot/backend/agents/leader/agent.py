@@ -145,12 +145,18 @@ class LeaderAgent:
         *,
         thread_title: str | None = None,
         title_question: str | None = None,
+        search_scope: dict[str, Any] | None = None,
     ) -> AgentRunResult:
         """驱动一次研究：构造 state + config → ainvoke → 收报告 → 存 artifact。
 
         Args:
             question: 研究问题。
             run_context: 运行上下文。
+            thread_title: 当前 thread 标题，供标题中间件使用。
+            title_question: 原始用户问题（不含 @引用 / thread 引用增强内容）。
+            search_scope: 本次运行的报告检索范围（project / cwd / storage_root /
+                跨项目授权）。由 AppRuntime 按当前 thread 元数据构造，逐轮实时传入；
+                为 None 时 ``search_reports`` 工具只报告范围不可用，不做任何检索。
 
         Returns:
             AgentRunResult: 运行结果。
@@ -170,19 +176,25 @@ class LeaderAgent:
             "title_question": title_question if title_question is not None else question,
         }
 
+        configurable: dict[str, Any] = {
+            "expert_mode": run_context.config.runtime.expert_mode,
+            "run_id": run_context.run_id,
+            "thread_id": run_context.thread_id,
+            "thread_title": thread_title,
+            "journal": run_context.journal,
+            "output_dir": str(run_context.output_dir),
+            "plan_enabled": run_context.config.runtime.plan_enabled,
+            "timezone": run_context.config.runtime.timezone,
+            # 取实际模型的路由 provider 名（FallbackChatModel 的 provider_names），非 config 静态值
+            "model": _resolve_actual_model_name(self.capability_registry),
+        }
+        if search_scope is not None:
+            # Report search scope is per-run: the tool reads it from configurable at
+            # call time, so a thread/project switch can never reuse a stale scope.
+            configurable["report_search_scope"] = search_scope
+
         config = {
-            "configurable": {
-                "expert_mode": run_context.config.runtime.expert_mode,
-                "run_id": run_context.run_id,
-                "thread_id": run_context.thread_id,
-                "thread_title": thread_title,
-                "journal": run_context.journal,
-                "output_dir": str(run_context.output_dir),
-                "plan_enabled": run_context.config.runtime.plan_enabled,
-                "timezone": run_context.config.runtime.timezone,
-                # 取实际模型的路由 provider 名（FallbackChatModel 的 provider_names），非 config 静态值
-                "model": _resolve_actual_model_name(self.capability_registry),
-            },
+            "configurable": configurable,
             # recursion_limit 从 config 推导：max_loop_steps * graph_node_multiplier。
             # 不再硬编码——让长程任务有足够图节点预算，安全网是 StallDetectionMiddleware。
             "recursion_limit": run_context.config.runtime.max_loop_steps * run_context.config.runtime.graph_node_multiplier,

@@ -60,6 +60,7 @@ from poirot.backend.agents.middlewares.loop_detection_middleware import (
 from poirot.backend.agents.middlewares.stall_detection_middleware import (
     StallDetectionMiddleware,
 )
+from poirot.backend.agents.middlewares.report_hint_middleware import ReportHintMiddleware
 from poirot.backend.agents.middlewares.reflection_middleware import (
     LightReflectionStrategy,
     ReflectionMiddleware,
@@ -204,6 +205,9 @@ def _build_middlewares(
     middlewares.extend([
         HelpRequestMiddleware(),
         DanglingToolCallMiddleware(),
+        # 确定性触发提示：本轮问句指向历史报告/旧结论时，明确提示先检索再回答。
+        # 工具不在表里、范围不可用或预算耗尽时静默跳过。
+        ReportHintMiddleware(),
         # LoopDetectionMiddleware 已移除——用户要求取消循环上限约束。
         # 原配置：after_model 检测近 10 条消息同 (tool, args_hash) ≥3 → 清 tool_calls + jump model。
         # 如需恢复，取消下行注释 + 确保 import 存在。

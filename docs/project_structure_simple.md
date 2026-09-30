@@ -133,6 +133,7 @@
 │   │   │   │   ├── memory_recall_middleware.py
 │   │   │   │   ├── message_normalizer_middleware.py
 │   │   │   │   ├── reflection_middleware.py
+│   │   │   │   ├── report_hint_middleware.py
 │   │   │   │   ├── report_middleware.py
 │   │   │   │   ├── run_journal_middleware.py
 │   │   │   │   ├── sandbox_middleware.py

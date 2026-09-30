@@ -1247,7 +1247,7 @@ class PoirotTUI(App):
             )
             self.runtime.run_manager.mark_running(ctx.run_id)
             self.runtime.begin_turn(question)
-            config = self._build_stream_config(ctx)
+            config = self._build_stream_config(ctx, prepared.original)
             client = PoirotStreamClient(graph=self.runtime.leader_agent.graph, config=config)
 
             async for event in client.stream(prepared.enriched, title_question=prepared.original):
@@ -1330,6 +1330,6 @@ class PoirotTUI(App):
             conv.write(Text(f"  ↳ Steer applied: {msg[:80]}", style="dim"))
         self._steer_queue.clear()
 
-    def _build_stream_config(self, ctx: Any) -> dict:
+    def _build_stream_config(self, ctx: Any, user_text: str = "") -> dict:
         from poirot.backend.app.cli.main import _build_stream_config
-        return _build_stream_config(self.runtime, ctx)
+        return _build_stream_config(self.runtime, ctx, user_text)

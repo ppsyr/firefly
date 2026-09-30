@@ -11,6 +11,7 @@ CLI / API / IM 各自负责呈现。
 - thread_report               : 渠道无关的报告生成服务（取 state → 合成 → 保存）。
 - ReportArtifact              : 报告生成结果（渠道无关），对外导出。
 - generate_report_from_thread : 报告生成服务主入口，对外导出。
+- report_search / agent_search: `/search` 检索核心与 search_reports Agent 工具服务层。
 
 【职责边界】
 - 只负责：报告文本渲染（markdown_reporter）、报告结果结构（result）、
@@ -31,7 +32,12 @@ from poirot.backend.agents.reporting.thread_report import (
 from poirot.backend.agents.reporting.report_store import ReportStore, SavedReport
 from poirot.backend.agents.reporting.report_index import ReportBlock, ReportIndex, RebuildResult
 from poirot.backend.agents.reporting.report_search import (
-    SearchAnswer, SearchResult, answer_search, format_search_result, parse_search_command, search_reports,
+    ReportCandidates, SearchAnswer, SearchResult, SearchScope, answer_search, collect_reports,
+    format_search_result, parse_search_command, search_reports,
+)
+from poirot.backend.agents.reporting.agent_search import (
+    AgentSearchResult, RunSearchScope, authorize_all_projects, build_run_scope, scope_from_payload,
+    search_reports_for_agent,
 )
 
 __all__ = [
@@ -45,8 +51,17 @@ __all__ = [
     "RebuildResult",
     "SearchResult",
     "SearchAnswer",
+    "SearchScope",
+    "ReportCandidates",
     "answer_search",
+    "collect_reports",
     "format_search_result",
     "parse_search_command",
     "search_reports",
+    "AgentSearchResult",
+    "RunSearchScope",
+    "authorize_all_projects",
+    "build_run_scope",
+    "scope_from_payload",
+    "search_reports_for_agent",
 ]

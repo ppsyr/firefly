@@ -186,12 +186,14 @@ def run_chat(provider: str | None = None, model: str | None = None, legacy: bool
         runtime.close()
 
 
-def _build_stream_config(runtime: AppRuntime, run_context: Any) -> dict:
+def _build_stream_config(runtime: AppRuntime, run_context: Any, user_text: str = "") -> dict:
     """构建 graph config（stream 用，与 LeaderAgent.run 一致）。
 
     Args:
         runtime: 应用运行时。
         run_context: 运行上下文。
+        user_text: 本轮原始用户输入；用于 search_reports 的检索范围与
+            跨项目授权。缺省为空串时仍下发范围，只是不会授权跨项目。
 
     Returns:
         dict: graph 调用配置（configurable + recursion_limit）。
@@ -208,6 +210,9 @@ def _build_stream_config(runtime: AppRuntime, run_context: Any) -> dict:
             "plan_enabled": rc.plan_enabled,
             "timezone": rc.timezone,
             "model": _resolve_actual_model_name(runtime.capability_registry),
+            # search_reports 每轮实时读取的范围：与 run_question 同一入口构造，
+            # 交互式 CLI / TUI 走这里，缺失会退化成 invalid_scope。
+            "report_search_scope": runtime.build_search_scope(run_context.thread_id, user_text),
         },
         "recursion_limit": rc.max_loop_steps * rc.graph_node_multiplier,
     }
@@ -630,7 +635,7 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
             )
             runtime.run_manager.mark_running(ctx.run_id)
             runtime.begin_turn(prompt)
-            config = _build_stream_config(runtime, ctx)
+            config = _build_stream_config(runtime, ctx, prepared.original)
             # /skill override：cli_state → configurable，SkillInjectionMiddleware 读取
             config["configurable"]["skill_override"] = cli_state.get("skill_override") or []
             client = PoirotStreamClient(graph=runtime.leader_agent.graph, config=config)

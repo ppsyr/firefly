@@ -5,9 +5,10 @@
 基础来源；这些工具优先于 MCP 工具（同名去重时优先保留 builtin）。
 
 【组成】
-1. imports：从各 builtin 模块导入 4 个工具对象。
+1. imports：从各 builtin 模块导入 5 个工具对象。
 2. 唯一对外函数：get_builtin_tools()
-   - 返回内置工具列表：[web_search_tool, read_snapshot, ask_help_tool, skill_search]。
+   - 返回内置工具列表：[web_search_tool, read_snapshot, ask_help_tool, skill_search,
+     search_reports]。
 
 【为什么返回「工具对象」而不是「工具名」】
 这些对象是 LangChain BaseTool 实例，可直接交给 Agent 挂载；
@@ -27,6 +28,7 @@ from langchain_core.tools import BaseTool
 from poirot.backend.agents.agent_tools.builtin.ask_help import ask_help_tool
 from poirot.backend.agents.agent_tools.builtin.ddg_search import web_search_tool
 from poirot.backend.agents.agent_tools.builtin.read_snapshot import read_snapshot
+from poirot.backend.agents.agent_tools.builtin.search_reports import search_reports
 from poirot.backend.agents.agent_tools.builtin.skill_search import skill_search
 
 
@@ -34,14 +36,15 @@ def get_builtin_tools() -> list[BaseTool]:
     """返回内置工具列表。
 
     行为：
-        - 收集并返回 4 个 builtin 工具对象：
+        - 收集并返回 5 个 builtin 工具对象：
           web_search_tool（网络搜索）、read_snapshot（读压缩前快照）、
-          ask_help_tool（求助）、skill_search（技能搜索）。
+          ask_help_tool（求助）、skill_search（技能搜索）、
+          search_reports（历史报告检索）。
         - 不做去重；同名去重由上层 dedupe_by_name 处理，且优先保留 builtin。
 
     Returns:
         内置工具对象列表（list[BaseTool]），顺序为：
-        [web_search_tool, read_snapshot, ask_help_tool, skill_search]。
+        [web_search_tool, read_snapshot, ask_help_tool, skill_search, search_reports]。
 
     """
-    return [web_search_tool, read_snapshot, ask_help_tool, skill_search]
+    return [web_search_tool, read_snapshot, ask_help_tool, skill_search, search_reports]

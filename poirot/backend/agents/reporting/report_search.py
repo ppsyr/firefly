@@ -22,6 +22,29 @@ class SearchResult:
 
 
 @dataclass(frozen=True)
+class SearchScope:
+    """Normalized retrieval scope shared by ``/search`` and the agent tool.
+
+    ``project``/``cwd`` come from thread metadata; ``cwd`` must already be a
+    real absolute path.  Both callers resolve their own scope at call time so
+    a thread switch is never served from a stale scope.
+    """
+
+    storage_root: str | Path | None
+    project: str | None = None
+    cwd: str | None = None
+
+
+@dataclass(frozen=True)
+class ReportCandidates:
+    """Ranked report candidates plus a machine-readable retrieval status."""
+
+    status: str
+    reports: tuple[tuple[str, tuple[ReportBlock, ...]], ...] = ()
+    message: str | None = None
+
+
+@dataclass(frozen=True)
 class SearchAnswer:
     """Result of the explicit ``/search`` workflow."""
 
@@ -86,7 +109,7 @@ def _terms(text: str) -> list[str]:
     return list(dict.fromkeys(terms))
 
 
-def _relevance(query: str, content: str) -> float:
+def relevance_score(query: str, content: str) -> float:
     """Return a small, stable lexical relevance score in ``[0, 1]``."""
     terms = _terms(query)
     if not terms:
@@ -97,31 +120,34 @@ def _relevance(query: str, content: str) -> float:
     return min(1.0, coverage * 0.8 + phrase_bonus)
 
 
-def search_reports(
-    runtime: Any,
-    arg: str,
+def collect_reports(
+    scope: SearchScope,
+    query: str,
     *,
+    all_projects: bool,
     limit: int = MAX_SEARCH_REPORTS,
     min_relevance: float = MIN_RELEVANCE,
-) -> SearchResult:
+) -> ReportCandidates:
+    """Retrieve ranked report candidates for an explicit scope.
+
+    This is the single retrieval core: the ``/search`` command and the
+    ``search_reports`` agent tool both call it, so the same query, scope and
+    filters always produce the same candidates and source metadata.
+    """
     limit = min(limit, MAX_SEARCH_REPORTS)
-    query, all_projects = parse_search_command(arg)
-    project, cwd = _current_scope(runtime)
-    if not all_projects and (not project or not cwd):
-        return SearchResult(query, False, (), "当前 thread 没有可确定的 project/cwd，默认搜索已拒绝；如需搜索全部报告，请使用 /search --all-projects。")
-    storage_root = getattr(getattr(runtime, "config", None), "runtime", None)
-    storage_root = getattr(storage_root, "storage_root", None)
-    if not storage_root:
-        return SearchResult(query, all_projects, (), "报告索引不可用：storage_root 未配置。")
-    index = ReportIndex(storage_root)
+    if not all_projects and (not scope.project or not scope.cwd):
+        return ReportCandidates("invalid_scope", (), "当前 thread 没有可确定的 project/cwd，默认搜索已拒绝；如需搜索全部报告，请使用 /search --all-projects。")
+    if not scope.storage_root:
+        return ReportCandidates("index_unavailable", (), "报告索引不可用：storage_root 未配置。")
+    index = ReportIndex(scope.storage_root)
     if not index.path.exists():
-        return SearchResult(query, all_projects, (), "报告索引尚未建立，请先生成报告或调用 ReportIndex.rebuild()。")
+        return ReportCandidates("index_unavailable", (), "报告索引尚未建立，请先生成报告或调用 ReportIndex.rebuild()。")
     hits: list[ReportBlock] = []
     try:
         for variant in _query_variants(query):
-            hits.extend(index.search(variant, project=None if all_projects else project, cwd=None if all_projects else cwd, limit=limit * 2))
+            hits.extend(index.search(variant, project=None if all_projects else scope.project, cwd=None if all_projects else scope.cwd, limit=limit * 2))
     except (RuntimeError, ValueError) as exc:
-        return SearchResult(query, all_projects, (), f"报告索引不可用：{exc}")
+        return ReportCandidates("index_unavailable", (), f"报告索引不可用：{exc}")
     unique: dict[tuple[str, str, str], ReportBlock] = {}
     for hit in hits:
         key = (hit.report_path, hit.section, hit.content_hash)
@@ -133,7 +159,7 @@ def search_reports(
         grouped.setdefault(hit.report_path, []).append(hit)
     ranked: list[tuple[float, str, list[ReportBlock]]] = []
     for report_path, matched_hits in grouped.items():
-        relevance = max(_relevance(query, hit.content) for hit in matched_hits)
+        relevance = max(relevance_score(query, hit.content) for hit in matched_hits)
         if relevance < min_relevance:
             continue
         ranked.append((relevance, report_path, matched_hits))
@@ -146,11 +172,35 @@ def search_reports(
         matched = {block.content_hash for block in matched_hits}
         ordered = tuple(block for block in blocks if block.level in {"L0", "L1"} or block.content_hash in matched)
         reports.append((report_path, ordered))
-    message = None if reports else "当前搜索范围未找到达到相关度阈值的历史报告。"
-    return SearchResult(query, all_projects, tuple(reports), message)
+    if not reports:
+        return ReportCandidates("no_results", (), "当前搜索范围未找到达到相关度阈值的历史报告。")
+    return ReportCandidates("ok", tuple(reports))
 
 
-def _conversation(report_path: Path, reports_root: Path, query: str, max_rows: int = 3) -> list[tuple[int, str, str]]:
+def search_reports(
+    runtime: Any,
+    arg: str,
+    *,
+    limit: int = MAX_SEARCH_REPORTS,
+    min_relevance: float = MIN_RELEVANCE,
+) -> SearchResult:
+    """Parse ``/search`` arguments, then delegate to the shared core."""
+    query, all_projects = parse_search_command(arg)
+    project, cwd = _current_scope(runtime)
+    storage_root = getattr(getattr(runtime, "config", None), "runtime", None)
+    storage_root = getattr(storage_root, "storage_root", None)
+    candidates = collect_reports(
+        SearchScope(storage_root, project, cwd),
+        query,
+        all_projects=all_projects,
+        limit=limit,
+        min_relevance=min_relevance,
+    )
+    message = None if candidates.status == "ok" else candidates.message
+    return SearchResult(query, all_projects, candidates.reports, message)
+
+
+def read_conversation(report_path: Path, reports_root: Path, query: str, max_rows: int = 3) -> list[tuple[int, str, str]]:
     conversation = report_path.with_name(report_path.stem + ".conversation.jsonl")
     try:
         if not conversation.is_file() or not conversation.resolve().is_relative_to(reports_root.resolve()):
@@ -187,7 +237,7 @@ def format_search_result(result: SearchResult, storage_root: str | Path) -> str:
             for block in deep[:3]:
                 lines.append(f"[{block.section}] {block.content[:MAX_BLOCK_CHARS]}")
             report_file = Path(storage_root).expanduser().resolve() / "reports" / report_path
-            rows = _conversation(report_file, Path(storage_root).expanduser().resolve() / "reports", result.query)
+            rows = read_conversation(report_file, Path(storage_root).expanduser().resolve() / "reports", result.query)
             if rows:
                 lines.append("[L3 conversation]")
                 lines.extend(f"[turn {turn} {role}] {content}" for turn, role, content in rows)

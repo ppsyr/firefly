@@ -71,6 +71,7 @@ from poirot.backend.agents.journal.run_journal import RunJournal
 from poirot.backend.agents.leader.agent import AgentRunResult, LeaderAgent
 from poirot.backend.agents.leader.factory import make_lead_agent
 from poirot.backend.agents.reporting.markdown_reporter import MarkdownReporter
+from poirot.backend.agents.reporting.agent_search import build_run_scope
 from poirot.backend.agents.runtime.run_manager import RunManager
 from poirot.backend.agents.agent_tools.available import get_available_tools, select_search_tool
 from poirot.backend.agents.multiagent.bootstrap import MultiAgentSetup, setup_multiagent
@@ -434,6 +435,23 @@ class AppRuntime:
 
         return persist_report_from_thread(self, title=topic)
 
+    def build_search_scope(self, thread_id: str | None, user_text: str | None) -> dict[str, Any]:
+        """Build this run's report retrieval scope for ``search_reports``.
+
+        Every graph entry point (one-shot ``run``, interactive CLI, TUI) must
+        call this so the tool reads the *current* thread metadata instead of a
+        cached or missing scope.  Cross-project authorization comes from the raw
+        user message only, never from model arguments.
+        """
+        thread = self.thread_store.require(thread_id) if (self.thread_store and thread_id) else None
+        return build_run_scope(
+            thread_id=thread_id,
+            project=thread.project if thread else None,
+            cwd=thread.cwd if thread else None,
+            storage_root=self.config.runtime.storage_root,
+            user_text=user_text,
+        )
+
     def run_question(
         self,
         question: str,
@@ -467,14 +485,20 @@ class AppRuntime:
             if self.thread_store is not None:
                 self.thread_store.update(effective_thread_id, first_message=prepared.original)
             self.active_threads.add(effective_thread_id)
+            # search_reports 的范围每轮从当前 thread 元数据重建：project / cwd 不缓存，
+            # 跨项目授权只看原始用户问题，模型无法自行扩大范围。
+            search_scope = self.build_search_scope(effective_thread_id, prepared.original)
             if self.thread_store is None:
-                result = self.leader_agent.run(prepared.enriched, context, title_question=prepared.original)
+                result = self.leader_agent.run(
+                    prepared.enriched, context, title_question=prepared.original, search_scope=search_scope,
+                )
             else:
                 result = self.leader_agent.run(
                     prepared.enriched,
                     context,
                     thread_title=self.thread_store.require(effective_thread_id).title,
                     title_question=prepared.original,
+                    search_scope=search_scope,
                 )
             self.run_manager.mark_success(context.run_id)
             return result

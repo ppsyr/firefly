@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 # 不在两个集合中的工具名一律归为 deferred（见 _tool_group）。
 
 # core 组：基础工具，default + expert 都加载（省上下文）
-CORE_TOOL_NAMES: set[str] = {"web_search", "browse_page", "read_snapshot", "skill_search"}
+CORE_TOOL_NAMES: set[str] = {"web_search", "browse_page", "read_snapshot", "skill_search", "search_reports"}
 
 # sandbox 组：沙箱工具（bash / 文件读写 / 目录列举 / 字符串替换 / 文件呈现）
 SANDBOX_TOOL_NAMES: set[str] = {"bash", "read_file", "write_file", "list_dir", "str_replace", "present_files"}
