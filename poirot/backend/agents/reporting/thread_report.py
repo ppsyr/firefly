@@ -45,6 +45,7 @@ class ReportArtifact:
     conversation_path: str | None = None
     title: str | None = None
     thread_id: str | None = None
+    index_error: str | None = None
 
 
 class _ReportRuntime(Protocol):
@@ -167,6 +168,13 @@ def persist_report_from_thread(
         state=state,
         metadata=metadata,
     )
+    index_error = None
+    try:
+        from poirot.backend.agents.reporting.report_index import ReportIndex
+
+        ReportIndex(storage_value).index_report(saved.report_path)
+    except Exception as exc:  # The durable report remains valid if derived data fails.
+        index_error = str(exc)
     return ReportArtifact(
         final_report=result.final_report,
         artifact_path=None,
@@ -174,4 +182,5 @@ def persist_report_from_thread(
         conversation_path=saved.conversation_path,
         title=saved.title,
         thread_id=runtime.thread_id,
+        index_error=index_error,
     )

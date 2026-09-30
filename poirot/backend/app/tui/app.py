@@ -1204,6 +1204,8 @@ class PoirotTUI(App):
         try:
             result = self.runtime.generate_report(topic=topic or None)
             conv.write(Text(f"Report generated: {result.report_path}", style="green"))
+            if result.index_error:
+                conv.write(Text(f"Report index unavailable: {result.index_error}", style="yellow"))
         except Exception as exc:
             conv.write(Text(f"Report failed: {exc}", style="red"))
 

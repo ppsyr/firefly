@@ -438,6 +438,8 @@ async def _run_chat_async(runtime: AppRuntime, provider: str | None, model: str 
         con.print(Markdown(result.final_report))
         con.print(f"[dim]report saved: {result.report_path}[/dim]")
         con.print(f"[dim]conversation saved: {result.conversation_path}[/dim]\n")
+        if result.index_error:
+            con.print(f"[yellow]report index unavailable: {result.index_error}[/yellow]\n")
 
     intent_tree = default_intent_tree(report_handler=_handle_report_intent)
 

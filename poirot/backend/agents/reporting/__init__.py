@@ -29,6 +29,7 @@ from poirot.backend.agents.reporting.thread_report import (
     persist_report_from_thread,
 )
 from poirot.backend.agents.reporting.report_store import ReportStore, SavedReport
+from poirot.backend.agents.reporting.report_index import ReportBlock, ReportIndex, RebuildResult
 
 __all__ = [
     "ReportArtifact",
@@ -36,4 +37,7 @@ __all__ = [
     "SavedReport",
     "generate_report_from_thread",
     "persist_report_from_thread",
+    "ReportBlock",
+    "ReportIndex",
+    "RebuildResult",
 ]
